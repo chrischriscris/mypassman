@@ -3,8 +3,8 @@
 //! tamper detection, and wrong-password rejection.
 
 use mpm_core::item::{tag, Item, ItemKind};
-use mpm_core::manifest::{WrapSlot, SLOT_PASSWORD};
-use mpm_core::{Manifest, Vault};
+use mpm_core::manifest::{WrapSlot, SLOT_PASSWORD, SLOT_RECOVERY};
+use mpm_core::{recovery, Manifest, Vault};
 use mpm_crypto::kdf::{self, KdfParams};
 use mpm_crypto::keys::{DeviceKey, KeyBundle};
 
@@ -23,8 +23,8 @@ fn tmpdir() -> std::path::PathBuf {
     d
 }
 
-/// Create vault on disk; returns device key (caller keeps the seed).
-fn init(dir: &std::path::Path, pw: &[u8]) -> (DeviceKey, [u8; 32]) {
+/// Create vault on disk; returns (device key, seed, recovery code).
+fn init(dir: &std::path::Path, pw: &[u8]) -> (DeviceKey, [u8; 32], [u8; 16]) {
     mpm_store::init_dir(dir).unwrap();
     let mut salt = [0u8; 32];
     rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut salt);
@@ -40,6 +40,17 @@ fn init(dir: &std::path::Path, pw: &[u8]) -> (DeviceKey, [u8; 32]) {
         kdf: Some((FAST, salt)),
         blob: bundle.wrap(&kek, &mpm_core::aad::wrap_slot(SLOT_PASSWORD)).unwrap(),
     });
+
+    let raw_code = recovery::generate_code();
+    let mut rsalt = [0u8; 32];
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut rsalt);
+    let rkek = kdf::derive_kek(&raw_code, &rsalt, &FAST).unwrap();
+    m.wrap_slots.push(WrapSlot {
+        slot_type: SLOT_RECOVERY,
+        kdf: Some((FAST, rsalt)),
+        blob: bundle.wrap(&rkek, &mpm_core::aad::wrap_slot(SLOT_RECOVERY)).unwrap(),
+    });
+
     m.devices.push(mpm_core::DeviceEntry {
         id: device.id,
         vk: device.verifying_key(),
@@ -50,7 +61,7 @@ fn init(dir: &std::path::Path, pw: &[u8]) -> (DeviceKey, [u8; 32]) {
     let sk = bundle.owner_signing_key();
     let bytes = m.to_file(&sk);
     mpm_store::write_manifest(dir, &bytes).unwrap();
-    (device, seed)
+    (device, seed, raw_code)
 }
 
 fn reopen(dir: &std::path::Path, pw: &[u8], seed: &[u8; 32], dev_id: [u8; 16]) -> Vault {
@@ -79,7 +90,7 @@ fn login(name: &str, user: &str, pass: &str) -> Item {
 fn roundtrip_add_reopen_decrypt() {
     let dir = tmpdir();
     let pw = b"correct horse battery staple";
-    let (device, seed) = init(&dir, pw);
+    let (device, seed, _code) = init(&dir, pw);
     let dev_id = device.id;
 
     let m = mpm_store::load_manifest(&dir).unwrap();
@@ -116,7 +127,7 @@ fn roundtrip_add_reopen_decrypt() {
 fn tombstone_hides_item() {
     let dir = tmpdir();
     let pw = b"pw";
-    let (device, seed) = init(&dir, pw);
+    let (device, seed, _code) = init(&dir, pw);
     let dev_id = device.id;
 
     let m = mpm_store::load_manifest(&dir).unwrap();
@@ -149,7 +160,7 @@ fn tombstone_hides_item() {
 fn tampered_op_rejected() {
     let dir = tmpdir();
     let pw = b"pw";
-    let (device, seed) = init(&dir, pw);
+    let (device, seed, _code) = init(&dir, pw);
     let dev_id = device.id;
 
     let m = mpm_store::load_manifest(&dir).unwrap();
@@ -178,6 +189,37 @@ fn tampered_op_rejected() {
     let mut v2 = Vault::new(m2, b2, DeviceKey::from_bytes(&seed, dev_id)).unwrap();
     let ops = mpm_store::read_ops(&dir, &dev_id).unwrap();
     assert!(v2.apply_own_op(&ops[0]).is_err(), "tampered op must not verify");
+}
+
+#[test]
+fn recovery_code_unlocks_and_parses() {
+    let dir = tmpdir();
+    let (device, seed, code) = init(&dir, b"pw");
+    let dev_id = device.id;
+
+    // format → parse roundtrip, including typo-tolerance (o→0, l→1)
+    let formatted = recovery::format_code(&code);
+    assert_eq!(recovery::parse_code(&formatted).unwrap(), code);
+
+    // unlock via the RECOVERY slot with the raw code
+    let m = mpm_store::load_manifest(&dir).unwrap();
+    let slot = m
+        .wrap_slots
+        .iter()
+        .find(|s| s.slot_type == SLOT_RECOVERY)
+        .unwrap()
+        .clone();
+    let (params, salt) = slot.kdf.unwrap();
+    let kek = kdf::derive_kek(&code, &salt, &params).unwrap();
+    let bundle =
+        KeyBundle::unwrap(&kek, &mpm_core::aad::wrap_slot(SLOT_RECOVERY), &slot.blob).unwrap();
+    assert!(Vault::new(m, bundle, DeviceKey::from_bytes(&seed, dev_id)).is_ok());
+
+    // a wrong code must not unwrap the recovery slot
+    let mut bad = code;
+    bad[0] ^= 0xff;
+    let kek_bad = kdf::derive_kek(&bad, &salt, &params).unwrap();
+    assert!(KeyBundle::unwrap(&kek_bad, &mpm_core::aad::wrap_slot(SLOT_RECOVERY), &slot.blob).is_err());
 }
 
 #[test]

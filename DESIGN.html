@@ -800,9 +800,11 @@ is not an audit.</li>
 <hr />
 <h2 id="11-recovery-amp-lifecycle-v1-not-later">11. Recovery &amp; lifecycle (v1, not later)</h2>
 <ul>
-<li><strong>Emergency kit</strong>: at <code>vault init</code>, generate a ~160-bit recovery code
-(printable words/base32); it Argon2id-derives an independent KEK that wraps
-the DEK in its own slot. Printed once, stored offline. Lost master password
+<li><strong>Emergency kit</strong>: at <code>vault init</code>, generate a 128-bit recovery code
+(26-char Crockford-ish base32, <code>xxxx-xxxx-…</code>, typo-tolerant: <code>o→0</code>,
+<code>i/l→1</code>); it Argon2id-derives an independent KEK that wraps the key
+bundle in <code>SLOT_RECOVERY</code>. Printed once, stored offline. Rotate with
+<code>mypassman recovery rotate</code> — invalidates the old code. Implemented. Lost master password
 is the <em>most likely</em> catastrophic event for a personal vault.</li>
 <li><strong>Backups</strong>: automatic rotating encrypted snapshots; restore path tested in
 CI, not just written.</li>
@@ -835,7 +837,7 @@ human can spot a rollback.</li>
 </tr>
 <tr>
   <td>M2</td>
-  <td>CLI + daemon (macOS): init/unlock/add/get/list/edit/gen/TOTP/copy/reveal/<code>run</code>/<code>otp</code>, auto-lock, recovery kit, import/export, backups. <strong>Daily-usable on your laptop.</strong></td>
+  <td>CLI + daemon (macOS): init/unlock/add/get/list/edit/copy/reveal, <del>gen</del> ✓, <del>recovery kit</del> ✓, TOTP/<code>otp</code>, <code>run</code>, auto-lock, import/export, backups. <strong>Daily-usable on your laptop.</strong></td>
 </tr>
 <tr>
   <td>M3</td>

@@ -546,9 +546,11 @@ Electron, anywhere a keyboard works.
 
 ## 11. Recovery & lifecycle (v1, not later)
 
-- **Emergency kit**: at `vault init`, generate a ~160-bit recovery code
-  (printable words/base32); it Argon2id-derives an independent KEK that wraps
-  the DEK in its own slot. Printed once, stored offline. Lost master password
+- **Emergency kit**: at `vault init`, generate a 128-bit recovery code
+  (26-char Crockford-ish base32, `xxxx-xxxx-…`, typo-tolerant: `o→0`,
+  `i/l→1`); it Argon2id-derives an independent KEK that wraps the key
+  bundle in `SLOT_RECOVERY`. Printed once, stored offline. Rotate with
+  `mypassman recovery rotate` — invalidates the old code. Implemented. Lost master password
   is the *most likely* catastrophic event for a personal vault.
 - **Backups**: automatic rotating encrypted snapshots; restore path tested in
   CI, not just written.
@@ -569,7 +571,7 @@ Electron, anywhere a keyboard works.
 |---|---|
 | M0 | `docs/FORMAT.md` + `docs/THREATMODEL.md` + `docs/SYNC.md` + test vectors + workspace + CI gates + **throwaway iOS AutoFill-extension spike** (measures memory ceiling, cold-launch latency, Argon2 fit — before anything freezes). **Spec before code.** |
 | M1 | `core`+`crypto`+`store`: vault init/open/CRUD/merge + all item kinds, fuzzed + proptested, handle-based secrecy API, single device, **no sync yet**. Format v1 freezes here — informed by the M0 spike. |
-| M2 | CLI + daemon (macOS): init/unlock/add/get/list/edit/gen/TOTP/copy/reveal/`run`/`otp`, auto-lock, recovery kit, import/export, backups. **Daily-usable on your laptop.** |
+| M2 | CLI + daemon (macOS): init/unlock/add/get/list/edit/copy/reveal, ~~gen~~ ✓, ~~recovery kit~~ ✓, TOTP/`otp`, `run`, auto-lock, import/export, backups. **Daily-usable on your laptop.** |
 | M3 | `syncd` self-host binary + device enrollment (pairing direction spiked *with* a phone) + merge + tombstones + compaction + conflict UI + gossip-vector verification. Test matrix: two offline devices editing one record, day-skewed clock, mid-sync partial file, restored-from-backup device, atomic `key_epoch` rotation, equivocation detection. **Phone↔laptop anywhere sync lands here.** |
 | M4 | iOS app (SwiftUI + uniffi) + AutoFill extension + FaceID unlock (ThisDeviceOnly) + foreground-pull sync + `otpauth://` QR import. **The "use it everywhere" point.** |
 | M5 | Minimal macOS app — shares the iOS SwiftUI codebase, so it's nearly free and kills the "CLI-only on your work machine" inversion; menu bar + autotype + TouchID |

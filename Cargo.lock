@@ -426,6 +426,7 @@ dependencies = [
  "mpm-crypto",
  "rand_core",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

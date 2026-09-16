@@ -4,9 +4,11 @@
 
 pub mod aad;
 pub mod error;
+pub mod gen;
 pub mod item;
 pub mod manifest;
 pub mod op;
+pub mod recovery;
 pub mod tlv;
 pub mod vault;
 

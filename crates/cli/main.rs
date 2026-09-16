@@ -3,8 +3,8 @@
 
 use clap::{Parser, Subcommand};
 use mpm_core::item::{tag, Item, ItemKind};
-use mpm_core::manifest::{WrapSlot, SLOT_PASSWORD};
-use mpm_core::{Manifest, Vault};
+use mpm_core::manifest::{WrapSlot, SLOT_PASSWORD, SLOT_RECOVERY};
+use mpm_core::{gen, recovery, Manifest, Vault};
 use mpm_crypto::keys::{DeviceKey, KeyBundle};
 use mpm_crypto::kdf::{self, KdfParams};
 use std::collections::BTreeMap;
@@ -19,6 +19,9 @@ struct Cli {
     /// Vault directory (default ~/.mypassman/vault, or $MPM_VAULT)
     #[arg(long, global = true)]
     vault: Option<PathBuf>,
+    /// Unlock with recovery code instead of master password
+    #[arg(long, global = true)]
+    recovery: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -52,6 +55,32 @@ enum Cmd {
     Rm { name: String },
     /// Show enrolled devices
     Devices,
+    /// Recovery kit management
+    Recovery {
+        #[command(subcommand)]
+        sub: RecoveryCmd,
+    },
+    /// Generate a password or passphrase (no vault needed)
+    Gen {
+        /// length (charset mode) or word count (--passphrase)
+        #[arg(short, long, default_value_t = 20)]
+        len: usize,
+        /// passphrase mode: N words joined by '-'
+        #[arg(short, long)]
+        passphrase: bool,
+        /// alnum only (no symbols)
+        #[arg(long)]
+        no_symbols: bool,
+        /// copy to clipboard instead of printing
+        #[arg(short, long)]
+        copy: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecoveryCmd {
+    /// Mint a new recovery code (requires master password); invalidates the old kit
+    Rotate,
 }
 
 fn vault_dir(cli: &Cli) -> PathBuf {
@@ -133,23 +162,30 @@ fn read_line(prompt: &str) -> String {
     s.trim().to_string()
 }
 
-/// Open vault: manifest → password → try each password slot → replay logs.
-fn unlock(dir: &Path) -> Result<Vault, String> {
+/// Open vault: manifest → password (or recovery code) → try slots → replay logs.
+fn unlock(dir: &Path, recovery_mode: bool) -> Result<Vault, String> {
     let manifest = mpm_store::load_manifest(dir).map_err(|e| e.to_string())?;
     manifest.kdf.check_bounds(DEVICE_KDF_CAP_KIB).map_err(|e| e.to_string())?;
     let device = mpm_store::load_device_key(&manifest.vault_id).map_err(|e| e.to_string())?;
-    let pw = read_password("master password: ");
-    let pw_b = pw.as_bytes();
+
+    let (slot_type, secret) = if recovery_mode {
+        let code = read_password("recovery code: ");
+        let raw = recovery::parse_code(&code).map_err(|_| "malformed recovery code".to_string())?;
+        (SLOT_RECOVERY, Zeroizing::new(raw.to_vec()))
+    } else {
+        let pw = read_password("master password: ");
+        (SLOT_PASSWORD, Zeroizing::new(pw.as_bytes().to_vec()))
+    };
 
     let mut bundle = None;
     for slot in &manifest.wrap_slots {
-        if slot.slot_type != SLOT_PASSWORD {
+        if slot.slot_type != slot_type {
             continue;
         }
         let Some((params, salt)) = &slot.kdf else { continue };
         params.check_bounds(DEVICE_KDF_CAP_KIB).map_err(|e| e.to_string())?;
-        let kek = kdf::derive_kek(pw_b, salt, params).map_err(|e| e.to_string())?;
-        if let Ok(b) = KeyBundle::unwrap(&kek, &mpm_core::aad::wrap_slot(SLOT_PASSWORD), &slot.blob) {
+        let kek = kdf::derive_kek(&secret, salt, params).map_err(|e| e.to_string())?;
+        if let Ok(b) = KeyBundle::unwrap(&kek, &mpm_core::aad::wrap_slot(slot_type), &slot.blob) {
             bundle = Some(b);
             break;
         }
@@ -209,6 +245,19 @@ fn cmd_init(dir: &Path) -> Result<(), String> {
         enrolled_at: mpm_core::vault::now_hlc(),
     });
 
+    // recovery slot: independent KEK from a printed-once code
+    let raw_code = recovery::generate_code();
+    let mut rsalt = [0u8; 32];
+    rand_core_fill(&mut rsalt);
+    let rkek = kdf::derive_kek(&raw_code, &rsalt, &params).map_err(|e| e.to_string())?;
+    manifest.wrap_slots.push(WrapSlot {
+        slot_type: SLOT_RECOVERY,
+        kdf: Some((params, rsalt)),
+        blob: bundle
+            .wrap(&rkek, &mpm_core::aad::wrap_slot(SLOT_RECOVERY))
+            .map_err(|e| e.to_string())?,
+    });
+
     let owner_sk = bundle.owner_signing_key();
     let bytes = manifest.to_file(&owner_sk);
     mpm_store::write_manifest(dir, &bytes).map_err(|e| e.to_string())?;
@@ -217,18 +266,23 @@ fn cmd_init(dir: &Path) -> Result<(), String> {
     eprintln!("vault created: {}", dir.display());
     eprintln!("vault_id: {}", mpm_store::hex(&manifest.vault_id));
     eprintln!("device:   {}", mpm_store::hex(&device.id));
-    eprintln!("NOTE: recovery kit (SLOT_RECOVERY) lands in M2 — keep your password safe until then.");
+    eprintln!();
+    eprintln!("=== RECOVERY KIT — shown ONCE. Write it down, store it offline. ===");
+    eprintln!("  code:      {}", recovery::format_code(&raw_code));
+    eprintln!("  key_epoch: {}", manifest.key_epoch);
+    eprintln!("  vault_id:  {}", mpm_store::hex(&manifest.vault_id));
+    eprintln!("Lose your password AND this code = lose the vault.");
     Ok(())
 }
 
-fn cmd_add(dir: &Path, kind: &str, name: &str, cli_fields: &[String]) -> Result<(), String> {
+fn cmd_add(dir: &Path, rec: bool, kind: &str, name: &str, cli_fields: &[String]) -> Result<(), String> {
     let kind = ItemKind::from_name(kind).map_err(|_| format!("unknown kind '{kind}'"))?;
     let fmap = field_map();
     let mut item = Item::default();
     item.set(tag::NAME, name.as_bytes().to_vec());
 
     // Unlock before touching secrets — prompts happen on an open vault.
-    let mut vault = unlock(dir)?;
+    let mut vault = unlock(dir, rec)?;
 
     let mut given = BTreeMap::new();
     for f in cli_fields {
@@ -271,8 +325,8 @@ fn cmd_add(dir: &Path, kind: &str, name: &str, cli_fields: &[String]) -> Result<
     Ok(())
 }
 
-fn cmd_list(dir: &Path) -> Result<(), String> {
-    let vault = unlock(dir)?;
+fn cmd_list(dir: &Path, rec: bool) -> Result<(), String> {
+    let vault = unlock(dir, rec)?;
     let mut rows: Vec<_> = vault.records().collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     println!("{:<10} {:<40} ID", "KIND", "NAME");
@@ -287,8 +341,8 @@ fn cmd_list(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_get(dir: &Path, name: &str, show: bool, copy: &Option<String>) -> Result<(), String> {
-    let vault = unlock(dir)?;
+fn cmd_get(dir: &Path, rec: bool, name: &str, show: bool, copy: &Option<String>) -> Result<(), String> {
+    let vault = unlock(dir, rec)?;
     let rid = vault.find(name).ok_or("not found (or ambiguous)")?;
     let item = vault.item(&rid).map_err(|e| e.to_string())?;
     let fmap = field_map();
@@ -318,13 +372,58 @@ fn cmd_get(dir: &Path, name: &str, show: bool, copy: &Option<String>) -> Result<
     Ok(())
 }
 
-fn cmd_rm(dir: &Path, name: &str) -> Result<(), String> {
-    let mut vault = unlock(dir)?;
+fn cmd_rm(dir: &Path, rec: bool, name: &str) -> Result<(), String> {
+    let mut vault = unlock(dir, rec)?;
     let rid = vault.find(name).ok_or("not found (or ambiguous)")?;
     let op = vault.make_tombstone(&rid).map_err(|e| e.to_string())?;
     mpm_store::append_op(dir, vault.device_id(), &op).map_err(|e| e.to_string())?;
     vault.commit(&op).map_err(|e| e.to_string())?;
     eprintln!("deleted '{name}' (tombstoned)");
+    Ok(())
+}
+
+fn cmd_recovery_rotate(dir: &Path, rec: bool) -> Result<(), String> {
+    let mut vault = unlock(dir, rec)?;
+    let raw_code = recovery::generate_code();
+    let params = KdfParams::default();
+    let mut rsalt = [0u8; 32];
+    rand_core_fill(&mut rsalt);
+    let rkek = kdf::derive_kek(&raw_code, &rsalt, &params).map_err(|e| e.to_string())?;
+
+    vault.manifest.wrap_slots.retain(|s| s.slot_type != SLOT_RECOVERY);
+    vault.manifest.wrap_slots.push(WrapSlot {
+        slot_type: SLOT_RECOVERY,
+        kdf: Some((params, rsalt)),
+        blob: vault
+            .bundle()
+            .wrap(&rkek, &mpm_core::aad::wrap_slot(SLOT_RECOVERY))
+            .map_err(|e| e.to_string())?,
+    });
+    let owner_sk = vault.bundle().owner_signing_key();
+    let bytes = vault.manifest.to_file(&owner_sk);
+    mpm_store::write_manifest(dir, &bytes).map_err(|e| e.to_string())?;
+
+    eprintln!("=== NEW RECOVERY KIT — old code is now useless. ===");
+    eprintln!("  code:      {}", recovery::format_code(&raw_code));
+    eprintln!("  key_epoch: {}", vault.manifest.key_epoch);
+    Ok(())
+}
+
+fn cmd_gen(len: usize, passphrase: bool, no_symbols: bool, copy: bool) -> Result<(), String> {
+    if len == 0 || len > 1024 {
+        return Err("bad length".into());
+    }
+    let out = if passphrase {
+        gen::passphrase(len.max(3))
+    } else {
+        gen::password(len, !no_symbols)
+    };
+    if copy {
+        copy_to_clipboard(out.as_bytes())?;
+        eprintln!("copied to clipboard (clear it when done)");
+    } else {
+        println!("{}", out.as_str());
+    }
     Ok(())
 }
 
@@ -388,13 +487,20 @@ fn rand_core_fill(b: &mut [u8]) {
 fn main() {
     let cli = Cli::parse();
     let dir = vault_dir(&cli);
+    let rec = cli.recovery;
     let res = match &cli.cmd {
         Cmd::Init => cmd_init(&dir),
-        Cmd::Add { kind, name, fields } => cmd_add(&dir, kind, name, fields),
-        Cmd::Get { name, show, copy } => cmd_get(&dir, name, *show, copy),
-        Cmd::List => cmd_list(&dir),
-        Cmd::Rm { name } => cmd_rm(&dir, name),
+        Cmd::Add { kind, name, fields } => cmd_add(&dir, rec, kind, name, fields),
+        Cmd::Get { name, show, copy } => cmd_get(&dir, rec, name, *show, copy),
+        Cmd::List => cmd_list(&dir, rec),
+        Cmd::Rm { name } => cmd_rm(&dir, rec, name),
         Cmd::Devices => cmd_devices(&dir),
+        Cmd::Recovery { sub } => match sub {
+            RecoveryCmd::Rotate => cmd_recovery_rotate(&dir, rec),
+        },
+        Cmd::Gen { len, passphrase, no_symbols, copy } => {
+            cmd_gen(*len, *passphrase, *no_symbols, *copy)
+        }
     };
     if let Err(e) = res {
         eprintln!("error: {e}");
