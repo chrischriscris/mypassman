@@ -1,0 +1,19 @@
+[package]
+name = "mypassman"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mypassman"
+path = "main.rs"
+
+[dependencies]
+mpm-core = { path = "../core" }
+mpm-crypto = { path = "../crypto" }
+mpm-store = { path = "../store" }
+clap.workspace = true
+rand_core.workspace = true
+rpassword.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true

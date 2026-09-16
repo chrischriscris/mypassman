@@ -1,0 +1,12 @@
+[package]
+name = "mpm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mpm-crypto = { path = "../crypto" }
+blake3.workspace = true
+ed25519-dalek.workspace = true
+rand_core.workspace = true
+thiserror.workspace = true

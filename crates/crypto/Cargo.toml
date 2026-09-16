@@ -1,0 +1,15 @@
+[package]
+name = "mpm-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+argon2.workspace = true
+blake3.workspace = true
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+libc = { version = "0.2", optional = false }
+rand_core.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true

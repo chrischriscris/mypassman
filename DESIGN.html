@@ -1,0 +1,949 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mypassman — Design Document</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #e6edf3; --dim: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --amber: #d29922; --code-bg: #0a0d12;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.65 -apple-system, BlinkMacSystemFont, "SF Pro Text",
+          "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  .layout { display: flex; min-height: 100vh; }
+
+  /* ── sidebar ─────────────────────────────────────── */
+  nav {
+    width: 250px; flex-shrink: 0; padding: 28px 20px;
+    border-right: 1px solid var(--border);
+    position: sticky; top: 0; height: 100vh; overflow-y: auto;
+    background: var(--panel);
+  }
+  nav .brand {
+    font: 700 14px/1.3 ui-monospace, "SF Mono", Menlo, monospace;
+    color: var(--accent); margin-bottom: 4px;
+  }
+  nav .sub { color: var(--dim); font-size: 11.5px; margin-bottom: 20px; }
+  nav a {
+    display: block; color: var(--dim); text-decoration: none;
+    font-size: 12.5px; padding: 3px 0 3px 10px;
+    border-left: 2px solid transparent;
+  }
+  nav a:hover { color: var(--text); border-left-color: var(--accent); }
+  nav a.toc-h3 { padding-left: 26px; font-size: 12px; }
+
+  /* ── content ─────────────────────────────────────── */
+  main {
+    flex: 1; max-width: 920px; padding: 40px 56px 120px;
+  }
+  h1 { font-size: 30px; margin: 0 0 8px; letter-spacing: -0.02em; }
+  h2 {
+    font-size: 21px; margin: 48px 0 14px; padding-top: 16px;
+    border-top: 1px solid var(--border); letter-spacing: -0.01em;
+  }
+  h3 { font-size: 16px; margin: 28px 0 10px; color: var(--accent); }
+  p { margin: 10px 0; }
+  a { color: var(--accent); }
+  strong { color: #fff; }
+  hr { display: none; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  li::marker { color: var(--accent); }
+
+  code {
+    font: 12.5px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    background: var(--code-bg); border: 1px solid var(--border);
+    padding: 1px 5px; border-radius: 4px;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px 18px; overflow-x: auto;
+    font-size: 12px; line-height: 1.45;
+  }
+  pre code { background: none; border: none; padding: 0; font-size: inherit; }
+
+  table {
+    border-collapse: collapse; width: 100%; margin: 16px 0;
+    font-size: 13px; display: block; overflow-x: auto;
+  }
+  th, td {
+    border: 1px solid var(--border); padding: 7px 12px;
+    text-align: left; vertical-align: top;
+  }
+  th { background: var(--panel); font-weight: 600; white-space: nowrap; }
+  tr:nth-child(even) td { background: rgba(255,255,255,0.015); }
+
+  blockquote {
+    margin: 14px 0; padding: 8px 16px; color: var(--dim);
+    border-left: 3px solid var(--border);
+  }
+
+  .badge {
+    display: inline-block; font: 600 11px/1 ui-monospace, Menlo, monospace;
+    padding: 5px 9px; border-radius: 20px; margin: 0 6px 12px 0;
+    border: 1px solid var(--border); color: var(--dim);
+  }
+  .badge.green { color: var(--green); border-color: var(--green); }
+  .badge.amber { color: var(--amber); border-color: var(--amber); }
+
+  footer {
+    margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--border);
+    color: var(--dim); font-size: 12px;
+  }
+
+  @media (max-width: 900px) {
+    nav { display: none; }
+    main { padding: 28px 22px 80px; }
+  }
+  @media print {
+    nav { display: none; }
+    body { background: #fff; color: #000; }
+    main { max-width: none; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav>
+    <div class="brand">mypassman</div>
+    <div class="sub">design doc · v2 draft</div>
+    <a class="toc-h2" href="#1-goals-amp-non-goals">1. Goals &amp; non-goals</a>
+        <a class="toc-h3" href="#goals">Goals</a>
+        <a class="toc-h3" href="#non-goals-v1">Non-goals (v1)</a>
+        <a class="toc-h2" href="#2-threat-model">2. Threat model</a>
+        <a class="toc-h2" href="#3-architecture">3. Architecture</a>
+        <a class="toc-h2" href="#4-technology-choices">4. Technology choices</a>
+        <a class="toc-h3" href="#footprint-amp-performance-budget-ci-gated">Footprint &amp; performance budget (CI-gated)</a>
+        <a class="toc-h2" href="#5-cryptographic-design">5. Cryptographic design</a>
+        <a class="toc-h3" href="#key-hierarchy">Key hierarchy</a>
+        <a class="toc-h3" href="#vault-a-directory-not-a-file">Vault = a directory, not a file</a>
+        <a class="toc-h2" href="#6-item-model">6. Item model</a>
+        <a class="toc-h2" href="#7-storage-amp-durability">7. Storage &amp; durability</a>
+        <a class="toc-h2" href="#8-sync-amp-merge">8. Sync &amp; merge</a>
+        <a class="toc-h3" href="#syncd-the-quot-anywhere-quot-transport">syncd — the &quot;anywhere&quot; transport</a>
+        <a class="toc-h2" href="#9-clients-autofill-amp-daemon">9. Clients, autofill &amp; daemon</a>
+        <a class="toc-h3" href="#ios-breaks-the-daemon-model-design-for-it-explicitly">iOS breaks the daemon model — design for it explicitly</a>
+        <a class="toc-h2" href="#10-secrecy-amp-hardening-checklist">10. Secrecy &amp; hardening checklist</a>
+        <a class="toc-h2" href="#11-recovery-amp-lifecycle-v1-not-later">11. Recovery &amp; lifecycle (v1, not later)</a>
+        <a class="toc-h2" href="#12-roadmap">12. Roadmap</a>
+        <a class="toc-h2" href="#13-alternatives-considered">13. Alternatives considered</a>
+        <a class="toc-h2" href="#14-risks-amp-open-questions">14. Risks &amp; open questions</a>
+        <a class="toc-h2" href="#15-repo-layout">15. Repo layout</a>
+  </nav>
+  <main>
+    <div>
+      <span class="badge green">local-first</span>
+      <span class="badge green">E2EE</span>
+      <span class="badge amber">pre-implementation</span>
+      <span class="badge">0 MB locked footprint</span>
+    </div>
+<h1 id="mypassman-design-document">mypassman — Design Document</h1>
+<p>A personal password manager: local-first, end-to-end encrypted, multiplatform,
+and engineered for near-zero idle resource footprint.</p>
+<p>Status: <strong>v4 — M1 core implemented</strong> (workspace + <code>crypto</code>/<code>core</code>/<code>store</code>/<code>cli</code>
+crates; init/add/get/list/rm/devices working; op chain + both AEAD layers
+tested incl. tamper + wrong-password). Two rounds of adversarial external
+review incorporated.</p>
+<hr />
+<h2 id="1-goals-amp-non-goals">1. Goals &amp; non-goals</h2>
+<h3 id="goals">Goals</h3>
+<ul>
+<li><strong>Single-user</strong>, local-first vault. <strong>No account needed to use it</strong> —
+self-host syncd authenticates by device pairing, not users. A managed
+cloud adds a thin billing/tenancy account that never touches keys (§8).</li>
+<li><strong>macOS + iOS first-class</strong>, architected multiplatform from day one —
+Windows/Linux/Android/browser join behind the same core.</li>
+<li><strong>Complete item coverage</strong>: passwords, cards, API keys, TOTP/authenticator,
+generic secrets, identities, SSH keys (see §6 Item model).</li>
+<li><strong>Near-zero footprint</strong>: when locked, <em>nothing runs</em> — 0 MB. Unlocked agent
+&lt;5 MB RSS, TUI &lt;15 MB, GUI &lt;40 MB, warm <code>get</code> &lt;10 ms.</li>
+<li><strong>Auditable</strong>: small dependency tree, own minimal vault format, reproducible
+builds, boring standard crypto only.</li>
+<li><strong>Sync anywhere</strong>: self-hostable <code>syncd</code> (single binary or serverless) as
+the primary transport — phone ↔ laptop over the internet, not just LAN.
+Folder sync stays as the zero-infra fallback. A future managed cloud reuses
+the identical trustless protocol — the server never sees plaintext either way.</li>
+<li><strong>Multiple vaults</strong> (personal / work) — <code>vault_id</code> makes this free.</li>
+</ul>
+<h3 id="non-goals-v1">Non-goals (v1)</h3>
+<ul>
+<li>Team/org sharing, multi-user, access delegation. (Single-item secure
+sharing may land post-1.0 via an age-style ephemeral-link scheme.)</li>
+<li>Managed multi-tenant cloud — post-1.0. When it lands it adds a <strong>thin
+account layer</strong> (email or passkey → owns <code>vault_id</code>s → billing, quota,
+abuse controls) on top of the <em>same</em> protocol. The account is a tenancy
+shell around opaque blobs: it never sees keys, and vault crypto is
+account-independent — a leaked/forgotten account password can't decrypt
+anything, and device re-pairing + recovery code survive account loss.</li>
+<li>Passkey provider (revisit post-1.0; the record schema reserves room).</li>
+<li>Attachments (post-1.0 — needs a size-bucketed blob store).</li>
+<li>Compression (zstd) — <em>deliberately excluded</em>, see §7.</li>
+</ul>
+<hr />
+<h2 id="2-threat-model">2. Threat model</h2>
+<p><strong>Protects against:</strong></p>
+<ul>
+<li>Vault theft (device, backup, cloud folder) — everything sensitive is AEAD-encrypted.</li>
+<li>Hostile/curious sync storage — it holds only opaque encrypted ops.</li>
+<li>Offline brute force — memory-hard KDF; <em>aggressive params are the only real
+defense since no server rate-limits</em>. A lost vault + weak password = lost data.</li>
+<li>Record tampering, truncation, replay, and cross-vault swapping — per-op AEAD
+with strict AAD binding + hash-chained logs + authenticated manifest.</li>
+<li>Secret leakage via swap/core dumps/crash reports — zeroed+locked memory,
+non-dumpable process, no secrets in logs.</li>
+<li>Clipboard sniffing — advisory concealment + ownership-checked auto-clear.</li>
+</ul>
+<p><strong>Does NOT protect against (don't overclaim):</strong></p>
+<ul>
+<li>A compromised device <em>while unlocked</em> (keyloggers, ptrace, same-user memory
+reads). The agent shrinks the exposure window; it never removes it.</li>
+<li>Metadata leakage via sync: op timing, approximate sizes, device fan-out.</li>
+<li>Managed-cloud account compromise — the account layer gates tenancy and
+billing only; an attacker with your cloud account can <em>disrupt</em> sync and
+see vault sizes but cannot decrypt, enroll devices, or forge ops.</li>
+<li>A sync adversary <em>withholding</em> an entire device's log (starvation). Detected
+via epoch watermarks + device liveness, not prevented — fundamental limit.</li>
+<li>Local lockout cannot stop offline guessing — failed-attempt delays are
+opportunistic-attacker defenses only, and destructive wipe-on-N-failures is
+<strong>off by default</strong> (self-DoS risk).</li>
+<li>Evil-maid on an unlocked session; coercion.</li>
+</ul>
+<hr />
+<h2 id="3-architecture">3. Architecture</h2>
+<pre><code>┌────────────────────────────────────────────────────────────┐
+│ Clients — disposable processes, each optional              │
+│  CLI (clap) │ TUI (ratatui) │ GUI │ mobile │ browser ext   │
+├────────────────────────────────────────────────────────────┤
+│ IPC: unix socket / named pipe → mypassmand (peer-cred auth)│
+├────────────────────────────────────────────────────────────┤
+│ mypassman-core                                             │
+│   vault   — op log, record CRUD, merge, conflict preserve  │
+│   crypto  — Argon2id, XChaCha20-Poly1305, BLAKE3, keywrap  │
+│   store   — manifest, snapshots, durable IO, backups       │
+│   sync    — per-device logs, HLC, tombstones, compaction   │
+├────────────────────────────────────────────────────────────┤
+│ OS: keychain/TEE, clipboard, fs, suspend events, sockets   │
+└────────────────────────────────────────────────────────────┘
+</code></pre>
+<p><strong>Principles</strong></p>
+<ul>
+<li><strong>Zero resident footprint when locked.</strong> <code>mypassmand</code> is socket-activated
+(launchd/systemd) and exits on lock. Locked state = no process, not a
+process holding secrets &quot;safely&quot;.</li>
+<li><strong>Secrets never leave core.</strong> Clients get handles and scoped, transient
+buffers — never the DEK, never managed-heap strings across FFI.</li>
+<li><strong>Decrypt-on-demand.</strong> Records rest as ciphertext; only the accessed entry
+decrypts, into a locked+zeroed buffer. No persistent plaintext search index.</li>
+<li><strong>Every device owns exactly one append-only log.</strong> Nobody writes another
+device's file → folder-sync conflicts become structurally impossible
+(the fix for the single-mutable-file flaw).</li>
+</ul>
+<hr />
+<h2 id="4-technology-choices">4. Technology choices</h2>
+<table>
+<thead>
+<tr>
+  <th>Layer</th>
+  <th>Choice</th>
+  <th>Rejected</th>
+  <th>Rationale</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>Language</td>
+  <td><strong>Rust</strong> (workspace, pinned MSRV)</td>
+  <td>Go (GC + ~10 MB floor), C++ (safety), Zig (immature crypto ecosystem)</td>
+  <td>no runtime, manual memory, mature audited-ish crates, best cross-compile</td>
+</tr>
+<tr>
+  <td>KDF</td>
+  <td><strong>Argon2id</strong> (params in manifest, calibrated to <em>weakest</em> supported device)</td>
+  <td>PBKDF2 (weak vs GPU), scrypt (dated), Balloon (less reviewed)</td>
+  <td>best practice; transient spike at unlock is a bounded, deliberate cost — <strong>not</strong> part of idle footprint</td>
+</tr>
+<tr>
+  <td>AEAD</td>
+  <td><strong>XChaCha20-Poly1305</strong>, random 192-bit nonces</td>
+  <td>AES-GCM, counter nonces</td>
+  <td>sync forks legitimately produce same-version ops → counter nonces risk catastrophic reuse; random nonces don't</td>
+</tr>
+<tr>
+  <td>Derivation / integrity</td>
+  <td><strong>BLAKE3</strong> keyed/<code>derive_key</code></td>
+  <td>SHA-256/HMAC</td>
+  <td>fast, domain separation via context strings; <em>not</em> a substitute for AEAD — used for op hash-chains and subkey derivation only</td>
+</tr>
+<tr>
+  <td>IDs</td>
+  <td><strong>Random 128-bit</strong></td>
+  <td>content/URL-derived hashes, UUIDv7</td>
+  <td>derived IDs leak account inventory to anyone holding the vault; random IDs leak nothing</td>
+</tr>
+<tr>
+  <td>Serialization</td>
+  <td>hand-rolled <strong>TLV</strong> (versioned)</td>
+  <td>protobuf (dep weight), JSON at rest (size)</td>
+  <td>tiny, strict, fuzzable; JSON/CSV only at the import/export edge</td>
+</tr>
+<tr>
+  <td>CLI / TUI</td>
+  <td><strong>clap</strong> / <strong>ratatui</strong></td>
+  <td>—</td>
+  <td>boring, complete, low overhead</td>
+</tr>
+<tr>
+  <td>GUI</td>
+  <td><strong>SwiftUI native</strong> (macOS+iOS share one codebase — primary platforms settled); Slint or native per secondary platform</td>
+  <td>Tauri/Electron — a WebView pulls secrets into a <strong>JS heap that cannot be zeroized</strong> and a renderer you don't control; memory is the secondary argument</td>
+  <td>the UI is a list + detail pane + form; native shells cost little and platform autofill APIs force native on iOS anyway</td>
+</tr>
+<tr>
+  <td>FFI</td>
+  <td><strong>uniffi — only when a non-Rust client exists</strong></td>
+  <td>hand JNI/Swift glue; adding uniffi on day one</td>
+  <td>Rust clients call core directly; FFI is a real secrecy boundary (§10)</td>
+</tr>
+<tr>
+  <td>Sync transport</td>
+  <td><strong><code>syncd</code></strong> — self-host binary (Rust+SQLite) <strong>or</strong> CF Worker+R2 serverless; folder sync as zero-infra fallback</td>
+  <td>any trusted server</td>
+  <td>server compromise yields encrypted garbage (§8)</td>
+</tr>
+<tr>
+  <td>Build/CI</td>
+  <td>cargo workspaces, <code>cross</code>/zigbuild, cargo-deny, cargo-audit, cargo-bloat, criterion, RSS budgets</td>
+  <td>—</td>
+  <td>supply chain + footprint enforced in CI, not aspirationally</td>
+</tr>
+</tbody>
+</table>
+<h3 id="footprint-amp-performance-budget-ci-gated">Footprint &amp; performance budget (CI-gated)</h3>
+<table>
+<thead>
+<tr>
+  <th>Metric</th>
+  <th>Target</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>Locked-state resident footprint</td>
+  <td><strong>0 MB</strong> (daemon exits / never starts)</td>
+</tr>
+<tr>
+  <td>Daemon idle RSS (unlocked)</td>
+  <td>&lt;5 MB</td>
+</tr>
+<tr>
+  <td>TUI active RSS</td>
+  <td>&lt;15 MB</td>
+</tr>
+<tr>
+  <td>GUI RSS</td>
+  <td>&lt;40 MB (measured before toolkit commit)</td>
+</tr>
+<tr>
+  <td>Argon2 transient peak</td>
+  <td>per device class: ≤256 MiB desktop / ≤64 MiB mobile, unlock only, freed after</td>
+</tr>
+<tr>
+  <td>Cold <code>get</code> incl. unlock</td>
+  <td>&lt;300 ms</td>
+</tr>
+<tr>
+  <td>Warm <code>get</code> via daemon</td>
+  <td>&lt;10 ms</td>
+</tr>
+<tr>
+  <td>10k-record load + merge</td>
+  <td>&lt;100 ms</td>
+</tr>
+<tr>
+  <td>CLI binary (stripped + LTO)</td>
+  <td>&lt;3 MB</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="5-cryptographic-design">5. Cryptographic design</h2>
+<h3 id="key-hierarchy">Key hierarchy</h3>
+<pre><code>master_password ─Argon2id(salt, m, t, p)→ KEK ─┐
+recovery_code   ─Argon2id(salt2,m,t,p)─→ rKEK ─┤ each wraps the
+biometric slot  (OS keychain, per device) ─────┘ KEY BUNDLE:
+                                              DEK(32B) + owner_sign_priv
+
+DEK ─blake3::derive_key→ k_meta (non-auth metadata MAC)
+                      └→ k_rec = derive_key(&quot;rec:&quot;+record_id)  per record
+
+owner_sign (Ed25519, random at init) — signs MANIFEST + device registry
+device_sign (Ed25519, per device, pubkey in registry) — signs own ops + heads
+</code></pre>
+<ul>
+<li><strong>Wrap slots wrap a bundle, not just the DEK</strong> — the owner signing key rides
+alongside so every authorized unlock path can sign.</li>
+<li><strong>Why signatures, not MACs:</strong> <code>k_meta</code> is held by <em>every</em> device — a MAC'd
+registry proves &quot;someone with the DEK wrote this,&quot; so a revoked device could
+un-tombstone itself. Owner-signed manifest/registry + device-signed ops make
+revocation real. <code>k_meta</code> remains only for non-authoritative metadata.</li>
+<li><strong>Device revocation = one atomic transition</strong> (<code>key_epoch</code> rotation):
+new DEK + new owner key + <strong>forced new master password</strong> + <strong>new recovery
+code</strong> + new device registry + fresh snapshot, staged as immutable objects
+then published atomically (CAS). Reason: a compromised device may hold the
+old password/recovery KEK — re-wrapping a new DEK under unchanged KEKs lets
+it unwrap instantly. Rotation protects <em>future</em> ops only; credentials the
+device already saw must be rotated at their services.</li>
+<li><strong>No fast-hash unlock check.</strong> Verify by trial-decrypting the wrap slot —
+a stored verifier is a brute-force oracle.</li>
+<li><strong>Per-record subkeys</strong> (<code>k_rec</code>) give domain separation; random XChaCha
+nonces mean no counter state to fork.</li>
+</ul>
+<h3 id="vault-a-directory-not-a-file">Vault = a directory, not a file</h3>
+<pre><code>vault/
+  MANIFEST            owner-signed: vault_id, format_version,
+                      min_reader_version, argon2 params, wrap slots,
+                      key_epoch, snapshot_epoch, device registry,
+                      purged_before_epoch, owner_sig
+  ops/
+    &lt;device_id&gt;.log   append-only, hash-chained, device-signed ops
+  snapshots/
+    snap-&lt;epoch&gt;.bin  compacted state + certified per-device chain anchors
+</code></pre>
+<p><strong>Op log entry</strong> — everything sensitive lives inside the AEAD; on disk an op
+is <code>seq(8) || nonce(24) || device_sig(64) || ct</code>:</p>
+<pre><code>ct  = XChaCha20-Poly1305(k_ops, nonce,
+      aad = vault_id | format_v | key_epoch | device_id | seq,
+      pt  = TLV { prev_op_hash, hlc, type, record_id(rnd128), kind,
+                  schema_v, created, name, fields_ct, gossip[] })
+
+fields_ct = nonce2 || XChaCha20-Poly1305(k_rec, nonce2,
+            aad = vault_id | record_id | key_epoch,
+            pt2 = TLV { fields{…per-kind…}, tags, custom_fields?, versions[] })
+
+op_hash = BLAKE3(canonical op bytes)
+</code></pre>
+<p><strong>Two layers, deliberately</strong> (implementation correction to the original
+single-layer sketch): <code>record_id</code> must live inside the outer ciphertext —
+but <code>k_rec</code> is <em>derived from</em> <code>record_id</code>, so it can't key the outer layer
+(circular). Hence <code>k_ops</code> (one vault-wide ops key) seals the record graph
+from the server, while the secret <code>fields</code> blob gets a second AEAD under
+<code>k_rec</code>. A DEK-holder sees name/kind/ids — enough to index and merge —
+while field plaintext requires the per-record key: decrypt-on-demand stays
+real. <code>name</code> sits in the outer layer so <code>list</code>/search never touch <code>k_rec</code>.</p>
+<ul>
+<li><strong><code>record_id</code>, <code>hlc</code>, <code>type</code> are inside the ciphertext.</strong> In the header they
+let a malicious server flip upsert→tombstone (AEAD still verifies — header
+fields not in AAD are unauthenticated) or <em>selectively suppress one
+record's ops</em> — strictly worse than whole-log withholding. Server-side
+indexing needs only <code>(device_id, seq)</code>.</li>
+<li><strong><code>gossip</code> kills two attack classes cheaply</strong>: an op records what this
+device last saw of every other device. Any device reading it can detect
+(a) <strong>prefix rollback</strong> of another device's log, and (b) <strong>equivocation</strong> —
+the server serving divergent valid chains to different clients — with zero
+prior local state. Hash chains alone catch neither.</li>
+<li><strong><code>device_sig</code> signs the canonical op</strong> — shared DEK doesn't prove
+authorship (any DEK holder can derive <code>k_rec</code> and forge another device's
+ops). Signatures verified against the enrolled registry + revocation cutoff.</li>
+<li><strong>Canonical encoding is law</strong>: fixed-length fields, fixed order, domain-
+separated hashes; reject duplicate keys and noncanonical encodings.
+<code>prev_op_hash</code> must equal the actual predecessor <em>in this file</em> — that's
+what makes cross-log op relocation fail.</li>
+<li><strong>HLC is ordering, not authority.</strong> Ops with <code>hlc &gt; now + skew</code> are
+<em>quarantined</em> (not dropped — legit clock skew exists); equal HLCs break by
+deterministic hash; conflict UI always shows &quot;version from device X, dated
+Y&quot; so a future-dated win is visible.</li>
+</ul>
+<p><strong>What this buys</strong></p>
+<ul>
+<li><strong>Structural conflict-freedom at the fs layer</strong> — only the owning device
+writes its log; sync conflicts at file level are impossible.</li>
+<li><strong>Truncation/tamper evidence</strong> — hash chains + device signatures; a mid-log
+cut or splice fails verification. Chain break ⇒ loud error, quarantine the
+suffix, explicit user salvage (salvage never silently overrides the chain).</li>
+<li><strong>Membership + rollback detection</strong> — snapshot manifest signs the full
+record set AND per-device chain anchors <code>{device_id, seq, head_hash}</code>;
+gossip vectors catch rollback/equivocation between snapshots.</li>
+<li><strong>Targeted-suppression resistance</strong> — server sees only opaque per-device
+sequences; it cannot tell which record an op touches.</li>
+<li><strong>Cross-vault replay resistance</strong> — <code>vault_id</code> + <code>device_id</code> + <code>key_epoch</code>
+in every AAD.</li>
+</ul>
+<hr />
+<h2 id="6-item-model">6. Item model</h2>
+<p>Every record is a typed <strong>item</strong>: one <code>kind</code>, one <code>schema_v</code>, per-kind field
+schema. Common meta on all kinds: <code>name</code>, <code>tags</code>, <code>favorite</code>, <code>created</code>,
+<code>modified_hlc</code>, <code>versions[]</code> (history + preserved conflicts), <code>custom_fields</code>.</p>
+<table>
+<thead>
+<tr>
+  <th>kind</th>
+  <th>key fields</th>
+  <th>notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><code>login</code></td>
+  <td>username, password, urls[], totp?</td>
+  <td>the default; TOTP embeds here or standalone</td>
+</tr>
+<tr>
+  <td><code>card</code></td>
+  <td>number, exp_month/year, cvv, holder, pin?, brand, billing_addr?</td>
+  <td>cvv/pin masked by default, separate reveal action</td>
+</tr>
+<tr>
+  <td><code>apikey</code></td>
+  <td>key, secret?, endpoint, env, scopes?, expires?</td>
+  <td>dev credentials; feeds <code>mypassman run</code></td>
+</tr>
+<tr>
+  <td><code>totp</code></td>
+  <td>secret, algorithm, digits, period, issuer</td>
+  <td>standalone authenticator entries; <code>otpauth://</code> import (+ QR scan on mobile)</td>
+</tr>
+<tr>
+  <td><code>secret</code></td>
+  <td>text/blob + custom fields</td>
+  <td>.env bundles, software licenses, seed phrases*</td>
+</tr>
+<tr>
+  <td><code>identity</code></td>
+  <td>name, address, phone, email</td>
+  <td>form autofill companion to <code>card</code></td>
+</tr>
+<tr>
+  <td><code>sshkey</code></td>
+  <td>private, public, fingerprint, comment</td>
+  <td>dev power feature; can feed ssh-agent via daemon</td>
+</tr>
+<tr>
+  <td><code>attachment</code></td>
+  <td>blob_ref, filename, size, mime</td>
+  <td><strong>post-1.0</strong> — separate size-bucketed blob store</td>
+</tr>
+</tbody>
+</table>
+<p>* seed phrases live fine in <code>secret</code>; docs should note the hot-vs-cold
+storage debate honestly rather than pretend it away.</p>
+<p><strong>Per-kind hardening notes</strong></p>
+<ul>
+<li><code>card.cvv</code>/<code>card.pin</code>/<code>sshkey.private</code>/<code>totp.secret</code> get the masked-by-default
+treatment: never rendered in list views, reveal is an explicit action,
+excluded from clipboard bulk ops.</li>
+<li><code>schema_v</code> per kind → field evolution without format migrations.</li>
+</ul>
+<p><strong>Power features this unlocks (the &quot;complete&quot; part)</strong></p>
+<ul>
+<li><code>mypassman run --item github/apikey -- npm publish</code> — injects item fields
+into a child process env (1Password <code>op run</code> equivalent); secrets never hit
+disk, shell history, or <code>.env</code> files.</li>
+<li><code>mypassman inject .env.tpl</code> — template rendering for dev environments.</li>
+<li><code>mypassman otp &lt;item&gt;</code> — current TOTP to stdout/clipboard.</li>
+<li><code>mypassman ssh-add &lt;item&gt;</code> — load an <code>sshkey</code> into the agent.</li>
+<li>Password health across kinds: reused passwords, expired/expiring API keys
+and cards, weak/generated-vs-human analysis.</li>
+</ul>
+<hr />
+<h2 id="7-storage-amp-durability">7. Storage &amp; durability</h2>
+<ul>
+<li><strong>Durable writes</strong>: append → <code>fsync</code> file → <code>fsync</code> dir. Atomic rename for
+manifest/snapshots, same fsync discipline. Rename alone is <em>not</em> durability —
+the code path is platform-aware (incl. macOS <code>F_FULLFSYNC</code>).</li>
+<li><strong>Hostile-input bounds</strong>: on open, validate Argon2 params against a device
+cap <em>before</em> allocating (a tampered manifest claiming 64 GB is a DoS), and
+bound op/record lengths before reading.</li>
+<li><strong>Snapshots &amp; GC</strong>: compaction merges all logs into <code>snap-&lt;epoch&gt;.bin</code>,
+which certifies per-device chain anchors <code>{device_id, seq, head_hash}</code> +
+<code>key_epoch</code> — a rejoining device's log restarts chain verification from its
+certified anchor. GC policy: <code>max(retention_days, all-devices-acked)</code>;
+pruning a log whose device hasn't acked is a <strong>user-visible decision</strong>
+(&quot;old iPad hasn't synced in 90 days — pruning makes its unsynced edits
+unmergeable&quot;). Never fully automatic: an indefinitely offline device can't
+be distinguished from a dead one.</li>
+<li><strong>Resurrection guard</strong>: manifest carries <code>purged_before_epoch</code>; pre-watermark
+ops for records absent from the snapshot are <strong>rejected</strong>, not applied —
+otherwise an offline device's stale upsert resurrects a tombstoned record.
+Tombstone knowledge outlives the deleted ciphertext.</li>
+<li><strong>Single writer per device</strong>: app/extension/CLI serialize appends through
+transactional local storage — local concurrency must not fork an honest
+chain. Restoring from backup reconciles first or starts a <strong>new device
+incarnation</strong>; an old writer identity resuming unaware of later writes is a
+self-inflicted equivocation.</li>
+<li><strong>Backups</strong>: rotating encrypted snapshots + a snapshot before <em>every</em>
+migration + a tested restore path. Corruption/user-error will beat attackers
+to your data.</li>
+<li><strong>Salvage</strong>: replay any log, keep AEAD-valid ops — one corrupt op never
+kills the vault. But a chain break is exactly what a splice looks like:
+salvage is loud, quarantines the suffix, and requires explicit user action.</li>
+<li><strong>No compression.</strong> Compress-then-encrypt leaks plaintext structure through
+ciphertext length (a random password compresses differently than a
+passphrase). Vaults are kilobytes — skip it. If attachments ever land,
+compress those fields only, post-pad.</li>
+</ul>
+<hr />
+<h2 id="8-sync-amp-merge">8. Sync &amp; merge</h2>
+<p><strong>Unit of replication:</strong> files in <code>ops/</code> and <code>snapshots/</code> — never merged at
+the file level, only at the op level, on read.</p>
+<p><strong>Merge semantics (no silent LWW):</strong></p>
+<ul>
+<li>Same <code>record_id</code>, sequential edits → max-HLC wins.</li>
+<li>Same <code>record_id</code>, <em>concurrent</em> edits → winner by HLC, <strong>loser preserved</strong>
+in <code>versions[]</code> and surfaced in UI (&quot;2 conflicted versions&quot;). Password
+history exists anyway; conflicts ride it. Locking yourself out of a real
+account because the newer password was silently dropped is the failure mode
+this design exists to prevent.</li>
+<li>Optional field-level merge later (disjoint fields merge cleanly); v1 keeps
+record-level winner + preserved loser — explainable, testable.</li>
+<li><strong>Tombstones</strong> are real ops revealing only <code>(device_id, seq)</code> — <code>record_id</code>
+lives inside the ciphertext. A tombstone beats an upsert iff its HLC is
+later. Purged at compaction, but the <code>purged_before_epoch</code> rejection
+frontier (§7) prevents resurrection by lagging devices.</li>
+</ul>
+<p><strong>Rollback/starvation detection:</strong> owner-signed manifest <code>snapshot_epoch</code> is
+monotonic; each device persists a high-water mark of (epoch, per-device op
+counts); op-level gossip vectors let <em>fresh</em> devices detect rollback and
+forks without local state. Regression → loud warning, refuse to auto-apply.
+The nastiest remaining case — a server serving a valid <em>old</em> manifest +
+snapshot to a freshly restored device (re-enrolling a revoked device, old
+<code>key_epoch</code> as current) — is mitigated by owner-signed manifests, monotonic
+pinning, and printing the epoch in the recovery kit + UI so a human can
+eyeball it. A withheld device log is detectable (device &quot;goes silent&quot;) but
+not preventable — documented in <code>docs/THREATMODEL.md</code>.</p>
+<p><strong>Folder-sync reality:</strong> Syncthing/Dropbox/iCloud transport <em>files</em>, including
+conflict copies and partial writes. Per-device logs make our own files
+conflict-proof; conflict-copies of <em>manifest/snapshots</em> are merged by taking
+the max valid epoch. iCloud can serve stale partials → reads always verify
+MAC + chain before trusting.</p>
+<h3 id="syncd-the-quot-anywhere-quot-transport">syncd — the &quot;anywhere&quot; transport</h3>
+<p>API surface: <code>GET /ops?device=&amp;since=seq</code> (paged), <code>PUT</code> immutable objects,
+<code>GET</code>/<code>CAS-PUT</code> manifest+snapshots, optional <code>GET /hint</code> (WS/SSE). <strong>Trust
+lives in the format — but the server still enforces.</strong></p>
+<p><strong>Server-side rules (syncd is dumb, not naive):</strong></p>
+<ul>
+<li><strong>Gate reads too.</strong> Public ciphertext = bulk harvest + offline brute-force
+oracle on the password wrap slot + traffic analysis. Scoped capabilities:
+<code>read</code> / <code>write</code> / <code>admin</code> / <code>enroll</code> are <em>separate</em> grants; a device-write
+token can't replace the manifest, publish snapshots, mint tokens, or GC.</li>
+<li><strong>Immutable objects</strong>: <code>PUT</code> with same ID + same bytes = OK; same ID +
+different bytes = reject. Manifest/snapshot publication is compare-and-swap
+on <code>snapshot_epoch</code>. Never trust <code>?device=</code> or a path as authorization —
+bind each token to (vault, device_id, scope, lifecycle).</li>
+<li><strong>Cursor semantics</strong>: per-device sequence positions, bounded pages,
+explicit <code>snapshot_required</code> after GC. Clients verify continuity across
+pages; an empty page is not proof of full disclosure.</li>
+<li><strong>Bound everything before buffering</strong>: object size/count, vault bytes,
+devices, enrollment attempts, hint connections, per-token and per-IP rates.
+A compromised-but-authorized client can still exhaust storage.</li>
+<li><strong>Tokens</strong>: <code>Authorization</code> header only (never URL — access logs), stored
+in OS keychain not dotfiles, renewal fails post-revocation, commit-time
+authz check (in-flight writes of a just-revoked token die). Consider
+signing writes with the device key so a leaked token isn't a write
+capability.</li>
+<li><strong>Hints are untrusted wakeups</strong>: authenticated + server-debounced; an
+unauthenticated hint channel is an activity-tracking oracle, unthrottled
+it's a battery attack on your other devices.</li>
+<li><strong>syncd is never the durable copy.</strong> Local retention is independent of
+server state — if GC trusted &quot;the server has it,&quot; a rolled-back SQLite
+loses ops permanently.</li>
+<li><strong>Backend equivalence needs a transaction story</strong>: SQLite commits related
+metadata atomically; R2 needs conditional publication or a coordinator —
+object-level consistency doesn't give cross-object transactions. R2 list is
+eventually consistent → don't build cursors on list.</li>
+</ul>
+<p><strong>Deployment options (same protocol, three backends):</strong></p>
+<ul>
+<li><strong>Self-hosted binary</strong>: single Rust binary + SQLite, ~10 MB RSS, runs on a
+VPS / Raspberry Pi / NAS. Front with TLS (Caddy auto-HTTPS) or expose only
+on Tailscale — simplest, zero third parties.</li>
+<li><strong>Serverless</strong>: a Cloudflare Worker + R2 implements the same endpoints;
+free tier covers personal scale, globally reachable, nothing to administer.
+This <em>is</em> the pragmatic &quot;cloud option&quot; — you run it on your own CF account,
+so it stays self-hosted in spirit.</li>
+<li><strong>Managed cloud (post-1.0)</strong>: same code + a thin account layer —
+email/passkey auth → owns <code>vault_id</code>s → billing, quota, abuse controls.
+Same trust model: accounts gate tenancy and payment, never decryption.
+<code>enroll</code>-scope credentials stay device-to-device; the account can list
+your vaults' sizes but can't add devices or read ops without a paired
+device's signature chain.</li>
+</ul>
+<p><strong>Device enrollment:</strong> new device generates <code>device_sign</code> keypair → pairs via
+short code/QR with an enrolled device → enrolled device signs the new device
+into the registry (owner-signed manifest update) + writes its wrap slot.
+syncd gets a scoped read/write token; <code>enroll</code>-scope credentials never live
+on ordinary sync paths. Revocation = signed registry tombstone + token delete</p>
+<ul>
+<li>atomic <code>key_epoch</code> rotation (§5).</li>
+</ul>
+<p><strong>Push (optional):</strong> authenticated WS/SSE &quot;new epoch&quot; hint → clients re-pull
+and verify. On iOS see §9 — <code>BGAppRefresh</code> is unreliable; design foreground
+sync + extension-local pull, not hints-as-correctness.</p>
+<hr />
+<h2 id="9-clients-autofill-amp-daemon">9. Clients, autofill &amp; daemon</h2>
+<p>| Phase | Client | Autofill story |
+|---|---|---|
+| P1 | <strong>CLI + <code>mypassmand</code></strong> on macOS (socket-activated daemon; peer-cred auth on unix socket) | <code>get | pbcopy</code>, <code>run</code>, <code>otp</code>, <code>ssh-add</code> |
+| P2 | <strong>iOS app</strong> (SwiftUI + uniffi→Swift) — needed early because it's a daily-driver platform, and its AutoFill extension + syncd dependency force hard boundaries while code is small | AutoFill Credential Provider extension, FaceID unlock via Keychain wrap slot |
+| P3 | <strong>macOS app</strong> (SwiftUI, shares the iOS UI codebase) + menu-bar item | global hotkey → search → autotype; Safari Web Extension via native messaging |
+| P4 | <strong>Browser extensions</strong> (Safari first — it's the macOS default — then Chrome/Firefox family) — thin shell over native messaging | strict origin+frame matching, per-fill consent, extension-ID allowlist on the native host |
+| P5 | Windows / Linux / Android: CLI ports first (core is already portable), then native or Slint GUIs; Android Autofill Service | platform autofill APIs; Wayland autotype via uinput/ydotool — flagged risk |
+| P6 | TUI (ratatui) — fun, not load-bearing | same IPC |</p>
+<p><strong>Why iOS moved up:</strong> you live on phone+laptop, and iOS is the hardest client
+(sandboxing, AutoFill extension, Keychain semantics, no mlock). Building it
+early validates uniffi, the wrap-slot model, and syncd while the codebase is
+small — porting those decisions later is painful. macOS+iOS sharing one
+SwiftUI codebase makes native (not Slint) the right GUI call for the primary
+platforms; secondary platforms pick Slint or native per cost/benefit.</p>
+<h3 id="ios-breaks-the-daemon-model-design-for-it-explicitly">iOS breaks the daemon model — design for it explicitly</h3>
+<ul>
+<li><strong>There is no daemon on iOS.</strong> App, AutoFill extension, and share extension
+are <em>separate processes</em> sharing only an App Group container + Keychain
+access group. &quot;Unlocked&quot; on iOS = a keychain item + timestamp — a
+materially different security model that gets its own paragraph in
+<code>THREATMODEL.md</code>. Core must work <strong>in-process, no IPC</strong>; if the desktop
+daemon shapes core's API around the socket boundary, iOS re-litigates it.</li>
+<li><strong>Spike the AutoFill extension before the format freezes.</strong> Memory ceiling,
+cold-launch latency (credential picker must appear fast), and
+snapshot-size-to-first-decrypt all push back on Argon2 params and snapshot
+layout — discover those at M0/M1 with a throwaway extension opening a fake
+vault, not at M4.</li>
+<li><strong>Biometric wrap must be <code>kSecAttrAccessibleWhenUnlockedThisDeviceOnly</code></strong>
+or iCloud Keychain silently replicates the DEK wrap to every Apple device
+you own — defeating per-device slots entirely.</li>
+<li><strong>Biometric invalidation is a daily-path lockout:</strong>
+<code>BiometryCurrentSet</code> invalidates when the user adds a face/finger → the
+extension's fallback is &quot;open the main app to unlock,&quot; and the main app
+hands a short-lived unlock token through the App Group. Test this path
+explicitly; it's the first thing that breaks.</li>
+<li><strong>Keychain accessibility is a hard choice, not a detail</strong>: background sync
+may move ciphertext, but validation/rewrapping waits for permitted key
+access — never weaken accessibility class to keep sync running.</li>
+<li><strong>Sync on iOS is foreground-pull.</strong> <code>BGAppRefresh</code> won't reliably run and
+WS hints don't exist in background. APNs is the only real push — and it
+leaks sync timing to Apple + needs a token registry on syncd. Design
+decision: foreground + in-extension pull; APNs optional later, documented
+as a privacy tradeoff.</li>
+<li><strong>Suspension mid-operation</strong>: sync and <code>key_epoch</code> rotation must be
+resumable — assume the process dies between any two writes; both are
+staged/immutable-publish designs partly <em>because</em> of this.</li>
+<li><strong>uniffi honesty</strong>: FFI hands Swift <code>String</code>/<code>Data</code> on a heap you can't
+zeroize → handle-based APIs + <code>reveal(handle, into:)</code> from M1. The final
+hop into <code>UITextField</code>/AutoFill is an unzeroizable NSString no matter what
+— don't claim otherwise.</li>
+<li><strong>Pairing direction</strong>: phone-scans-desktop vs desktop-scans-phone changes
+which side holds the ephemeral key → spike with the phone in the loop
+before M3 ships.</li>
+</ul>
+<p>Autotype remains the universal fallback — works in browsers, terminals,
+Electron, anywhere a keyboard works.</p>
+<hr />
+<h2 id="10-secrecy-amp-hardening-checklist">10. Secrecy &amp; hardening checklist</h2>
+<ul>
+<li><code>zeroize</code>/<code>secrecy::SecretBox</code> on all key material; <code>mlock</code>/<code>VirtualLock</code>
+on DEK pages — <strong>but <code>mlock</code> is not load-bearing</strong>: <code>RLIMIT_MEMLOCK</code> is
+64 KiB on stock Linux, unavailable on iOS, and doesn't cover hibernation
+images. Pair with <code>RLIMIT_CORE=0</code>, non-dumpable (<code>prctl</code>/<code>PT_DENY_ATTACH</code>),
+Yama scope, and assume encrypted swap.</li>
+<li><strong>FFI is a secrecy boundary</strong>: managed heaps (Swift/Kotlin/JS) can't be
+zeroized. Cross-boundary APIs return handles or <code>Zeroizing&lt;Vec&lt;u8&gt;&gt;</code>
+buffers, never <code>String</code>. Prefer flows that keep the secret in-process
+(autotype, native-messaging fill) over copying it out.</li>
+<li><strong>Clipboard</strong>: advisory concealment only (<code>org.nspasteboard.ConcealedType</code>
+is a convention well-behaved apps <em>choose</em> to honor; mark non-syncable or
+Universal Clipboard ships it to your other devices). Auto-clear only after
+checking the clipboard still holds our value. Prefer autofill over
+clipboard wherever possible.</li>
+<li><strong>Auto-lock</strong>: idle T, suspend, screensaver, explicit → zeroize + daemon
+exits.</li>
+<li><strong>Biometric unlock is platform-specific</strong> — &quot;Secure Enclave wraps the DEK&quot;
+is not literally possible (SE holds P-256 keys only):<ul>
+<li>macOS/iOS: Keychain item with <code>kSecAccessControlBiometryCurrentSet</code>
+<em>or</em> SE P-256 key doing ECIES-wrap of the DEK — different properties,
+pick deliberately.</li>
+<li>Android: Keystore/StrongBox AES key, <code>setUserAuthenticationRequired</code>.</li>
+<li>Windows: Hello/DPAPI. Linux: secret-service, TPM2 optional.</li>
+</ul>
+</li>
+<li><strong>Failed-attempt handling</strong>: local escalating delay only; optional
+&quot;destroy biometric wrap after N failures&quot; off by default. No lockout can
+stop offline guessing — KDF params do that job.</li>
+<li><strong>Audit log is LOCAL-ONLY, never synced.</strong> Logging unlocks/failures/exports
+inside the vault turns reads into write ops (sync amplification) and
+publishes your activity pattern as op counts. Per-device local log, or drop
+it. Password health = explicit user-initiated full-decrypt operation —
+never a background job (it contradicts decrypt-on-demand).</li>
+<li><strong>What a hostile server still can do</strong> (documented, accepted): freeze one
+device's view (stale manifest) — mitigated by gossip + epoch display;
+observe that a <code>key_epoch</code> rotation happened (compromise-response signal);
+withhold entirely. Deletion, delivery, and global recency can't be
+guaranteed cryptographically.</li>
+<li><strong>Supply chain</strong>: committed <code>Cargo.lock</code>, cargo-deny (advisories+licenses),
+minimal deps, reproducible builds, signed releases (cosign/minisign),
+signed update manifest — the update channel is part of the threat model.</li>
+<li><strong>Fuzzing</strong>: <code>cargo-fuzz</code> over manifest/op/TLV/importer parsers — synced
+files are attacker-reachable input. Proptest merge invariants:
+idempotent, commutative, associative.</li>
+<li><strong>Versioning</strong>: <code>format_version</code> + <code>min_reader_version</code> in the MAC'd
+manifest; refuse newer, never silently downgrade, snapshot before migrate.
+Format freezes at first release; every later change is a migration with
+test vectors.</li>
+<li><strong>Independent audit</strong> before claiming &quot;safe for real secrets&quot; — self-review
+is not an audit.</li>
+</ul>
+<hr />
+<h2 id="11-recovery-amp-lifecycle-v1-not-later">11. Recovery &amp; lifecycle (v1, not later)</h2>
+<ul>
+<li><strong>Emergency kit</strong>: at <code>vault init</code>, generate a ~160-bit recovery code
+(printable words/base32); it Argon2id-derives an independent KEK that wraps
+the DEK in its own slot. Printed once, stored offline. Lost master password
+is the <em>most likely</em> catastrophic event for a personal vault.</li>
+<li><strong>Backups</strong>: automatic rotating encrypted snapshots; restore path tested in
+CI, not just written.</li>
+<li><strong>Import</strong>: CSV / KDBX (KeePassXC) / Bitwarden / 1Password — without import
+you won't dogfood; <strong>export</strong> (plaintext JSON, loud warnings) so the tool is
+never a roach motel.</li>
+<li><strong>Device revocation</strong>: atomic <code>key_epoch</code> transition — new DEK + new owner
+key + new password + new recovery code, staged then CAS-published (§5).
+Honest limit: it evicts <em>future</em> access; anything the device already saw
+must be rotated at the service. Recovery kit prints <code>key_epoch</code> so a
+human can spot a rollback.</li>
+</ul>
+<hr />
+<h2 id="12-roadmap">12. Roadmap</h2>
+<table>
+<thead>
+<tr>
+  <th>Milestone</th>
+  <th>Deliverable</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>M0</td>
+  <td><code>docs/FORMAT.md</code> + <code>docs/THREATMODEL.md</code> + <code>docs/SYNC.md</code> + test vectors + workspace + CI gates + <strong>throwaway iOS AutoFill-extension spike</strong> (measures memory ceiling, cold-launch latency, Argon2 fit — before anything freezes). <strong>Spec before code.</strong></td>
+</tr>
+<tr>
+  <td>M1</td>
+  <td><code>core</code>+<code>crypto</code>+<code>store</code>: vault init/open/CRUD/merge + all item kinds, fuzzed + proptested, handle-based secrecy API, single device, <strong>no sync yet</strong>. Format v1 freezes here — informed by the M0 spike.</td>
+</tr>
+<tr>
+  <td>M2</td>
+  <td>CLI + daemon (macOS): init/unlock/add/get/list/edit/gen/TOTP/copy/reveal/<code>run</code>/<code>otp</code>, auto-lock, recovery kit, import/export, backups. <strong>Daily-usable on your laptop.</strong></td>
+</tr>
+<tr>
+  <td>M3</td>
+  <td><code>syncd</code> self-host binary + device enrollment (pairing direction spiked <em>with</em> a phone) + merge + tombstones + compaction + conflict UI + gossip-vector verification. Test matrix: two offline devices editing one record, day-skewed clock, mid-sync partial file, restored-from-backup device, atomic <code>key_epoch</code> rotation, equivocation detection. <strong>Phone↔laptop anywhere sync lands here.</strong></td>
+</tr>
+<tr>
+  <td>M4</td>
+  <td>iOS app (SwiftUI + uniffi) + AutoFill extension + FaceID unlock (ThisDeviceOnly) + foreground-pull sync + <code>otpauth://</code> QR import. <strong>The &quot;use it everywhere&quot; point.</strong></td>
+</tr>
+<tr>
+  <td>M5</td>
+  <td>Minimal macOS app — shares the iOS SwiftUI codebase, so it's nearly free and kills the &quot;CLI-only on your work machine&quot; inversion; menu bar + autotype + TouchID</td>
+</tr>
+<tr>
+  <td>M6</td>
+  <td>Safari Web Extension + native messaging host; then Chrome/Firefox</td>
+</tr>
+<tr>
+  <td>M7</td>
+  <td>TUI; CF Worker syncd backend; Windows/Linux/Android CLI ports</td>
+</tr>
+<tr>
+  <td>M8</td>
+  <td>GUI+autofill on secondary platforms (Slint/native per platform), managed-cloud spike if desired</td>
+</tr>
+<tr>
+  <td>M9</td>
+  <td>External audit, reproducible releases, 1.0</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="13-alternatives-considered">13. Alternatives considered</h2>
+<table>
+<thead>
+<tr>
+  <th>Option</th>
+  <th>Verdict</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>Fork KeePassXC</td>
+  <td>C++/Qt, heavy, legacy format — but KDBX <strong>import</strong> is mandatory</td>
+</tr>
+<tr>
+  <td>pass + age/gpg</td>
+  <td>Right spirit; per-secret files + gpg UX fails the product bar</td>
+</tr>
+<tr>
+  <td>Bitwarden self-host</td>
+  <td>Heavy server + JS clients — fails footprint goal outright</td>
+</tr>
+<tr>
+  <td>1Password</td>
+  <td>Closed + Electron. UX reference only</td>
+</tr>
+<tr>
+  <td>age/rage</td>
+  <td>Format inspiration: chunked AEAD, simple header, streaming</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="14-risks-amp-open-questions">14. Risks &amp; open questions</h2>
+<ul>
+<li><strong>Argon2 params are baked per-vault</strong> — a desktop-tuned vault can OOM-kill
+the iOS app. Cap ≈256 MiB with higher <code>t</code>; calibrate to the weakest device
+class; params profile per wrap slot if needed.</li>
+<li><strong>Wayland autotype</strong> is fragmented (portals/uinput); may need
+compositor-specific paths.</li>
+<li><strong>iOS sync</strong> — resolved by syncd at M3/M4; iCloud Drive file sync remains a
+free fallback but stale-partial behavior makes syncd the primary path.</li>
+<li><strong>Log GC safety</strong> — policy is <code>max(retention, all-devices-acked)</code> +
+user-visible prune decisions; <code>docs/SYNC.md</code> must nail the cutoff/rebase
+semantics for revoked and long-offline devices.</li>
+<li><strong>Signature overhead</strong> — device sig + owner sig + gossip vector adds
+~100 B+/op; acceptable, but snapshot anchors must not bloat.</li>
+<li><strong>Owner key custody</strong> — signing key rides in every wrap slot; a device that
+only needs read/write shouldn't necessarily hold owner_sign → consider a
+separate &quot;admin&quot; slot tier so daily drivers can't re-enroll devices.
+Open question for FORMAT.md.</li>
+<li><strong>Scope creep</strong> — sharing/passkeys/orgs stay non-goals until 1.0.</li>
+</ul>
+<hr />
+<h2 id="15-repo-layout">15. Repo layout</h2>
+<pre><code>mypassman/
+  crates/
+    core/     op log, records, index, merge, conflict preservation
+    crypto/   kdf, aead, keywrap, subkeys, locked memory
+    store/    manifest, snapshots, durable io, backups
+    sync/     log replication, HLC, tombstones, compaction
+    cli/      clap CLI
+    daemon/   mypassmand (socket-activated agent)
+    tui/      ratatui app
+    gui/      SwiftUI app (macOS+iOS shared); Slint/native per secondary platform
+    ffi/      uniffi bindings (Swift first, Kotlin later)
+    nmhost/   browser native-messaging host
+    import/   CSV / KDBX / Bitwarden / 1Password importers
+    syncd/    self-host sync server (Rust+SQLite binary; CF Worker backend)
+  docs/       FORMAT.md · THREATMODEL.md · SYNC.md
+  DESIGN.md   (this file)
+</code></pre>
+
+    <footer>
+      Generated from DESIGN.md · mypassman · single-file artifact, no external resources
+    </footer>
+  </main>
+</div>
+</body>
+</html>
