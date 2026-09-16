@@ -458,6 +458,7 @@ dependencies = [
 name = "mypassman"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "clap",
  "mpm-core",
  "mpm-crypto",

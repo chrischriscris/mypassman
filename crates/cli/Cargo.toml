@@ -12,6 +12,7 @@ path = "main.rs"
 mpm-core = { path = "../core" }
 mpm-crypto = { path = "../crypto" }
 mpm-store = { path = "../store" }
+blake3.workspace = true
 clap.workspace = true
 rand_core.workspace = true
 rpassword.workspace = true
