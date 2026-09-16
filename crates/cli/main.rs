@@ -510,13 +510,9 @@ fn cmd_clipclear() -> Result<(), String> {
     let mut hash = String::new();
     std::io::stdin().read_to_string(&mut hash).map_err(|e| e.to_string())?;
     std::thread::sleep(std::time::Duration::from_secs(clip_ttl()));
-    if let Ok(out) = std::process::Command::new("pbpaste").output() {
-        if out.status.success()
-            && blake3::hash(&out.stdout).to_hex().as_str() == hash.trim()
-        {
-            let _ = std::process::Command::new("sh")
-                .args(["-c", "pbcopy < /dev/null"])
-                .status();
+    if let Some(cur) = clip_read() {
+        if blake3::hash(&cur).to_hex().as_str() == hash.trim() {
+            clip_clear();
         }
     }
     Ok(())
@@ -525,27 +521,127 @@ fn cmd_clipclear() -> Result<(), String> {
 #[cfg(not(target_os = "macos"))]
 fn copy_to_clipboard(val: &[u8]) -> Result<(), String> {
     use std::io::Write;
-    for cmd in ["wl-copy", "xclip", "xsel"] {
-        let args: &[&str] = match cmd {
-            "xclip" => &["-selection", "clipboard"],
-            "xsel" => &["--clipboard", "--input"],
-            _ => &[],
-        };
-        if let Ok(mut p) = std::process::Command::new(cmd)
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
+    use std::process::{Command, Stdio};
+
+    // write via whatever the platform offers, then spawn the janitor
+    let tools: &[(&str, &[&str])] = if cfg!(target_os = "windows") {
+        &[("clip", &[])]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+    let mut wrote = false;
+    for &(cmd, args) in tools {
+        if let Ok(mut p) = Command::new(cmd).args(args).stdin(Stdio::piped()).spawn() {
             if let Some(mut s) = p.stdin.take() {
                 if s.write_all(val).is_ok() {
                     drop(s);
                     let _ = p.wait();
-                    return Ok(());
+                    wrote = true;
+                    break;
                 }
             }
         }
     }
-    Err("no clipboard tool found (wl-copy/xclip/xsel)".into())
+    if !wrote {
+        return Err("no clipboard tool found (wl-copy/xclip/xsel/clip)".into());
+    }
+
+    // concealment: no standard on Linux/X11 or `clip`; KDE hint and Windows'
+    // ExcludeClipboardContentFromMonitorProcessing need real API bindings —
+    // noted in DESIGN.md. Janitor auto-clear still applies everywhere.
+    if clip_read().is_some() && clip_clear_supported() {
+        let hash = blake3::hash(val).to_hex().to_string();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Ok(mut c) = Command::new(exe)
+                .arg("__clipclear")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                if let Some(mut s) = c.stdin.take() {
+                    let _ = s.write_all(hash.as_bytes());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read current clipboard bytes — per platform.
+#[cfg(target_os = "macos")]
+fn clip_read() -> Option<Vec<u8>> {
+    std::process::Command::new("pbpaste")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| o.stdout)
+}
+
+#[cfg(target_os = "linux")]
+fn clip_read() -> Option<Vec<u8>> {
+    for (cmd, args) in [
+        ("wl-paste", ["-n"].as_slice()),
+        ("xclip", ["-selection", "clipboard", "-o"].as_slice()),
+        ("xsel", ["--clipboard", "--output"].as_slice()),
+    ] {
+        if let Ok(o) = std::process::Command::new(cmd).args(args).output() {
+            if o.status.success() {
+                return Some(o.stdout);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn clip_read() -> Option<Vec<u8>> {
+    std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| o.stdout)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn clip_read() -> Option<Vec<u8>> {
+    None
+}
+
+/// Clear the clipboard — per platform.
+fn clip_clear() -> bool {
+    #[cfg(target_os = "macos")]
+    let cmds: &[(&str, &[&str])] = &[("sh", &["-c", "pbcopy < /dev/null"])];
+    #[cfg(target_os = "linux")]
+    let cmds: &[(&str, &[&str])] = &[
+        ("wl-copy", &["-c"]),
+        ("sh", &["-c", "printf '' | xclip -selection clipboard"]),
+        ("sh", &["-c", "xsel --clipboard --clear"]),
+    ];
+    #[cfg(target_os = "windows")]
+    let cmds: &[(&str, &[&str])] =
+        &[("powershell", &["-NoProfile", "-Command", "Set-Clipboard -Value ''"])];
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let cmds: &[(&str, &[&str])] = &[];
+
+    for &(cmd, args) in cmds {
+        if let Ok(st) = std::process::Command::new(cmd).args(args).status() {
+            if st.success() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clip_clear_supported() -> bool {
+    cfg!(any(target_os = "linux", target_os = "windows"))
 }
 
 fn rand_core_fill(b: &mut [u8]) {
