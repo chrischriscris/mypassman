@@ -63,11 +63,11 @@ pub mod tag {
     pub const NAME: u8 = 0x01;
     pub const NOTES: u8 = 0x02;
     pub const TAGS: u8 = 0x03; // comma-separated
-    // login
+                               // login
     pub const USERNAME: u8 = 0x10;
     pub const PASSWORD: u8 = 0x11;
     pub const URL: u8 = 0x12; // repeatable
-    // card
+                              // card
     pub const CARD_NUMBER: u8 = 0x20;
     pub const CARD_EXP: u8 = 0x21; // "MM/YY"
     pub const CARD_CVV: u8 = 0x22;
@@ -113,7 +113,10 @@ impl Item {
     }
 
     pub fn get(&self, tag: u8) -> Option<&[u8]> {
-        self.fields.get(&tag).and_then(|v| v.first()).map(|v| v.as_slice())
+        self.fields
+            .get(&tag)
+            .and_then(|v| v.first())
+            .map(|v| v.as_slice())
     }
 
     pub fn get_str(&self, tag: u8) -> Option<&str> {
@@ -143,14 +146,24 @@ impl Item {
     pub fn decode(buf: &[u8]) -> Result<Self> {
         let mut item = Item::default();
         let mut r = Reader::new(buf);
-        let mut last_tag = 0u8;
+        let mut ord = crate::tlv::OrderGuard::default();
         while let Some((t, v)) = r.next_field()? {
-            if t < last_tag {
-                return Err(CoreError::Tlv("non-canonical tag order"));
-            }
+            ord.check(t, &[tag::URL])?; // only URL may repeat
             item.push(t, v.to_vec());
-            last_tag = t;
         }
         Ok(item)
+    }
+}
+
+/// An Item holds decrypted secret field bytes — scrub them on drop rather
+/// than leaving them on freed heap. (Defense-in-depth; see mem.rs removal
+/// note in DESIGN.md.)
+impl Drop for Item {
+    fn drop(&mut self) {
+        for vals in self.fields.values_mut() {
+            for v in vals.iter_mut() {
+                zeroize::Zeroize::zeroize(v);
+            }
+        }
     }
 }

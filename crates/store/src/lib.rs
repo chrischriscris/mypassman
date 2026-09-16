@@ -7,7 +7,8 @@
 //! Device private keys live OUTSIDE the synced vault dir under the OS
 //! data dir — a device key must never be replicated by file sync.
 
-use mpm_core::op::{Op, OP_HEADER_LEN};
+use fs2::FileExt;
+use mpm_core::op::Op;
 use mpm_core::Manifest;
 use mpm_crypto::DeviceKey;
 use std::fs::{self, File, OpenOptions};
@@ -27,6 +28,10 @@ pub enum StoreError {
     NoVault(PathBuf),
     #[error("no device key for this vault on this machine")]
     NoDeviceKey,
+    #[error("vault is busy (another mypassman process holds the write lock)")]
+    Busy,
+    #[error("op log rolled back or diverged from last verified checkpoint")]
+    RolledBack,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -40,9 +45,10 @@ pub fn init_dir(dir: &Path) -> Result<()> {
     if dir.join(MANIFEST).exists() {
         return Err(StoreError::Exists(dir.to_path_buf()));
     }
-    fs::create_dir_all(dir.join(OPS_DIR))?;
-    fs::create_dir_all(dir.join(SNAPS_DIR))?;
-    set_private_dir(dir)?;
+    // mode set at creation — no 0755→0700 chmod window
+    private_dirs().create(dir.join(OPS_DIR))?;
+    private_dirs().create(dir.join(SNAPS_DIR))?;
+    set_private_dir(dir)?; // belt+braces: an existing parent may pre-date us
     Ok(())
 }
 
@@ -55,56 +61,110 @@ pub fn load_manifest(dir: &Path) -> Result<Manifest> {
     Ok(Manifest::from_file(&buf)?)
 }
 
-/// Durable manifest write: tmp → fsync → rename → fsync dir.
+/// Exclusive write lock for the vault (flock). Hold across
+/// read-modify-write sequences or two processes can append the same seq.
+/// Lock file is never truncated, so a pre-planted symlink is harmless.
+pub fn lock_vault(dir: &Path) -> Result<File> {
+    // .append would be wrong here (the lock file must not grow), and we
+    // never write through this handle at all — flock is the whole point
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(".lock"))?;
+    f.try_lock_exclusive().map_err(|_| StoreError::Busy)?;
+    Ok(f)
+}
+
+/// Durable manifest write: unique tmp (O_EXCL — never follows a planted
+/// symlink) → fsync → rename → fsync dir.
 pub fn write_manifest(dir: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = dir.join(".MANIFEST.tmp");
+    let tmp = dir.join(format!(".MANIFEST.{}.tmp", std::process::id()));
     let dst = dir.join(MANIFEST);
-    {
-        let mut f = File::create(&tmp)?;
-        set_private_file(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+    let res = (|| -> Result<()> {
+        {
+            let mut f = private_files().create_new(true).open(&tmp)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, &dst)?;
+        fsync_dir(dir)
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, &dst)?;
-    fsync_dir(dir)
+    set_private_file(&dst)?;
+    res
 }
 
 pub fn log_path(dir: &Path, device_id: &[u8; 16]) -> PathBuf {
     dir.join(OPS_DIR).join(format!("{}.log", hex(device_id)))
 }
 
-/// Append a canonical op and fsync. Ops are self-delimiting.
+/// Append a canonical op and fsync — the file AND the ops dir (a new
+/// log's directory entry is not durable without the second fsync).
 pub fn append_op(dir: &Path, device_id: &[u8; 16], op: &Op) -> Result<()> {
     let path = log_path(dir, device_id);
-    let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut f = private_files().create(true).append(true).open(&path)?;
+    // fd-level check: refuse to append into a non-regular file (planted
+    // symlink/hardlink). The opened fd pins the object — no TOCTOU here.
+    if !f.metadata()?.is_file() {
+        return Err(StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "op log is not a regular file",
+        )));
+    }
     set_private_file(&path)?;
     f.write_all(&op.encode())?;
     f.sync_all()?;
+    fsync_dir(&dir.join(OPS_DIR))?;
     Ok(())
 }
 
-/// Read all ops from a device log, in order.
-pub fn read_ops(dir: &Path, device_id: &[u8; 16]) -> Result<Vec<Op>> {
+/// Result of reading a device log: verified-prefix ops plus a flag for a
+/// torn tail (crash mid-append leaves a truncated final record — that is
+/// expected damage, distinct from mid-log corruption which stays fatal).
+pub struct LogRead {
+    pub ops: Vec<Op>,
+    pub torn_tail: bool,
+}
+
+/// Read all ops from a device log, in order. A truncated final record is
+/// reported as `torn_tail` rather than failing the whole log.
+pub fn read_ops(dir: &Path, device_id: &[u8; 16]) -> Result<LogRead> {
     let path = log_path(dir, device_id);
     let mut buf = Vec::new();
     match File::open(&path) {
         Ok(mut f) => {
             f.read_to_end(&mut buf)?;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LogRead {
+                ops: Vec::new(),
+                torn_tail: false,
+            })
+        }
         Err(e) => return Err(e.into()),
     }
     let mut ops = Vec::new();
     let mut pos = 0usize;
+    let mut torn_tail = false;
     while pos < buf.len() {
-        if buf.len() - pos < OP_HEADER_LEN {
-            return Err(mpm_core::CoreError::Tlv("trailing partial op").into());
+        match Op::decode(&buf[pos..]) {
+            Ok((op, end)) => {
+                ops.push(op);
+                pos += end;
+            }
+            // a torn write can only ever be the last record
+            Err(_) if pos > 0 => {
+                torn_tail = true;
+                break;
+            }
+            Err(e) => return Err(e.into()),
         }
-        let (op, end) = Op::decode(&buf[pos..])?;
-        ops.push(op);
-        pos += end;
     }
-    Ok(ops)
+    Ok(LogRead { ops, torn_tail })
 }
 
 /// List device log files present in the vault (hex device ids).
@@ -122,14 +182,22 @@ pub fn list_device_logs(dir: &Path) -> Result<Vec<[u8; 16]>> {
             }
         }
     }
+    // readdir order is filesystem-dependent — sort so every caller sees a
+    // stable scan (merge itself is order-independent, but logs and audit
+    // output shouldn't be)
+    out.sort_unstable();
     Ok(out)
 }
 
 // ── device keys (OUTSIDE the vault dir) ─────────────────────────────
 
 fn device_dir() -> Result<PathBuf> {
-    let base = dirs::data_local_dir()
-        .ok_or_else(|| StoreError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "no data dir")))?;
+    let base = dirs::data_local_dir().ok_or_else(|| {
+        StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no data dir",
+        ))
+    })?;
     Ok(base.join("mypassman").join("devices"))
 }
 
@@ -140,13 +208,16 @@ fn device_key_path(vault_id: &[u8; 16]) -> Result<PathBuf> {
 /// File layout: device_id(16) || seed(32). Mode 0600.
 pub fn save_device_key(vault_id: &[u8; 16], key: &DeviceKey) -> Result<()> {
     let dir = device_dir()?;
-    fs::create_dir_all(&dir)?;
+    private_dirs().create(&dir)?;
     set_private_dir(&dir)?;
     let path = device_key_path(vault_id)?;
     let mut buf = Vec::with_capacity(48);
     buf.extend_from_slice(&key.id);
     buf.extend_from_slice(key.seed_bytes());
-    fs::write(&path, &buf)?;
+    // mode at creation: the seed must never exist at 0644, even briefly
+    let mut f = private_files().create(true).truncate(true).open(&path)?;
+    f.write_all(&buf)?;
+    f.sync_all()?;
     set_private_file(&path)?;
     Ok(())
 }
@@ -167,7 +238,118 @@ pub fn load_device_key(vault_id: &[u8; 16]) -> Result<DeviceKey> {
     Ok(DeviceKey::from_bytes(&seed, id))
 }
 
+// ── head checkpoints (outside the synced vault dir) ─────────────────
+//
+// The op log's tail is self-authenticating, but a *prefix rollback*
+// (truncating the log, deleting it) verifies cleanly against genesis.
+// The checkpoint persists the last head WE verified, signed by this
+// device, so a shortened/diverged log is caught at unlock.
+//
+// File: sig(64) || device_id(16) || seq(8) || head(32); the signature
+// covers "mypassman/v1/ckpt" | vault_id | device_id | seq | head.
+
+const CKPT_DOMAIN: &[u8] = b"mypassman/v1/ckpt";
+
+fn ckpt_path(vault_id: &[u8; 16]) -> Result<PathBuf> {
+    Ok(device_dir()?.join(format!("{}.head", hex(vault_id))))
+}
+
+fn ckpt_preimage(vault_id: &[u8; 16], device_id: &[u8; 16], seq: u64, head: &[u8; 32]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(CKPT_DOMAIN.len() + 16 + 16 + 8 + 32);
+    p.extend_from_slice(CKPT_DOMAIN);
+    p.extend_from_slice(vault_id);
+    p.extend_from_slice(device_id);
+    p.extend_from_slice(&seq.to_le_bytes());
+    p.extend_from_slice(head);
+    p
+}
+
+/// Persist the verified log tip. `seq` is the op's seq (0 for empty log).
+pub fn save_checkpoint(
+    vault_id: &[u8; 16],
+    device: &DeviceKey,
+    seq: u64,
+    head: &[u8; 32],
+) -> Result<()> {
+    let dir = device_dir()?;
+    private_dirs().create(&dir)?;
+    let sig = device.sign(&ckpt_preimage(vault_id, &device.id, seq, head));
+    let mut buf = Vec::with_capacity(64 + 16 + 8 + 32);
+    buf.extend_from_slice(&sig.to_bytes());
+    buf.extend_from_slice(&device.id);
+    buf.extend_from_slice(&seq.to_le_bytes());
+    buf.extend_from_slice(head);
+    let path = ckpt_path(vault_id)?;
+    // unique tmp + rename: never partial, never follows a planted symlink
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    {
+        let mut f = private_files().create_new(true).open(&tmp)?;
+        f.write_all(&buf)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    set_private_file(&path)?;
+    Ok(())
+}
+
+/// A verified checkpoint for this device: (seq, head).
+pub fn load_checkpoint(vault_id: &[u8; 16], device: &DeviceKey) -> Result<Option<(u64, [u8; 32])>> {
+    let buf = match fs::read(ckpt_path(vault_id)?) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if buf.len() != 120 {
+        return Err(StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "checkpoint corrupt",
+        )));
+    }
+    let sig = ed25519_dalek::Signature::from_bytes(&buf[..64].try_into().unwrap());
+    let device_id: [u8; 16] = buf[64..80].try_into().unwrap();
+    let seq = u64::from_le_bytes(buf[80..88].try_into().unwrap());
+    let head: [u8; 32] = buf[88..120].try_into().unwrap();
+    if device_id != device.id {
+        return Ok(None); // belongs to a different device incarnation
+    }
+    let ok = mpm_crypto::keys::verify(
+        &device.verifying_key(),
+        &ckpt_preimage(vault_id, &device_id, seq, &head),
+        &sig,
+    )
+    .is_ok();
+    if !ok {
+        return Err(StoreError::RolledBack);
+    }
+    Ok(Some((seq, head)))
+}
+
 // ── durability / permissions ────────────────────────────────────────
+
+/// OpenOptions with 0600 baked into creation (unix) — secrets are born
+/// private instead of being chmod'd after the fact. On other platforms the
+/// ACL model differs; this is a no-op there.
+fn private_files() -> OpenOptions {
+    let mut o = OpenOptions::new();
+    o.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o
+}
+
+fn private_dirs() -> fs::DirBuilder {
+    let mut b = fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b
+}
 
 fn fsync_dir(dir: &Path) -> Result<()> {
     File::open(dir)?.sync_all()?;
@@ -203,7 +385,9 @@ pub fn hex(b: &[u8]) -> String {
 }
 
 fn unhex16(s: &str) -> Option<[u8; 16]> {
-    if s.len() != 32 {
+    // ascii-only: slicing a str at arbitrary byte offsets panics on
+    // multibyte chars — a crafted 32-byte filename could crash unlock.
+    if s.len() != 32 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 16];

@@ -12,7 +12,11 @@ pub struct KdfParams {
 impl Default for KdfParams {
     /// Desktop default: 64 MiB, 3 iterations, 1 lane.
     fn default() -> Self {
-        Self { m_kib: 65_536, t: 3, p: 1 }
+        Self {
+            m_kib: 65_536,
+            t: 3,
+            p: 1,
+        }
     }
 }
 

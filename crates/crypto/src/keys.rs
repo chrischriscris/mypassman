@@ -22,7 +22,10 @@ impl KeyBundle {
         let mut owner = [0u8; KEY_LEN];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut dek);
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut owner);
-        Self { dek: Zeroizing::new(dek), owner_seed: Zeroizing::new(owner) }
+        Self {
+            dek: Zeroizing::new(dek),
+            owner_seed: Zeroizing::new(owner),
+        }
     }
 
     pub fn owner_signing_key(&self) -> SigningKey {
@@ -49,7 +52,10 @@ impl KeyBundle {
         let mut owner = [0u8; KEY_LEN];
         dek.copy_from_slice(&b[..KEY_LEN]);
         owner.copy_from_slice(&b[KEY_LEN..]);
-        Ok(Self { dek: Zeroizing::new(dek), owner_seed: Zeroizing::new(owner) })
+        Ok(Self {
+            dek: Zeroizing::new(dek),
+            owner_seed: Zeroizing::new(owner),
+        })
     }
 
     /// Wrap the bundle under a KEK. Output = nonce(24) || ciphertext.
@@ -88,11 +94,17 @@ impl DeviceKey {
         let mut id = [0u8; 16];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut seed);
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut id);
-        Self { seed: Zeroizing::new(seed), id }
+        Self {
+            seed: Zeroizing::new(seed),
+            id,
+        }
     }
 
     pub fn from_bytes(seed: &[u8; KEY_LEN], id: [u8; 16]) -> Self {
-        Self { seed: Zeroizing::new(*seed), id }
+        Self {
+            seed: Zeroizing::new(*seed),
+            id,
+        }
     }
 
     pub fn seed_bytes(&self) -> &[u8; KEY_LEN] {

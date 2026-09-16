@@ -20,6 +20,9 @@ pub struct RecordSummary {
     pub hlc: u64,
     pub tombstoned: bool,
     fields_ct: Vec<u8>,
+    /// (device_id, seq) of the op that last won this record — the tiebreak
+    /// that makes equal-HLC merges order-independent.
+    origin: ([u8; DEVICE_ID_LEN], u64),
 }
 
 pub struct Vault {
@@ -28,11 +31,13 @@ pub struct Vault {
     device: DeviceKey,
     next_seq: u64,
     head: [u8; HASH_LEN],
+    max_hlc: u64,
     records: BTreeMap<[u8; RECORD_ID_LEN], RecordSummary>,
 }
 
+/// Wall-clock millis — metadata only (e.g. `enrolled_at`). Op ordering
+/// uses `Vault::next_hlc`, which is monotone against observed ops.
 pub fn now_hlc() -> u64 {
-    // v0: wall-clock millis. True HLC (counter + causal max) lands with sync.
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -61,8 +66,16 @@ impl Vault {
             device,
             next_seq: 1,
             head: [0u8; HASH_LEN],
+            max_hlc: 0,
             records: BTreeMap::new(),
         })
+    }
+
+    /// Monotone timestamp: wall clock, but never below max observed + 1.
+    /// A clock that stepped backwards must not produce tombstones/upserts
+    /// that lose to older ops on HLC comparison.
+    pub fn next_hlc(&self) -> u64 {
+        now_hlc().max(self.max_hlc.saturating_add(1))
     }
 
     /// Verify + apply one stored op from this device's log. Enforces seq
@@ -80,6 +93,7 @@ impl Vault {
             &vk,
             &self.bundle.dek,
             &self.manifest.vault_id,
+            self.manifest.format_v,
             self.manifest.key_epoch,
             &self.device.id,
         )?;
@@ -99,7 +113,13 @@ impl Vault {
         device_id: &[u8; DEVICE_ID_LEN],
         ops: &[Op],
     ) -> Result<Vec<OpPlaintext>> {
-        let entry = self.manifest.device(device_id).ok_or(CoreError::NotEnrolled)?;
+        let entry = self
+            .manifest
+            .device(device_id)
+            .ok_or(CoreError::NotEnrolled)?;
+        if !entry.active {
+            return Err(CoreError::NotEnrolled); // revoked devices don't merge
+        }
         let mut head = [0u8; HASH_LEN];
         let mut out = Vec::with_capacity(ops.len());
         for (i, op) in ops.iter().enumerate() {
@@ -110,6 +130,7 @@ impl Vault {
                 &entry.vk,
                 &self.bundle.dek,
                 &self.manifest.vault_id,
+                self.manifest.format_v,
                 self.manifest.key_epoch,
                 device_id,
             )?;
@@ -131,17 +152,23 @@ impl Vault {
     }
 
     fn apply_pt(&mut self, pt: OpPlaintext) {
-        let e = self.records.entry(pt.record_id).or_insert_with(|| RecordSummary {
-            record_id: pt.record_id,
-            kind: None,
-            name: String::new(),
-            created: pt.created,
-            hlc: 0,
-            tombstoned: false,
-            fields_ct: Vec::new(),
-        });
-        // Later HLC wins; equal HLC → deterministic (applied order).
-        if pt.hlc >= e.hlc {
+        self.max_hlc = self.max_hlc.max(pt.hlc);
+        let e = self
+            .records
+            .entry(pt.record_id)
+            .or_insert_with(|| RecordSummary {
+                record_id: pt.record_id,
+                kind: None,
+                name: String::new(),
+                created: pt.created,
+                hlc: 0,
+                tombstoned: false,
+                fields_ct: Vec::new(),
+                origin: ([0u8; DEVICE_ID_LEN], 0),
+            });
+        // Total order (hlc, origin_device, origin_seq): the merge result
+        // depends only on the op SET, never on replay/scan order.
+        if (pt.hlc, pt.origin_device, pt.origin_seq) >= (e.hlc, e.origin.0, e.origin.1) {
             match pt.op_type {
                 OpType::Upsert => {
                     e.kind = pt.kind;
@@ -149,11 +176,13 @@ impl Vault {
                     e.hlc = pt.hlc;
                     e.tombstoned = false;
                     e.fields_ct = pt.fields_ct;
+                    e.origin = (pt.origin_device, pt.origin_seq);
                 }
                 OpType::Tombstone => {
                     e.hlc = pt.hlc;
                     e.tombstoned = true;
                     e.fields_ct.clear();
+                    e.origin = (pt.origin_device, pt.origin_seq);
                 }
                 OpType::Meta => {}
             }
@@ -165,18 +194,39 @@ impl Vault {
     fn gossip(&self) -> Vec<Gossip> {
         // v0 single-device: we only observe ourselves. Multi-device merge
         // lands with sync (M3) — the field is wired, the vector fills then.
-        vec![Gossip { device_id: self.device.id, seq: self.next_seq - 1, head: self.head }]
+        vec![Gossip {
+            device_id: self.device.id,
+            seq: self.next_seq - 1,
+            head: self.head,
+        }]
     }
 
     /// Seal + sign an upsert op. Caller persists via store::append_op.
-    pub fn make_upsert(&mut self, kind: ItemKind, mut item: Item) -> Result<(Op, [u8; RECORD_ID_LEN])> {
+    pub fn make_upsert(&mut self, kind: ItemKind, item: Item) -> Result<(Op, [u8; RECORD_ID_LEN])> {
         let mut record_id = [0u8; RECORD_ID_LEN];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut record_id);
+        let op = self.make_upsert_for(record_id, kind, item)?;
+        Ok((op, record_id))
+    }
 
-        let name = item
-            .get(tag::NAME)
-            .map(|v| v.to_vec())
-            .unwrap_or_default();
+    /// Upsert into an EXISTING record (edit): same record_id, new hlc,
+    /// original `created` preserved. History lives in the op chain.
+    pub fn make_update(
+        &mut self,
+        record_id: &[u8; RECORD_ID_LEN],
+        kind: ItemKind,
+        item: Item,
+    ) -> Result<Op> {
+        self.make_upsert_for(*record_id, kind, item)
+    }
+
+    fn make_upsert_for(
+        &mut self,
+        record_id: [u8; RECORD_ID_LEN],
+        kind: ItemKind,
+        mut item: Item,
+    ) -> Result<Op> {
+        let name = item.get(tag::NAME).map(|v| v.to_vec()).unwrap_or_default();
         item.fields.remove(&tag::NAME); // name lives in the outer layer only
 
         let fields_ct = OpPlaintext::seal_fields(
@@ -187,7 +237,12 @@ impl Vault {
             &item,
         )?;
 
-        let now = now_hlc();
+        let now = self.next_hlc();
+        let created = self
+            .records
+            .get(&record_id)
+            .map(|r| r.created)
+            .unwrap_or(now);
         let pt = OpPlaintext {
             prev_op_hash: self.head,
             hlc: now,
@@ -195,20 +250,29 @@ impl Vault {
             record_id,
             kind: Some(kind),
             schema_v: 1,
-            created: now,
+            created,
             name,
             fields_ct,
             gossip: self.gossip(),
+            origin_device: self.device.id,
+            origin_seq: self.next_seq,
         };
-        let op = Op::seal(&pt, self.next_seq, &self.bundle.dek, &self.manifest.vault_id, self.manifest.key_epoch, &self.device)?;
-        Ok((op, record_id))
+        Op::seal(
+            &pt,
+            self.next_seq,
+            &self.bundle.dek,
+            &self.manifest.vault_id,
+            self.manifest.format_v,
+            self.manifest.key_epoch,
+            &self.device,
+        )
     }
 
     /// Seal + sign a tombstone op for `record_id`.
     pub fn make_tombstone(&mut self, record_id: &[u8; RECORD_ID_LEN]) -> Result<Op> {
         let pt = OpPlaintext {
             prev_op_hash: self.head,
-            hlc: now_hlc(),
+            hlc: self.next_hlc(),
             op_type: OpType::Tombstone,
             record_id: *record_id,
             kind: None,
@@ -217,8 +281,18 @@ impl Vault {
             name: Vec::new(),
             fields_ct: Vec::new(),
             gossip: self.gossip(),
+            origin_device: self.device.id,
+            origin_seq: self.next_seq,
         };
-        Op::seal(&pt, self.next_seq, &self.bundle.dek, &self.manifest.vault_id, self.manifest.key_epoch, &self.device)
+        Op::seal(
+            &pt,
+            self.next_seq,
+            &self.bundle.dek,
+            &self.manifest.vault_id,
+            self.manifest.format_v,
+            self.manifest.key_epoch,
+            &self.device,
+        )
     }
 
     /// Commit a freshly-made op to the in-memory index (call after store
@@ -244,36 +318,57 @@ impl Vault {
             name: rec.name.as_bytes().to_vec(),
             fields_ct: rec.fields_ct.clone(),
             gossip: Vec::new(),
+            origin_device: [0u8; 16],
+            origin_seq: 0,
         };
-        pt.open_fields(&self.bundle.dek, &self.manifest.vault_id, self.manifest.key_epoch)
+        pt.open_fields(
+            &self.bundle.dek,
+            &self.manifest.vault_id,
+            self.manifest.key_epoch,
+        )
     }
 
     pub fn records(&self) -> impl Iterator<Item = &RecordSummary> {
         self.records.values().filter(|r| !r.tombstoned)
     }
 
-    pub fn find(&self, name_or_id: &str) -> Option<[u8; RECORD_ID_LEN]> {
-        // exact id (hex) first, then case-insensitive name match
+    /// Resolution order: exact record-id hex → exact name (case-insensitive)
+    /// → unique substring. Returns `Err` for ambiguous or known-but-tombstoned.
+    pub fn find(&self, name_or_id: &str) -> FindResult {
+        // exact id (hex)
         if let Ok(b) = hex_decode(name_or_id) {
             if b.len() == RECORD_ID_LEN && self.records.contains_key(b.as_slice()) {
                 let mut id = [0u8; 16];
                 id.copy_from_slice(&b);
-                if self.records.get(&id).map(|r| !r.tombstoned).unwrap_or(false) {
-                    return Some(id);
-                }
+                return match self.records.get(&id) {
+                    Some(r) if !r.tombstoned => FindResult::One(id),
+                    Some(_) => FindResult::Tombstoned,
+                    None => FindResult::None,
+                };
             }
         }
         let needle = name_or_id.to_lowercase();
-        let mut hits: Vec<[u8; 16]> = self
+        // exact name wins over substring hits
+        for r in self.records() {
+            if r.name.eq_ignore_ascii_case(name_or_id) {
+                return FindResult::One(r.record_id);
+            }
+        }
+        let hits: Vec<[u8; 16]> = self
             .records()
             .filter(|r| r.name.to_lowercase().contains(&needle))
             .map(|r| r.record_id)
             .collect();
-        if hits.len() == 1 {
-            Some(hits.pop().unwrap())
-        } else {
-            None
+        match hits.len() {
+            0 => FindResult::None,
+            1 => FindResult::One(hits[0]),
+            _ => FindResult::Ambiguous(hits.len()),
         }
+    }
+
+    /// Last verified op-chain tip + its seq (for checkpoint persistence).
+    pub fn head(&self) -> (u64, [u8; HASH_LEN]) {
+        (self.next_seq - 1, self.head)
     }
 
     pub fn dek(&self) -> &[u8; 32] {
@@ -287,6 +382,21 @@ impl Vault {
     pub fn device_id(&self) -> &[u8; DEVICE_ID_LEN] {
         &self.device.id
     }
+
+    pub fn device(&self) -> &DeviceKey {
+        &self.device
+    }
+}
+
+/// Outcome of a `find()` lookup — distinguishes "not there" from "ambiguous"
+/// from "was deleted" so callers can message honestly.
+#[derive(Debug)]
+pub enum FindResult {
+    One([u8; RECORD_ID_LEN]),
+    None,
+    /// Record exists but is tombstoned (matched by exact id only).
+    Tombstoned,
+    Ambiguous(usize),
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>> {

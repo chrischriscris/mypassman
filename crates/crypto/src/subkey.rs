@@ -13,9 +13,9 @@ pub fn derive_subkey(dek: &[u8; 32], ctx: &str) -> [u8; 32] {
     blake3::derive_key(ctx, dek)
 }
 
-pub fn derive_record_key(dek: &[u8; 32], record_id: &[u8; 16]) -> [u8; 32] {
-    let mut material = Vec::with_capacity(48);
-    material.extend_from_slice(dek);
-    material.extend_from_slice(record_id);
-    blake3::derive_key(CTX_RECORD, &material)
+pub fn derive_record_key(dek: &[u8; 32], record_id: &[u8; 16]) -> zeroize::Zeroizing<[u8; 32]> {
+    let mut material = zeroize::Zeroizing::new([0u8; 48]);
+    material[..32].copy_from_slice(dek);
+    material[32..].copy_from_slice(record_id);
+    zeroize::Zeroizing::new(blake3::derive_key(CTX_RECORD, &material[..]))
 }

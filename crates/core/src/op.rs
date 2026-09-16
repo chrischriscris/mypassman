@@ -99,25 +99,51 @@ pub struct OpPlaintext {
     pub name: Vec<u8>,      // index-visible display name (UTF-8)
     pub fields_ct: Vec<u8>, // nonce||inner_ct; empty for tombstone/meta
     pub gossip: Vec<Gossip>,
+    /// Merge metadata — which device log + seq produced this op. Not part
+    /// of the encoded plaintext (already bound by AAD + device signature);
+    /// filled by `Op::open`, used for the deterministic merge order.
+    pub origin_device: [u8; DEVICE_ID_LEN],
+    pub origin_seq: u64,
 }
 
 impl OpPlaintext {
     /// Decrypt the inner fields layer — the only place field plaintext exists.
-    pub fn open_fields(&self, dek: &[u8; 32], vault_id: &[u8; VAULT_ID_LEN], key_epoch: u32) -> Result<Item> {
+    pub fn open_fields(
+        &self,
+        dek: &[u8; 32],
+        vault_id: &[u8; VAULT_ID_LEN],
+        key_epoch: u32,
+    ) -> Result<Item> {
         if self.fields_ct.len() < NONCE_LEN + aead::TAG_LEN {
             return Err(CoreError::Tlv("fields_ct short"));
         }
         let (nonce, ct) = self.fields_ct.split_at(NONCE_LEN);
         let k_rec = subkey::derive_record_key(dek, &self.record_id);
-        let pt = aead::open(&k_rec, nonce.try_into().unwrap(), &aad::record_fields(vault_id, &self.record_id, key_epoch), ct)?;
+        let pt = zeroize::Zeroizing::new(aead::open(
+            &k_rec,
+            nonce.try_into().unwrap(),
+            &aad::record_fields(vault_id, &self.record_id, key_epoch),
+            ct,
+        )?);
         Item::decode(&pt)
     }
 
     /// Seal a fields item into the inner layer.
-    pub fn seal_fields(dek: &[u8; 32], vault_id: &[u8; VAULT_ID_LEN], key_epoch: u32, record_id: &[u8; 16], item: &Item) -> Result<Vec<u8>> {
+    pub fn seal_fields(
+        dek: &[u8; 32],
+        vault_id: &[u8; VAULT_ID_LEN],
+        key_epoch: u32,
+        record_id: &[u8; 16],
+        item: &Item,
+    ) -> Result<Vec<u8>> {
         let k_rec = subkey::derive_record_key(dek, record_id);
         let nonce = aead::random_nonce();
-        let ct = aead::seal(&k_rec, &nonce, &aad::record_fields(vault_id, record_id, key_epoch), &item.encode())?;
+        let ct = aead::seal(
+            &k_rec,
+            &nonce,
+            &aad::record_fields(vault_id, record_id, key_epoch),
+            &item.encode(),
+        )?;
         let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ct);
@@ -155,7 +181,9 @@ impl OpPlaintext {
         let mut fields_ct = Vec::new();
         let mut gossip = Vec::new();
         let mut name = Vec::new();
+        let mut ord = tlv::OrderGuard::default();
         while let Some((t, v)) = r.next_field()? {
+            ord.check(t, &[T_GOSSIP])?;
             match t {
                 T_PREV_HASH => {
                     Reader::want_fixed(t, v, HASH_LEN)?;
@@ -187,6 +215,8 @@ impl OpPlaintext {
             name,
             fields_ct,
             gossip,
+            origin_device: [0u8; 16],
+            origin_seq: 0,
         })
     }
 }
@@ -219,12 +249,23 @@ impl Op {
         let seq = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let nonce: [u8; NONCE_LEN] = buf[8..8 + NONCE_LEN].try_into().unwrap();
         let sig: [u8; 64] = buf[8 + NONCE_LEN..8 + NONCE_LEN + 64].try_into().unwrap();
-        let ct_len = u32::from_le_bytes(buf[OP_HEADER_LEN - 4..OP_HEADER_LEN].try_into().unwrap()) as usize;
-        let end = OP_HEADER_LEN.checked_add(ct_len).ok_or(CoreError::Tlv("op len"))?;
+        let ct_len =
+            u32::from_le_bytes(buf[OP_HEADER_LEN - 4..OP_HEADER_LEN].try_into().unwrap()) as usize;
+        let end = OP_HEADER_LEN
+            .checked_add(ct_len)
+            .ok_or(CoreError::Tlv("op len"))?;
         if end > buf.len() {
             return Err(CoreError::Tlv("op truncated"));
         }
-        Ok((Op { seq, nonce, sig, ct: buf[OP_HEADER_LEN..end].to_vec() }, end))
+        Ok((
+            Op {
+                seq,
+                nonce,
+                sig,
+                ct: buf[OP_HEADER_LEN..end].to_vec(),
+            },
+            end,
+        ))
     }
 
     pub fn hash(&self) -> [u8; HASH_LEN] {
@@ -237,15 +278,28 @@ impl Op {
         device_vk: &[u8; 32],
         dek: &[u8; 32],
         vault_id: &[u8; VAULT_ID_LEN],
+        format_v: u16,
         key_epoch: u32,
         device_id: &[u8; DEVICE_ID_LEN],
     ) -> Result<OpPlaintext> {
         let sig = Signature::from_bytes(&self.sig);
-        mpm_crypto::keys::verify(device_vk, &aad::op_sig_preimage(self.seq, &self.nonce, &self.ct), &sig)
-            .map_err(|_| CoreError::BadOpSig(self.seq))?;
+        mpm_crypto::keys::verify(
+            device_vk,
+            &aad::op_sig_preimage(self.seq, &self.nonce, &self.ct),
+            &sig,
+        )
+        .map_err(|_| CoreError::BadOpSig(self.seq))?;
         let k_ops = subkey::derive_subkey(dek, subkey::CTX_OPS);
-        let pt = aead::open(&k_ops, &self.nonce, &aad::op(vault_id, key_epoch, device_id, self.seq), &self.ct)?;
-        OpPlaintext::decode(&pt)
+        let pt = aead::open(
+            &k_ops,
+            &self.nonce,
+            &aad::op(vault_id, format_v, key_epoch, device_id, self.seq),
+            &self.ct,
+        )?;
+        let mut pt = OpPlaintext::decode(&pt)?;
+        pt.origin_device = *device_id;
+        pt.origin_seq = self.seq;
+        Ok(pt)
     }
 
     /// Build, seal, and sign a new op.
@@ -254,13 +308,26 @@ impl Op {
         seq: u64,
         dek: &[u8; 32],
         vault_id: &[u8; VAULT_ID_LEN],
+        format_v: u16,
         key_epoch: u32,
         device: &DeviceKey,
     ) -> Result<Self> {
         let k_ops = subkey::derive_subkey(dek, subkey::CTX_OPS);
         let nonce = aead::random_nonce();
-        let ct = aead::seal(&k_ops, &nonce, &aad::op(vault_id, key_epoch, &device.id, seq), &pt.encode()?)?;
-        let sig = device.sign(&aad::op_sig_preimage(seq, &nonce, &ct)).to_bytes();
-        Ok(Op { seq, nonce, sig, ct })
+        let ct = aead::seal(
+            &k_ops,
+            &nonce,
+            &aad::op(vault_id, format_v, key_epoch, &device.id, seq),
+            &pt.encode()?,
+        )?;
+        let sig = device
+            .sign(&aad::op_sig_preimage(seq, &nonce, &ct))
+            .to_bytes();
+        Ok(Op {
+            seq,
+            nonce,
+            sig,
+            ct,
+        })
     }
 }

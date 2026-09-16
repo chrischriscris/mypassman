@@ -19,7 +19,8 @@ impl Writer {
     /// which may repeat consecutively.
     pub fn field(&mut self, tag: u8, val: &[u8]) -> &mut Self {
         self.buf.push(tag);
-        self.buf.extend_from_slice(&(val.len() as u32).to_le_bytes());
+        self.buf
+            .extend_from_slice(&(val.len() as u32).to_le_bytes());
         self.buf.extend_from_slice(val);
         self
     }
@@ -45,6 +46,33 @@ impl Writer {
     }
 }
 
+/// Canonical-ordering guard for decode loops: tags must be non-decreasing,
+/// and a tag may repeat only if it's in `repeatable` (consecutive runs).
+/// Signed data must have ONE byte-level meaning — last-wins duplicates and
+/// out-of-order fields are different byte strings different parsers could
+/// disagree on, so we reject both.
+#[derive(Default)]
+pub struct OrderGuard {
+    last: u8,
+    started: bool,
+}
+
+impl OrderGuard {
+    pub fn check(&mut self, tag: u8, repeatable: &[u8]) -> Result<()> {
+        if self.started {
+            if tag < self.last {
+                return Err(CoreError::Tlv("non-canonical tag order"));
+            }
+            if tag == self.last && !repeatable.contains(&tag) {
+                return Err(CoreError::Tlv("duplicate singleton tag"));
+            }
+        }
+        self.last = tag;
+        self.started = true;
+        Ok(())
+    }
+}
+
 /// Single-pass reader. Collect with `for (tag, val) in r` semantics via `next`.
 pub struct Reader<'a> {
     buf: &'a [u8],
@@ -65,10 +93,12 @@ impl<'a> Reader<'a> {
             return Err(CoreError::Tlv("truncated header"));
         }
         let tag = self.buf[self.pos];
-        let len = u32::from_le_bytes(self.buf[self.pos + 1..self.pos + 5].try_into().unwrap())
-            as usize;
+        let len =
+            u32::from_le_bytes(self.buf[self.pos + 1..self.pos + 5].try_into().unwrap()) as usize;
         let start = self.pos + 5;
-        let end = start.checked_add(len).ok_or(CoreError::Tlv("len overflow"))?;
+        let end = start
+            .checked_add(len)
+            .ok_or(CoreError::Tlv("len overflow"))?;
         if end > self.buf.len() {
             return Err(CoreError::Tlv("truncated value"));
         }

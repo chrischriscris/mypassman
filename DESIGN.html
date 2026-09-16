@@ -746,11 +746,16 @@ Electron, anywhere a keyboard works.</p>
 <hr />
 <h2 id="10-secrecy-amp-hardening-checklist">10. Secrecy &amp; hardening checklist</h2>
 <ul>
-<li><code>zeroize</code>/<code>secrecy::SecretBox</code> on all key material; <code>mlock</code>/<code>VirtualLock</code>
-on DEK pages — <strong>but <code>mlock</code> is not load-bearing</strong>: <code>RLIMIT_MEMLOCK</code> is
-64 KiB on stock Linux, unavailable on iOS, and doesn't cover hibernation
-images. Pair with <code>RLIMIT_CORE=0</code>, non-dumpable (<code>prctl</code>/<code>PT_DENY_ATTACH</code>),
-Yama scope, and assume encrypted swap.</li>
+<li><code>zeroize</code> on all key material and decrypted secrets (KEK, key bundle,
+derived record keys, field plaintext, <code>Item</code> values, generated passwords).
+<strong><code>mlock</code> was evaluated and removed</strong>: it can't be done correctly for
+movable structs — <code>mlock</code>ing a page then moving the struct leaves a
+secret copy pinned in the freed page, strictly worse than not locking.
+Correct pinning requires <code>Pin&lt;Box&gt;</code> + a stable allocation contract
+across every layer that touches keys; revisit if a secrets-handling
+audit shows it's needed. <code>RLIMIT_MEMLOCK</code> is also 64 KiB on stock Linux
+and unavailable on iOS. Pair with <code>RLIMIT_CORE=0</code>, non-dumpable
+(<code>prctl</code>/<code>PT_DENY_ATTACH</code>), Yama scope, and assume encrypted swap.</li>
 <li><strong>FFI is a secrecy boundary</strong>: managed heaps (Swift/Kotlin/JS) can't be
 zeroized. Cross-boundary APIs return handles or <code>Zeroizing&lt;Vec&lt;u8&gt;&gt;</code>
 buffers, never <code>String</code>. Prefer flows that keep the secret in-process

@@ -1,4 +1,4 @@
-//! Recovery kit (DESIGN.md §11): a 130-bit code shown ONCE, which
+//! Recovery kit (DESIGN.md §11): a 128-bit code shown ONCE, which
 //! Argon2id-derives an independent KEK wrapping the key bundle in its own
 //! slot. Losing the master password without it = total loss.
 //!
@@ -79,6 +79,11 @@ pub fn parse_code(s: &str) -> Result<[u8; CODE_BYTES]> {
                 out += 1;
             }
         }
+    }
+    // 26 chars carry 130 bits for 128 of payload — the 2 trailing pad
+    // bits must be zero, else non-canonical codes alias the same secret
+    if bits > 0 && acc & ((1u32 << bits) - 1) != 0 {
+        return Err(CoreError::Tlv("non-canonical recovery code"));
     }
     Ok(raw)
 }

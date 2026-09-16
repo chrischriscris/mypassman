@@ -49,7 +49,9 @@ const KDF_PACKED_LEN: usize = 44; // m|t|p|salt
 pub struct WrapSlot {
     pub slot_type: u8,
     pub kdf: Option<(KdfParams, [u8; 32])>, // params + salt; None for biometric markers
-    pub blob: Vec<u8>,                    // nonce || AEAD(KeyBundle)
+    pub blob: Vec<u8>,                      // nonce || AEAD(KeyBundle)
+    /// Unrecognized nested fields, retained for lossless re-encode.
+    pub extra: Vec<(u8, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +61,7 @@ pub struct DeviceEntry {
     pub name: String,
     pub active: bool,
     pub enrolled_at: u64,
+    pub extra: Vec<(u8, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +78,9 @@ pub struct Manifest {
     pub purged_before_epoch: u64,
     pub owner_vk: [u8; 32],
     pub sig: [u8; SIG_LEN],
+    /// Unrecognized top-level fields — re-emitted verbatim so re-signing a
+    /// manifest written by a newer build doesn't silently delete data.
+    pub extra: Vec<(u8, Vec<u8>)>,
 }
 
 impl Manifest {
@@ -94,6 +100,7 @@ impl Manifest {
             purged_before_epoch: 0,
             owner_vk,
             sig: [0u8; SIG_LEN],
+            extra: Vec::new(),
         }
     }
 
@@ -101,42 +108,39 @@ impl Manifest {
         self.devices.iter().find(|d| &d.id == id)
     }
 
+    /// Emit canonical TLV: all fields (known + retained extras) sorted by
+    /// tag; repeated tags keep their relative order (stable sort).
     fn encode_body(&self) -> Vec<u8> {
-        let mut w = Writer::new();
-        w.field(T_VAULT_ID, &self.vault_id);
-        w.u16f(T_FORMAT_V, self.format_v);
-        w.u16f(T_MIN_READER, self.min_reader_v);
+        let mut f: Vec<(u8, Vec<u8>)> =
+            Vec::with_capacity(10 + self.wrap_slots.len() + self.devices.len() + self.extra.len());
+        f.push((T_VAULT_ID, self.vault_id.to_vec()));
+        f.push((T_FORMAT_V, self.format_v.to_le_bytes().to_vec()));
+        f.push((T_MIN_READER, self.min_reader_v.to_le_bytes().to_vec()));
         let mut kd = [0u8; KDF_PACKED_LEN];
         kd[0..4].copy_from_slice(&self.kdf.m_kib.to_le_bytes());
         kd[4..8].copy_from_slice(&self.kdf.t.to_le_bytes());
         kd[8..12].copy_from_slice(&self.kdf.p.to_le_bytes());
         kd[12..44].copy_from_slice(&self.kdf_salt);
-        w.field(T_KDF, &kd);
+        f.push((T_KDF, kd.to_vec()));
         for s in &self.wrap_slots {
-            let mut sw = Writer::new();
-            sw.u8f(S_TYPE, s.slot_type);
-            if let Some((p, salt)) = &s.kdf {
-                sw.field(S_SALT, salt);
-                sw.u32f(S_M, p.m_kib);
-                sw.u32f(S_T, p.t);
-                sw.u32f(S_P, p.p);
-            }
-            sw.field(S_BLOB, &s.blob);
-            w.field(T_WRAP_SLOT, &sw.finish());
+            f.push((T_WRAP_SLOT, encode_slot(s)));
         }
-        w.u32f(T_KEY_EPOCH, self.key_epoch);
-        w.u64f(T_SNAPSHOT_EPOCH, self.snapshot_epoch);
+        f.push((T_KEY_EPOCH, self.key_epoch.to_le_bytes().to_vec()));
+        f.push((T_SNAPSHOT_EPOCH, self.snapshot_epoch.to_le_bytes().to_vec()));
         for d in &self.devices {
-            let mut dw = Writer::new();
-            dw.field(D_ID, &d.id);
-            dw.field(D_VK, &d.vk);
-            dw.field(D_NAME, d.name.as_bytes());
-            dw.u8f(D_STATUS, if d.active { 1 } else { 2 });
-            dw.u64f(D_ENROLLED, d.enrolled_at);
-            w.field(T_DEVICE, &dw.finish());
+            f.push((T_DEVICE, encode_device(d)));
         }
-        w.u64f(T_PURGED_BEFORE, self.purged_before_epoch);
-        w.field(T_OWNER_VK, &self.owner_vk);
+        f.push((
+            T_PURGED_BEFORE,
+            self.purged_before_epoch.to_le_bytes().to_vec(),
+        ));
+        f.push((T_OWNER_VK, self.owner_vk.to_vec()));
+        f.extend(self.extra.iter().cloned());
+        f.sort_by_key(|(t, _)| *t);
+        let mut w = Writer::new();
+        for (t, v) in &f {
+            w.field(*t, v);
+        }
         w.finish()
     }
 
@@ -173,10 +177,13 @@ impl Manifest {
             purged_before_epoch: 0,
             owner_vk: [0u8; 32],
             sig,
+            extra: Vec::new(),
         };
 
         let mut r = Reader::new(body);
+        let mut ord = tlv::OrderGuard::default();
         while let Some((t, v)) = r.next_field()? {
+            ord.check(t, &[T_WRAP_SLOT, T_DEVICE])?;
             match t {
                 T_VAULT_ID => {
                     Reader::want_fixed(t, v, VAULT_ID_LEN)?;
@@ -202,12 +209,17 @@ impl Manifest {
                     Reader::want_fixed(t, v, 32)?;
                     m.owner_vk = v.try_into().unwrap();
                 }
-                _ => {}
+                _ => m.extra.push((t, v.to_vec())),
             }
         }
 
         if m.format_v > FORMAT_VERSION {
             return Err(CoreError::UnsupportedVersion(m.format_v));
+        }
+        // a manifest written by a newer format may carry semantics we'd
+        // silently drop on re-sign — refuse rather than degrade it
+        if m.min_reader_v > FORMAT_VERSION {
+            return Err(CoreError::UnsupportedVersion(m.min_reader_v));
         }
         // Self-signature check: the embedded owner_vk must have signed body.
         let signature = Signature::from_bytes(&m.sig);
@@ -217,13 +229,35 @@ impl Manifest {
     }
 }
 
+fn encode_slot(s: &WrapSlot) -> Vec<u8> {
+    let mut f: Vec<(u8, Vec<u8>)> = Vec::with_capacity(6 + s.extra.len());
+    f.push((S_TYPE, vec![s.slot_type]));
+    if let Some((p, salt)) = &s.kdf {
+        f.push((S_SALT, salt.to_vec()));
+        f.push((S_M, p.m_kib.to_le_bytes().to_vec()));
+        f.push((S_T, p.t.to_le_bytes().to_vec()));
+        f.push((S_P, p.p.to_le_bytes().to_vec()));
+    }
+    f.push((S_BLOB, s.blob.clone()));
+    f.extend(s.extra.iter().cloned());
+    f.sort_by_key(|(t, _)| *t);
+    let mut w = Writer::new();
+    for (t, v) in &f {
+        w.field(*t, v);
+    }
+    w.finish()
+}
+
 fn parse_slot(buf: &[u8]) -> Result<WrapSlot> {
     let mut r = Reader::new(buf);
+    let mut ord = tlv::OrderGuard::default();
     let mut slot_type = None;
     let mut salt: Option<[u8; 32]> = None;
     let (mut m, mut t_, mut p) = (0u32, 0u32, 0u32);
     let mut blob = Vec::new();
+    let mut extra = Vec::new();
     while let Some((t, v)) = r.next_field()? {
+        ord.check(t, &[])?;
         match t {
             S_TYPE => slot_type = Some(tlv::u8v(t, v)?),
             S_SALT => {
@@ -234,7 +268,7 @@ fn parse_slot(buf: &[u8]) -> Result<WrapSlot> {
             S_T => t_ = tlv::u32v(t, v)?,
             S_P => p = tlv::u32v(t, v)?,
             S_BLOB => blob = v.to_vec(),
-            _ => {}
+            _ => extra.push((t, v.to_vec())),
         }
     }
     let slot_type = slot_type.ok_or(CoreError::Tlv("slot type"))?;
@@ -242,17 +276,41 @@ fn parse_slot(buf: &[u8]) -> Result<WrapSlot> {
         return Err(CoreError::BadSlot(slot_type));
     }
     let kdf = salt.map(|s| (KdfParams { m_kib: m, t: t_, p }, s));
-    Ok(WrapSlot { slot_type, kdf, blob })
+    Ok(WrapSlot {
+        slot_type,
+        kdf,
+        blob,
+        extra,
+    })
+}
+
+fn encode_device(d: &DeviceEntry) -> Vec<u8> {
+    let mut f: Vec<(u8, Vec<u8>)> = Vec::with_capacity(5 + d.extra.len());
+    f.push((D_ID, d.id.to_vec()));
+    f.push((D_VK, d.vk.to_vec()));
+    f.push((D_NAME, d.name.as_bytes().to_vec()));
+    f.push((D_STATUS, vec![if d.active { 1 } else { 2 }]));
+    f.push((D_ENROLLED, d.enrolled_at.to_le_bytes().to_vec()));
+    f.extend(d.extra.iter().cloned());
+    f.sort_by_key(|(t, _)| *t);
+    let mut w = Writer::new();
+    for (t, v) in &f {
+        w.field(*t, v);
+    }
+    w.finish()
 }
 
 fn parse_device(buf: &[u8]) -> Result<DeviceEntry> {
     let mut r = Reader::new(buf);
+    let mut ord = tlv::OrderGuard::default();
     let mut id = None;
     let mut vk = None;
     let mut name = String::new();
     let mut active = true;
     let mut enrolled = 0u64;
+    let mut extra = Vec::new();
     while let Some((t, v)) = r.next_field()? {
+        ord.check(t, &[])?;
         match t {
             D_ID => {
                 Reader::want_fixed(t, v, DEVICE_ID_LEN)?;
@@ -265,7 +323,7 @@ fn parse_device(buf: &[u8]) -> Result<DeviceEntry> {
             D_NAME => name = String::from_utf8_lossy(v).into_owned(),
             D_STATUS => active = tlv::u8v(t, v)? == 1,
             D_ENROLLED => enrolled = tlv::u64v(t, v)?,
-            _ => {}
+            _ => extra.push((t, v.to_vec())),
         }
     }
     Ok(DeviceEntry {
@@ -274,6 +332,7 @@ fn parse_device(buf: &[u8]) -> Result<DeviceEntry> {
         name,
         active,
         enrolled_at: enrolled,
+        extra,
     })
 }
 

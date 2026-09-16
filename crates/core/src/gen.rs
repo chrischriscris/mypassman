@@ -22,6 +22,7 @@ fn wordlist() -> Vec<&'static str> {
 fn draw(max: usize) -> usize {
     // rejection sampling over u64: accept only values below the largest
     // multiple of `max`, so every index has identical probability
+    assert!(max > 0, "draw from empty set");
     let max = max as u64;
     let bound = u64::MAX / max * max;
     loop {
@@ -34,16 +35,12 @@ fn draw(max: usize) -> usize {
 
 /// Charset password. `symbols=false` → alnum only.
 pub fn password(len: usize, symbols: bool) -> Zeroizing<String> {
-    if !symbols {
-        return password_from(ALNUM, len);
-    }
-    let mut s = [0u8; 62 + 22];
-    s[..62].copy_from_slice(ALNUM);
-    s[62..].copy_from_slice(SYMBOLS);
-    password_from(&s, len)
-}
-
-fn password_from(set: &[u8], len: usize) -> Zeroizing<String> {
+    // concat at runtime so a SYMBOLS edit can't silently truncate/overrun
+    let set: Vec<u8> = if symbols {
+        [ALNUM, SYMBOLS].concat()
+    } else {
+        ALNUM.to_vec()
+    };
     let mut out = String::with_capacity(len);
     for _ in 0..len {
         out.push(set[draw(set.len())] as char);
@@ -54,12 +51,9 @@ fn password_from(set: &[u8], len: usize) -> Zeroizing<String> {
 /// Diceware-style passphrase: `words` joined by '-'.
 pub fn passphrase(words: usize) -> Zeroizing<String> {
     let wl = wordlist();
-    let mut out = String::new();
-    for i in 0..words {
-        if i > 0 {
-            out.push('-');
-        }
-        out.push_str(wl[draw(wl.len())]);
-    }
-    Zeroizing::new(out)
+    assert!(!wl.is_empty(), "wordlist asset is empty");
+    // join() allocates the result once — no realloc'd partial passphrases
+    // left scattered across freed heap
+    let picked: Vec<&str> = (0..words).map(|_| wl[draw(wl.len())]).collect();
+    Zeroizing::new(picked.join("-"))
 }
