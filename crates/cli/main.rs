@@ -10,6 +10,8 @@ use mpm_core::{gen, recovery, Manifest, Vault};
 use mpm_crypto::kdf::{self, KdfParams};
 use mpm_crypto::keys::{DeviceKey, KeyBundle};
 #[cfg(target_os = "macos")]
+mod autofill;
+#[cfg(target_os = "macos")]
 mod bio;
 mod daemon;
 
@@ -57,6 +59,12 @@ enum Cmd {
         /// copy one field to clipboard (e.g. -c password)
         #[arg(short, long)]
         copy: Option<String>,
+        /// copy field then simulate ⌘V into the frontmost app (macOS)
+        #[arg(long)]
+        paste: Option<String>,
+        /// type field as synthetic keystrokes — clipboard never touched (macOS)
+        #[arg(long = "type")]
+        r#type: Option<String>,
     },
     /// List items (names + kinds only — fields stay sealed)
     #[command(alias = "ls")]
@@ -96,6 +104,12 @@ enum Cmd {
         /// copy code to clipboard instead of printing
         #[arg(short, long)]
         copy: bool,
+        /// copy code then simulate ⌘V into the frontmost app (macOS)
+        #[arg(long)]
+        paste: bool,
+        /// type code as synthetic keystrokes — clipboard never touched (macOS)
+        #[arg(long = "type")]
+        r#type: bool,
     },
     /// Edit fields of an existing item (refuses to create — use `add`)
     Edit {
@@ -845,38 +859,103 @@ fn find_one(vault: &mpm_core::Vault, name: &str) -> Result<[u8; 16], String> {
     }
 }
 
-fn cmd_get(
-    dir: &Path,
-    rec: bool,
-    name: &str,
-    show: bool,
-    copy: &Option<String>,
-) -> Result<(), String> {
+/// How a retrieved secret leaves the process.
+enum Out {
+    Print,
+    Copy(String),
+    /// concealed clipboard write + synthetic ⌘V (macOS autofill)
+    Paste(String),
+    /// synthetic per-char keystrokes — pasteboard never touched (macOS)
+    Type(String),
+}
+
+fn out_field(out: &Out) -> Option<&str> {
+    match out {
+        Out::Copy(f) | Out::Paste(f) | Out::Type(f) => Some(f),
+        Out::Print => None,
+    }
+}
+
+/// Event-post permission check — must pass BEFORE any clipboard write so a
+/// denied `--paste` never publishes the secret at all.
+fn autofill_preflight() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return autofill::preflight();
+    #[cfg(not(target_os = "macos"))]
+    Err("paste/type autofill is macOS-only so far".into())
+}
+
+/// ⌘V after a concealed clipboard write — macOS only; elsewhere say so.
+fn paste_into_app() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return autofill::paste();
+    #[cfg(not(target_os = "macos"))]
+    Err("paste autofill is macOS-only so far".into())
+}
+
+fn type_into_app(text: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return autofill::type_text(text);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = text;
+        Err("type autofill is macOS-only so far".into())
+    }
+}
+
+fn pick_out(c: Option<&String>, p: Option<&String>, t: Option<&String>) -> Result<Out, String> {
+    match (c, p, t) {
+        (Some(f), None, None) => Ok(Out::Copy(f.clone())),
+        (None, Some(f), None) => Ok(Out::Paste(f.clone())),
+        (None, None, Some(f)) => Ok(Out::Type(f.clone())),
+        (None, None, None) => Ok(Out::Print),
+        _ => Err("pass only one of --copy/--paste/--type".into()),
+    }
+}
+
+fn cmd_get(dir: &Path, rec: bool, name: &str, show: bool, out: &Out) -> Result<(), String> {
     match daemon::item(dir, name)? {
-        daemon::DaemonItem::Found(item, _, _, _) => return render_item(&item, show, copy),
+        daemon::DaemonItem::Found(item, _, _, _) => return render_item(&item, show, out),
         daemon::DaemonItem::Missing => return Err(format!("'{name}': not found")),
         daemon::DaemonItem::Offline => {}
     }
     let vault = unlock(dir, rec)?;
     let rid = find_one(&vault, name)?;
     let item = vault.item(&rid).map_err(|e| e.to_string())?;
-    render_item(&item, show, copy)
+    render_item(&item, show, out)
 }
 
-fn render_item(item: &mpm_core::Item, show: bool, copy: &Option<String>) -> Result<(), String> {
+fn render_item(item: &mpm_core::Item, show: bool, out: &Out) -> Result<(), String> {
     let fmap = field_map();
     let inv: BTreeMap<u8, (&str, bool)> = fmap.iter().map(|(n, (t, s))| (*t, (*n, *s))).collect();
 
-    if let Some(field) = copy {
-        let Some((t, _)) = fmap.get(field.as_str()) else {
+    if let Some(field) = out_field(out) {
+        let Some((t, _)) = fmap.get(field) else {
             return Err(format!("unknown field '{field}'"));
         };
         let val = item.get(*t).ok_or("field absent")?;
-        copy_to_clipboard(val)?;
-        eprintln!(
-            "copied '{field}' — concealed from clipboard managers, auto-clears in {}s",
-            clip_ttl()
-        );
+        match out {
+            Out::Copy(_) => {
+                copy_to_clipboard(val)?;
+                eprintln!(
+                    "copied '{field}' — concealed from clipboard managers, auto-clears in {}s",
+                    clip_ttl()
+                );
+            }
+            Out::Paste(_) => {
+                autofill_preflight()?; // before publishing anything
+                copy_to_clipboard(val)?; // concealed write + janitor, then ⌘V
+                paste_into_app()?;
+                eprintln!("pasted '{field}'");
+            }
+            Out::Type(_) => {
+                let text =
+                    std::str::from_utf8(val).map_err(|_| "field isn't UTF-8 — can't type it")?;
+                type_into_app(text)?;
+                eprintln!("typed '{field}'");
+            }
+            Out::Print => unreachable!(),
+        }
         return Ok(());
     }
 
@@ -996,7 +1075,7 @@ fn cmd_gen(
 
 /// `otp <name>` — current TOTP code for any item carrying a totp_secret
 /// (a login can hold its own 2FA; a `totp` item is the standalone form).
-fn cmd_otp(dir: &Path, rec: bool, name: &str, copy: bool) -> Result<(), String> {
+fn cmd_otp(dir: &Path, rec: bool, name: &str, out: &Out) -> Result<(), String> {
     let item = match daemon::item(dir, name)? {
         daemon::DaemonItem::Found(i, _, _, _) => i,
         daemon::DaemonItem::Missing => return Err(format!("'{name}': not found")),
@@ -1025,11 +1104,23 @@ fn cmd_otp(dir: &Path, rec: bool, name: &str, copy: bool) -> Result<(), String> 
         .unwrap()
         .as_secs();
     let (code, left) = mpm_core::totp::totp(&secret, now, period, digits, algo);
-    if copy {
-        copy_to_clipboard(code.as_bytes())?;
-        eprintln!("copied code — auto-clears in {}s", clip_ttl());
-    } else {
-        println!("{code}  (valid {left}s more)");
+    match out {
+        Out::Copy(_) => {
+            copy_to_clipboard(code.as_bytes())?;
+            eprintln!("copied code — auto-clears in {}s", clip_ttl());
+        }
+        Out::Paste(_) => {
+            autofill_preflight()?;
+            copy_to_clipboard(code.as_bytes())?;
+            paste_into_app()?;
+            eprintln!("pasted code");
+        }
+        Out::Type(_) => {
+            autofill_preflight()?;
+            type_into_app(&code)?;
+            eprintln!("typed code");
+        }
+        Out::Print => println!("{code}  (valid {left}s more)"),
     }
     Ok(())
 }
@@ -2123,7 +2214,14 @@ fn main() {
     let res = match &cli.cmd {
         Cmd::Init => cmd_init(&dir),
         Cmd::Add { kind, name, fields } => cmd_add(&dir, rec, kind, name, fields),
-        Cmd::Get { name, show, copy } => cmd_get(&dir, rec, name, *show, copy),
+        Cmd::Get {
+            name,
+            show,
+            copy,
+            paste,
+            r#type,
+        } => pick_out(copy.as_ref(), paste.as_ref(), r#type.as_ref())
+            .and_then(|out| cmd_get(&dir, rec, name, *show, &out)),
         Cmd::List { json } => cmd_list(&dir, rec, *json),
         Cmd::Rm { name } => cmd_rm(&dir, rec, name),
         Cmd::Devices => cmd_devices(&dir, cli.recovery),
@@ -2136,7 +2234,20 @@ fn main() {
             no_symbols,
             copy,
         } => cmd_gen(*len, *passphrase, *no_symbols, *copy),
-        Cmd::Otp { name, copy } => cmd_otp(&dir, rec, name, *copy),
+        Cmd::Otp {
+            name,
+            copy,
+            paste,
+            r#type,
+        } => {
+            let s = String::new();
+            pick_out(
+                copy.then_some(&s),
+                paste.then_some(&s),
+                r#type.then_some(&s),
+            )
+            .and_then(|out| cmd_otp(&dir, rec, name, &out))
+        }
         Cmd::Edit { name, fields } => cmd_edit(&dir, rec, name, fields),
         Cmd::Run { inject, cmd } => cmd_run(&dir, rec, inject, cmd),
         Cmd::Clipclear => cmd_clipclear(),

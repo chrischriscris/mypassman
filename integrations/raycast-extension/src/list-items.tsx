@@ -1,4 +1,4 @@
-import { Action, ActionPanel, Icon, List, Toast, showToast } from "@raycast/api";
+import { Action, ActionPanel, Icon, List, Toast, closeMainWindow, showHUD, showToast } from "@raycast/api";
 import { useExec } from "@raycast/utils";
 import { execFile, spawn } from "child_process";
 import { promisify } from "util";
@@ -22,30 +22,35 @@ const KIND_ICON: Record<string, Icon> = {
   sshkey: Icon.Key,
 };
 
-// Copy actions call back into the CLI — the secret goes straight from the
-// daemon to the concealed clipboard and never enters this process.
-async function copyField(item: VaultItem, field: string) {
-  const toast = await showToast({ style: Toast.Style.Animated, title: `Copying ${field}…` });
+// Every secret hand-off shells back to the CLI — the value goes straight
+// from the daemon to the pasteboard/frontmost app and never enters this
+// process. `closeMainWindow` first so focus returns to the target app
+// before the synthetic keystrokes land.
+async function fill(item: VaultItem, field: string, mode: "paste" | "type", otp: boolean) {
+  await closeMainWindow({ clearRootSearch: true });
   try {
-    await run(MPM, ["get", item.id, "--copy", field]);
-    toast.style = Toast.Style.Success;
-    toast.title = `${field} copied — auto-clears`;
+    const args = otp ? ["otp", item.id, `--${mode}`] : ["get", item.id, `--${mode}`, field];
+    await run(MPM, args);
+    await showHUD(`${otp ? "code" : field} ${mode === "paste" ? "pasted" : "typed"}`);
   } catch (e) {
-    toast.style = Toast.Style.Failure;
-    toast.title = `Couldn't copy ${field}`;
-    toast.message = e instanceof Error ? e.message : String(e);
+    await showToast({
+      style: Toast.Style.Failure,
+      title: `Couldn't ${mode} ${otp ? "code" : field}`,
+      message: e instanceof Error ? e.message : String(e),
+    });
   }
 }
 
-async function copyOtp(item: VaultItem) {
-  const toast = await showToast({ style: Toast.Style.Animated, title: "Copying code…" });
+async function copyField(item: VaultItem, field: string, otp: boolean) {
+  const toast = await showToast({ style: Toast.Style.Animated, title: `Copying ${otp ? "code" : field}…` });
   try {
-    await run(MPM, ["otp", item.id, "--copy"]);
+    const args = otp ? ["otp", item.id, "--copy"] : ["get", item.id, "--copy", field];
+    await run(MPM, args);
     toast.style = Toast.Style.Success;
-    toast.title = "Code copied — auto-clears";
+    toast.title = `${otp ? "code" : field} copied — auto-clears`;
   } catch (e) {
     toast.style = Toast.Style.Failure;
-    toast.title = "No TOTP on this item";
+    toast.title = `Couldn't copy ${otp ? "code" : field}`;
     toast.message = e instanceof Error ? e.message : String(e);
   }
 }
@@ -115,62 +120,86 @@ export default function Command() {
           </ActionPanel>
         }
       />
-      {(data ?? []).map((item) => (
-        <List.Item
-          key={item.id}
-          icon={KIND_ICON[item.kind] ?? Icon.Key}
-          title={item.name}
-          accessories={[{ tag: { value: item.kind || "item", color: "#6e6e73" } }]}
-          actions={
-            <ActionPanel>
-              <Action
-                title="Copy Password"
-                icon={Icon.Clipboard}
-                onAction={() => copyField(item, "password")}
-              />
-              <Action
-                title="Copy Username"
-                icon={Icon.Person}
-                shortcut={{ modifiers: ["cmd"], key: "u" }}
-                onAction={() => copyField(item, "username")}
-              />
-              <Action
-                title="Copy TOTP Code"
-                icon={Icon.Clock}
-                shortcut={{ modifiers: ["cmd"], key: "t" }}
-                onAction={() => copyOtp(item)}
-              />
-              <ActionPanel.Section title="More fields">
+      {(data ?? []).map((item) => {
+        const isTotp = item.kind === "totp";
+        const mainLabel = isTotp ? "Paste Code" : "Paste Password";
+        return (
+          <List.Item
+            key={item.id}
+            icon={KIND_ICON[item.kind] ?? Icon.Key}
+            title={item.name}
+            accessories={[{ tag: { value: item.kind || "item", color: "#6e6e73" } }]}
+            actions={
+              <ActionPanel>
                 <Action
-                  title="Copy URL"
-                  icon={Icon.Link}
-                  shortcut={{ modifiers: ["cmd"], key: "l" }}
-                  onAction={() => copyField(item, "url")}
+                  title={mainLabel}
+                  icon={Icon.ArrowRightCircleFilled}
+                  onAction={() => fill(item, "password", "paste", isTotp)}
                 />
                 <Action
-                  title="Copy Card Number"
-                  icon={Icon.CreditCard}
-                  shortcut={{ modifiers: ["cmd"], key: "n" }}
-                  onAction={() => copyField(item, "number")}
+                  title={isTotp ? "Type Code" : "Type Password"}
+                  icon={Icon.Keyboard}
+                  shortcut={{ modifiers: ["opt"], key: "t" }}
+                  onAction={() => fill(item, "password", "type", isTotp)}
                 />
+                {!isTotp && (
+                  <Action
+                    title="Paste TOTP Code"
+                    icon={Icon.Clock}
+                    shortcut={{ modifiers: ["opt"], key: "o" }}
+                    onAction={() => fill(item, "", "paste", true)}
+                  />
+                )}
+                <ActionPanel.Section title="Clipboard">
+                  <Action
+                    title="Copy Password"
+                    icon={Icon.Clipboard}
+                    shortcut={{ modifiers: ["cmd"], key: "p" }}
+                    onAction={() => copyField(item, "password", false)}
+                  />
+                  <Action
+                    title="Copy Username"
+                    icon={Icon.Person}
+                    shortcut={{ modifiers: ["cmd"], key: "u" }}
+                    onAction={() => copyField(item, "username", false)}
+                  />
+                  <Action
+                    title="Copy TOTP Code"
+                    icon={Icon.Clock}
+                    shortcut={{ modifiers: ["cmd"], key: "o" }}
+                    onAction={() => copyField(item, "", true)}
+                  />
+                  <Action
+                    title="Copy URL"
+                    icon={Icon.Link}
+                    shortcut={{ modifiers: ["cmd"], key: "l" }}
+                    onAction={() => copyField(item, "url", false)}
+                  />
+                  <Action
+                    title="Copy Card Number"
+                    icon={Icon.CreditCard}
+                    shortcut={{ modifiers: ["cmd"], key: "n" }}
+                    onAction={() => copyField(item, "number", false)}
+                  />
+                  <Action
+                    title="Copy CVV"
+                    icon={Icon.EyeDisabled}
+                    shortcut={{ modifiers: ["cmd"], key: "v" }}
+                    onAction={() => copyField(item, "cvv", false)}
+                  />
+                </ActionPanel.Section>
                 <Action
-                  title="Copy CVV"
-                  icon={Icon.EyeDisabled}
-                  shortcut={{ modifiers: ["cmd"], key: "v" }}
-                  onAction={() => copyField(item, "cvv")}
+                  title="Lock Vault"
+                  icon={Icon.Lock}
+                  style={Action.Style.Destructive}
+                  shortcut={{ modifiers: ["cmd", "shift"], key: "l" }}
+                  onAction={lockVault}
                 />
-              </ActionPanel.Section>
-              <Action
-                title="Lock Vault"
-                icon={Icon.Lock}
-                style={Action.Style.Destructive}
-                shortcut={{ modifiers: ["cmd", "shift"], key: "l" }}
-                onAction={lockVault}
-              />
-            </ActionPanel>
-          }
-        />
-      ))}
+              </ActionPanel>
+            }
+          />
+        );
+      })}
     </List>
   );
 }
