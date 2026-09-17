@@ -212,7 +212,7 @@ fn field_map() -> BTreeMap<&'static str, (u8, bool)> {
         ("username", tag::USERNAME, false),
         ("password", tag::PASSWORD, true),
         ("url", tag::URL, false),
-        ("notes", tag::NOTES, false),
+        ("notes", tag::NOTES, true),
         ("number", tag::CARD_NUMBER, true),
         ("exp", tag::CARD_EXP, false),
         ("cvv", tag::CARD_CVV, true),
@@ -939,7 +939,7 @@ enum Out {
     Type(Vec<String>),
 }
 
-fn out_fields<'a>(out: &'a Out) -> Vec<&'a str> {
+fn out_fields(out: &Out) -> Vec<&str> {
     match out {
         Out::Copy(f) | Out::Paste(f) => vec![f.as_str()],
         Out::Type(fs) => fs.iter().map(|s| s.as_str()).collect(),

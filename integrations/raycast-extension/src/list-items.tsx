@@ -345,7 +345,14 @@ const KINDS = ["login", "card", "totp", "apikey", "secret", "identity", "sshkey"
 export default function Command() {
   const { data, isLoading, error, revalidate } = useExec(MPM, ["list", "--json"], {
     env: ENV.env,
-    parseOutput: ({ stdout }) => JSON.parse(stdout) as VaultItem[],
+    // parseOutput runs even on non-zero exits — surface stderr ("unlock
+    // failed"…) instead of letting JSON.parse("") mask the real error
+    parseOutput: ({ stdout, stderr, exitCode }) => {
+      if (exitCode !== 0 || !stdout.trim()) {
+        throw new Error(stderr.trim() || `mypassman exited ${exitCode}`);
+      }
+      return JSON.parse(stdout) as VaultItem[];
+    },
   });
   const [kindFilter, setKindFilter] = useState("all");
   const [showDetail, setShowDetail] = useState(true);
