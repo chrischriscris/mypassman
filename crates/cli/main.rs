@@ -137,9 +137,15 @@ enum Cmd {
     #[command(hide = true, name = "__preflight")]
     Preflight,
     /// (internal) verify the pasteboard still holds <id>'s <field> — or
-    /// the current code with `--otp` — then post ⌘V into the frontmost app
+    /// the current code with --otp — then post ⌘V into the frontmost app
     #[command(hide = true, name = "__dopaste")]
-    Dopaste { id: String, field: String },
+    Dopaste {
+        id: String,
+        field: Option<String>,
+        /// verify against the item's current TOTP code instead of a field
+        #[arg(long)]
+        otp: bool,
+    },
     /// Export all items to a passphrase-sealed portable file (MPMEXP).
     /// The export passphrase is prompted (or $MPM_EXPORT_PASSWORD).
     Export { path: PathBuf },
@@ -805,7 +811,14 @@ fn row_meta_tags(vault: &mpm_core::Vault, rid: &[u8; 16]) -> (Vec<u8>, Vec<(u8, 
         all.push(*t);
         if !tag_secret(*t) {
             if let Some(v) = vals.first() {
-                ns.push((*t, v[..v.len().min(META_VALUE_CAP)].to_vec()));
+                // byte-cap, but never split a UTF-8 codepoint — a severed
+                // multibyte tail becomes U+FFFD under from_utf8_lossy and a
+                // client could act on a corrupted URL
+                let mut n = v.len().min(META_VALUE_CAP);
+                while n > 0 && n < v.len() && (v[n] & 0xC0) == 0x80 {
+                    n -= 1;
+                }
+                ns.push((*t, v[..n].to_vec()));
             }
         }
     }
@@ -971,11 +984,17 @@ fn autofill_preflight() -> Result<(), String> {
 }
 
 /// ⌘V after a concealed clipboard write — macOS only; elsewhere say so.
-fn paste_into_app() -> Result<(), String> {
+/// `expected` is the value the pasteboard must still hold — the JXA
+/// helper compares-and-posts atomically so a swapped clipboard can never
+/// emit the wrong secret.
+fn paste_into_app(expected: &[u8]) -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    return autofill::paste();
+    return autofill::paste(expected);
     #[cfg(not(target_os = "macos"))]
-    Err("paste autofill is macOS-only so far".into())
+    {
+        let _ = expected;
+        Err("paste autofill is macOS-only so far".into())
+    }
 }
 
 fn type_into_app(parts: &[&str]) -> Result<(), String> {
@@ -1020,37 +1039,35 @@ fn cmd_get(dir: &Path, rec: bool, name: &str, show: bool, out: &Out) -> Result<(
 /// that — overlapping fills, janitor clears, or foreign copies can never
 /// emit the wrong secret. `--otp` recomputes the code (a rolled code
 /// fails the compare, correctly aborting a stale paste).
-fn cmd_dopaste(dir: &Path, rec: bool, id: &str, field: &str) -> Result<(), String> {
-    let expected: Vec<u8> = if field == "--otp" {
-        totp_code(&fetch_item(dir, rec, id)?)?.0.into_bytes()
+fn cmd_dopaste(
+    dir: &Path,
+    rec: bool,
+    id: &str,
+    field: Option<&String>,
+    otp: bool,
+) -> Result<(), String> {
+    // the JXA helper compares + posts atomically; Zeroizing because this
+    // buffer is a secret copy that would otherwise linger after free
+    let expected: zeroize::Zeroizing<Vec<u8>> = if otp {
+        // recompute — a rolled code mismatches, correctly aborting a
+        // stale paste
+        zeroize::Zeroizing::new(totp_code(&fetch_item(dir, rec, id)?)?.0.into_bytes())
     } else {
+        let field = field.ok_or("pass a field or --otp")?;
         let fmap = field_map();
-        let Some((t, _)) = fmap.get(field) else {
+        let Some((t, _)) = fmap.get(field.as_str()) else {
             return Err(format!("unknown field '{field}'"));
         };
-        fetch_item(dir, rec, id)?
-            .get(*t)
-            .ok_or("field absent")?
-            .to_vec()
+        zeroize::Zeroizing::new(
+            fetch_item(dir, rec, id)?
+                .get(*t)
+                .ok_or("field absent")?
+                .to_vec(),
+        )
     };
-    match clip_read() {
-        Some(cur) if cur == expected => {}
-        _ => return Err("clipboard changed since the copy — refusing to paste".into()),
-    }
-    match paste_into_app() {
-        Ok(()) => {
-            eprintln!("pasted");
-            Ok(())
-        }
-        Err(e) => {
-            // it's still our secret on the pasteboard — don't leave it
-            // sitting there on a failed fill
-            if clip_read().as_deref() == Some(expected.as_slice()) {
-                clip_clear();
-            }
-            Err(e)
-        }
-    }
+    paste_into_app(&expected)?;
+    eprintln!("pasted");
+    Ok(())
 }
 
 fn render_item(item: &mpm_core::Item, show: bool, out: &Out) -> Result<(), String> {
@@ -1075,9 +1092,8 @@ fn render_item(item: &mpm_core::Item, show: bool, out: &Out) -> Result<(), Strin
                         );
                     }
                     Out::Paste(_) => {
-                        autofill_preflight()?; // before publishing anything
                         copy_to_clipboard(val)?; // concealed write + janitor, then ⌘V
-                        paste_into_app()?;
+                        paste_into_app(val)?; // JXA verifies board==val first
                         eprintln!("pasted '{field}'");
                     }
                     _ => unreachable!(),
@@ -1259,9 +1275,8 @@ fn cmd_otp(dir: &Path, rec: bool, name: &str, out: &Out) -> Result<(), String> {
             eprintln!("copied code — auto-clears in {}s", clip_ttl());
         }
         Out::Paste(_) => {
-            autofill_preflight()?;
             copy_to_clipboard(code.as_bytes())?;
-            paste_into_app()?;
+            paste_into_app(code.as_bytes())?;
             eprintln!("pasted code");
         }
         Out::Type(_) => {
@@ -1442,6 +1457,13 @@ fn cmd_devices(dir: &Path, rec: bool) -> Result<(), String> {
 /// Seconds before the janitor clears a copied secret. `MPM_CLIP_TTL` overrides.
 const CLIP_TTL_SECS: u64 = 45;
 
+/// Credential env vars must never propagate into helper subprocesses
+/// (osascript, pbcopy/pbpaste, powershell, our own janitor child…).
+fn scrub_env(c: &mut std::process::Command) -> &mut std::process::Command {
+    c.env_remove("MPM_PASSWORD")
+        .env_remove("MPM_EXPORT_PASSWORD")
+}
+
 fn clip_ttl() -> u64 {
     std::env::var("MPM_CLIP_TTL")
         .ok()
@@ -1460,8 +1482,8 @@ fn spawn_janitor() -> Result<std::process::ChildStdin, String> {
     c.arg("__clipclear")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("MPM_PASSWORD");
+        .stderr(Stdio::null());
+    scrub_env(&mut c);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1499,6 +1521,7 @@ fn copy_to_clipboard(val: &[u8]) -> Result<(), String> {
     // setStringForType(null) would write nothing while exiting 0.
     const JXA: &str = r#"
 ObjC.import('AppKit');
+ObjC.import('stdlib'); // $.exit — not a builtin without this import
 var d = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
 var s = $.NSString.alloc.initWithDataEncoding(d, $.NSUTF8StringEncoding).js;
 if (typeof s !== 'string' || s.length === 0) { $.exit(3); }
@@ -1511,13 +1534,14 @@ it.setDataForType($.NSData.data, 'org.nspasteboard.AutoGeneratedType');
 pb.writeObjects($([it]));
 pb.changeCount;
 "#;
-    let mut p = Command::new("osascript")
-        .args(["-l", "JavaScript", "-e", JXA])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .env_remove("MPM_PASSWORD")
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    let mut p = scrub_env(
+        Command::new("osascript")
+            .args(["-l", "JavaScript", "-e", JXA])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped()),
+    )
+    .spawn()
+    .map_err(|e| e.to_string())?;
     p.stdin
         .take()
         .unwrap()
@@ -1561,10 +1585,13 @@ fn cmd_clipclear() -> Result<(), String> {
         let script = format!(
             "ObjC.import('AppKit');var pb=$.NSPasteboard.generalPasteboard;if(pb.changeCount=={cc})pb.clearContents;"
         );
-        let _ = std::process::Command::new("osascript")
-            .args(["-l", "JavaScript", "-e", &script])
-            .env_remove("MPM_PASSWORD")
-            .status();
+        let _ = scrub_env(std::process::Command::new("osascript").args([
+            "-l",
+            "JavaScript",
+            "-e",
+            &script,
+        ]))
+        .status();
     } else if let Some(hash) = token.strip_prefix("hash:") {
         if let Some(cur) = clip_read() {
             if blake3::hash(&cur).to_hex().as_str() == hash {
@@ -1600,12 +1627,7 @@ fn copy_to_clipboard(val: &[u8]) -> Result<(), String> {
     };
     let mut wrote = false;
     for &(cmd, args) in tools {
-        if let Ok(mut p) = Command::new(cmd)
-            .args(args)
-            .stdin(Stdio::piped())
-            .env_remove("MPM_PASSWORD")
-            .spawn()
-        {
+        if let Ok(mut p) = scrub_env(Command::new(cmd).args(args).stdin(Stdio::piped())).spawn() {
             if let Some(mut s) = p.stdin.take() {
                 if s.write_all(val).is_ok() {
                     drop(s);
@@ -1632,8 +1654,10 @@ fn copy_to_clipboard(val: &[u8]) -> Result<(), String> {
 /// Read current clipboard bytes — per platform.
 #[cfg(target_os = "macos")]
 fn clip_read() -> Option<Vec<u8>> {
-    std::process::Command::new("pbpaste")
-        .env_remove("MPM_PASSWORD")
+    scrub_env(&mut std::process::Command::new("pbpaste"))
+        // clipboard bytes are decoded as text by pbpaste — pin UTF-8 so a
+        // non-UTF-8 locale can't mangle multibyte secrets
+        .env("LANG", "en_US.UTF-8")
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -1647,7 +1671,7 @@ fn clip_read() -> Option<Vec<u8>> {
         ("xclip", ["-selection", "clipboard", "-o"].as_slice()),
         ("xsel", ["--clipboard", "--output"].as_slice()),
     ] {
-        if let Ok(o) = std::process::Command::new(cmd).args(args).output() {
+        if let Ok(o) = scrub_env(std::process::Command::new(cmd).args(args)).output() {
             if o.status.success() {
                 return Some(o.stdout);
             }
@@ -1658,7 +1682,7 @@ fn clip_read() -> Option<Vec<u8>> {
 
 #[cfg(target_os = "windows")]
 fn clip_read() -> Option<Vec<u8>> {
-    std::process::Command::new("powershell")
+    scrub_env(&mut std::process::Command::new("powershell"))
         .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
         .output()
         .ok()
@@ -1690,7 +1714,7 @@ fn clip_clear() -> bool {
     let cmds: &[(&str, &[&str])] = &[];
 
     for &(cmd, args) in cmds {
-        if let Ok(st) = std::process::Command::new(cmd).args(args).status() {
+        if let Ok(st) = scrub_env(std::process::Command::new(cmd).args(args)).status() {
             if st.success() {
                 return true;
             }
@@ -1876,24 +1900,19 @@ fn cmd_import(
     // "Google-2", not silently replace the first
     let mut batch_names: std::collections::HashSet<String> = Default::default();
     for (kind, name, mut item) in items {
-        if batch_names.contains(&name) {
-            let mut n = 2;
-            while batch_names.contains(&format!("{name}-{n}")) {
-                n += 1;
-            }
-            batch_names.insert(format!("{name}-{n}"));
-            item.set(tag::NAME, format!("{name}-{n}").into_bytes());
-        } else {
-            batch_names.insert(name.clone());
-            item.set(tag::NAME, name.as_bytes().to_vec());
-        }
-        // same name + same kind → replace; name taken by another kind →
-        // find a free suffix rather than minting an ambiguous duplicate
-        let mut use_name = item
-            .get_str(tag::NAME)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| name.clone());
+        // resolve the final name in ONE loop: batch dup → name-2/-3…;
+        // name taken in the vault by another kind → -imported suffixes;
+        // the FINAL minted name is what must land in batch_names — the
+        // old code recorded the raw name and let a later row overwrite
+        // the record the suffix had just created
+        let mut use_name = name.clone();
+        let mut n = 2usize;
         loop {
+            if batch_names.contains(&use_name) {
+                use_name = format!("{name}-{n}");
+                n += 1;
+                continue;
+            }
             let existing = vault
                 .records()
                 .find(|r| r.name == use_name)
@@ -1926,6 +1945,7 @@ fn cmd_import(
                 }
             }
         }
+        batch_names.insert(use_name);
     }
     save_checkpoint(&vault)?;
     eprintln!("imported {created} new, {updated} updated");
@@ -2422,7 +2442,7 @@ fn main() {
         Cmd::Run { inject, cmd } => cmd_run(&dir, rec, inject, cmd),
         Cmd::Clipclear => cmd_clipclear(),
         Cmd::Preflight => autofill_preflight().map(|_| println!("ok")),
-        Cmd::Dopaste { id, field } => cmd_dopaste(&dir, rec, id, field),
+        Cmd::Dopaste { id, field, otp } => cmd_dopaste(&dir, rec, id, field.as_ref(), *otp),
         Cmd::Export { path } => cmd_export(&dir, rec, path),
         Cmd::Import {
             path,

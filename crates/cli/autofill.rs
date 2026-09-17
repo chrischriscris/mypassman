@@ -88,30 +88,62 @@ fn post_key(key: u16, utf16: &[u16]) -> Result<(), String> {
     Ok(())
 }
 
-/// Simulate ⌘V via System Events — the concealed clipboard write already
-/// happened. CGEvent-posted keys get silently dropped for spawned CLI
-/// children on modern macOS; System Events is the TCC-trusted broker every
-/// launcher script relies on. No secret crosses argv — just the keystroke.
-pub fn paste() -> Result<(), String> {
+/// Verify-and-paste in ONE JXA eval: the expected pasteboard content
+/// arrives on stdin (bytes — never argv/env/script text); the general
+/// pasteboard is compared against it and System Events posts ⌘V only on
+/// an exact match. Compare and keystroke are adjacent statements in one
+/// process — no window for a concurrent clipboard write to swap contents
+/// under us. On keystroke failure the payload is cleared iff it's still
+/// ours. Exit codes: 3 = clipboard changed; 4 = keystroke denied; 5 = bad input.
+pub fn paste(expected: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
     settle();
-    let out = std::process::Command::new("osascript")
-        .args([
-            "-e",
-            "tell application \"System Events\" to keystroke \"v\" using command down",
-        ])
+    // JXA quirk: zero-arg ObjC methods auto-invoke on property access —
+    // `pb.clearContents` IS the call; `clearContents()` throws "not a
+    // function". Only methods with arguments take parens.
+    const JXA: &str = r#"
+ObjC.import('AppKit');
+ObjC.import('stdlib');
+var d = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+var s = $.NSString.alloc.initWithDataEncoding(d, $.NSUTF8StringEncoding);
+if (s === null) { $.exit(5); }
+s = s.js;
+var pb = $.NSPasteboard.generalPasteboard;
+var cur = pb.stringForType('public.utf8-plain-text');
+if (cur === null || cur.js !== s) { $.exit(3); }
+try {
+    Application('System Events').keystroke('v', {using: 'command down'});
+} catch (e) {
+    if (pb.stringForType('public.utf8-plain-text').js === s) {
+        pb.clearContents;
+    }
+    $.exit(4);
+}
+"#;
+    let mut p = Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", JXA])
+        .stdin(Stdio::piped())
         // never forward credential env vars to a subprocess we don't own
         .env_remove("MPM_PASSWORD")
         .env_remove("MPM_EXPORT_PASSWORD")
-        .output()
+        .spawn()
         .map_err(|e| format!("osascript spawn: {e}"))?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let err = String::from_utf8_lossy(&out.stderr);
-    Err(format!(
-        "System Events keystroke denied ({err}) — grant Automation access: \
+    p.stdin
+        .take()
+        .unwrap()
+        .write_all(expected)
+        .map_err(|e| e.to_string())?;
+    match p.wait().map_err(|e| e.to_string())?.code() {
+        Some(0) => Ok(()),
+        Some(3) => Err("clipboard changed since the copy — refused to paste".into()),
+        Some(4) => Err(
+            "System Events keystroke denied — allow the launching app in \
 System Settings → Privacy & Security → Automation"
-    ))
+                .into(),
+        ),
+        _ => Err("paste helper failed".into()),
+    }
 }
 
 /// Type each part in order, Tab between them — `user⇥pass` form fill.

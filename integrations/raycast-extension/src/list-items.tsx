@@ -166,7 +166,7 @@ async function waitForFocus() {
 const fail = async (title: string, e: unknown, closed: boolean) => {
   const msg = e instanceof Error ? e.message : String(e);
   // once the window is closed only HUDs render; toasts need it open
-  if (closed) await showHUD(`⚠ ${title}: ${msg.split("\n").pop()}`);
+  if (closed) await showHUD(`⚠ ${title}: ${msg.trim().split("\n").pop()}`);
   else
     await showToast({
       style: Toast.Style.Failure,
@@ -226,12 +226,17 @@ async function fillInner(item: VaultItem, fields: string[], mode: "paste" | "typ
   try {
     const app = await getFrontmostApplication();
     target = app.name;
-    targetOk = !intended || !app.bundleId || app.bundleId === intended;
-  } catch {}
+    // an indeterminate destination can't prove it's the intended app —
+    // missing bundleId or a failed lookup aborts rather than spraying a
+    // secret wherever focus happens to be
+    targetOk = !intended || (!!app.bundleId && app.bundleId === intended);
+  } catch {
+    targetOk = !intended;
+  }
   if (!targetOk) {
     // the copy stays sealed — the janitor clears it within the clip TTL;
     // better a missed fill than a password in the wrong window
-    return showHUD(`⚠ Focus moved to ${target} — fill aborted`);
+    return showHUD(`⚠ Focus moved to ${target || "an unknown app"} — fill aborted`);
   }
   try {
     if (mode === "paste") {
@@ -267,11 +272,15 @@ async function copyField(item: VaultItem, field: string, otp: boolean) {
 }
 
 const RECENT_KEY = "mypassman-recent";
+// LocalStorage persists across launches; this hook updates React state in
+// the same tick so the Recent section reorders without a reload
+let onRecentChange: ((ids: string[]) => void) | null = null;
 async function bumpRecent(id: string) {
   try {
     const cur = JSON.parse((await LocalStorage.getItem<string>(RECENT_KEY)) ?? "[]") as string[];
     const next = [id, ...cur.filter((x) => x !== id)].slice(0, 5);
     await LocalStorage.setItem(RECENT_KEY, JSON.stringify(next));
+    onRecentChange?.(next);
   } catch {
     // recents are cosmetic — never block an action over it
   }
@@ -433,7 +442,7 @@ export default function Command() {
     // failed"…) instead of letting JSON.parse("") mask the real error
     parseOutput: ({ stdout, stderr, exitCode }) => {
       if (exitCode !== 0 || !stdout.trim()) {
-        throw new Error(stderr.trim() || `mypassman exited ${exitCode}`);
+        throw new Error(stderr.trim() || `mypassman exited ${exitCode ?? "abnormally"}`);
       }
       return JSON.parse(stdout) as VaultItem[];
     },
@@ -453,8 +462,12 @@ export default function Command() {
         setRecentIds(JSON.parse(v ?? "[]"));
       } catch {}
     });
+    onRecentChange = setRecentIds;
     const t = setInterval(() => setTick((n) => n + 1), 1000);
-    return () => clearInterval(t);
+    return () => {
+      clearInterval(t);
+      onRecentChange = null;
+    };
   }, []);
 
   if (error) {

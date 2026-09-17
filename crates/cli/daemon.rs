@@ -335,6 +335,11 @@ fn serve(
             let mut w = Writer::new();
             let mut rows: Vec<_> = vault.records().collect();
             rows.sort_by(|a, b| a.name.cmp(&b.name));
+            // the client reads at most MAX_MSG (1 MiB) — meta values are
+            // already capped per-field, but 500 fat rows would still
+            // overflow the aggregate. Budget meta bytes; rows past the
+            // budget get an empty map (fields/kind still arrive).
+            let mut meta_budget: usize = 768 * 1024;
             for r in rows {
                 let mut inner = Writer::new();
                 inner.field(T_NAME, r.name.as_bytes()); // canonical: 1 < 2 < 5 < 8 < 9
@@ -343,6 +348,11 @@ fn serve(
                 let (tags, ns) = crate::row_meta_tags(vault, &r.record_id);
                 let mut meta = Writer::new();
                 for (t, v) in &ns {
+                    let cost = v.len() + 4; // tag+len encoding overhead
+                    if cost > meta_budget {
+                        break;
+                    }
+                    meta_budget -= cost;
                     meta.field(*t, v);
                 }
                 inner.field(T_META, &meta.finish());

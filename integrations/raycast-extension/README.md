@@ -59,15 +59,16 @@ extension's preferences ("mypassman Binary Path") if yours lives elsewhere.
   (presence is metadata, not a secret), and values of fields explicitly
   classified non-secret (username, url, issuer, holder, endpoint…). Unknown
   field tags default to secret and are never emitted
-- Paste posts `⌘V` through System Events (osascript) — needs **Automation**
-  consent for the launching app (one-time prompt). Typing uses CGEvent
-  keystrokes — needs **Accessibility** ("post event") access instead
+- Paste compares-and-posts atomically: `__dopaste` re-fetches the expected
+  value and a single JXA eval reads the pasteboard, requires an exact
+  match, then posts `⌘V` through System Events — needs **Automation**
+  consent for the launching app (one-time prompt). A swapped clipboard
+  aborts instead of pasting the wrong secret; on keystroke failure our
+  payload is cleared. Typing uses CGEvent keystrokes — needs
+  **Accessibility** ("post event") access instead
 - Fills are bound to the app that was frontmost when Raycast opened: if
-  focus moved elsewhere by the time the window closes, the fill aborts
-  rather than land a secret in the wrong window. `__dopaste` also
-  re-verifies the pasteboard still holds the exact copied value before
-  posting — overlapping fills or a cleared clipboard abort instead of
-  pasting the wrong thing, and a failed paste clears our payload
+  focus moved elsewhere — or the frontmost app can't be identified — the
+  fill aborts rather than land a secret in the wrong window
 - Focus lands wherever your cursor was — the extension polls
   `getFrontmostApplication` until Raycast yields focus before spawning the
   fill, and the CLI additionally waits `MPM_FILL_DELAY_MS` (default 350ms)
