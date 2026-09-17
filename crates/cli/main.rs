@@ -3,10 +3,14 @@
 
 use clap::{Parser, Subcommand};
 use mpm_core::item::{tag, Item, ItemKind};
+#[cfg(target_os = "macos")]
+use mpm_core::manifest::SLOT_BIOMETRIC;
 use mpm_core::manifest::{WrapSlot, SLOT_PASSWORD, SLOT_RECOVERY};
 use mpm_core::{gen, recovery, Manifest, Vault};
 use mpm_crypto::kdf::{self, KdfParams};
 use mpm_crypto::keys::{DeviceKey, KeyBundle};
+#[cfg(target_os = "macos")]
+mod bio;
 mod daemon;
 
 use std::collections::BTreeMap;
@@ -136,12 +140,27 @@ enum Cmd {
     },
     /// Lock now: tell a running daemon to drop the vault and exit
     Lock,
+    /// Biometric unlock (Touch ID on macOS): enroll/remove
+    Bio {
+        #[command(subcommand)]
+        sub: BioCmd,
+    },
 }
 
 #[derive(Subcommand)]
 enum RecoveryCmd {
     /// Mint a new recovery code (requires master password); invalidates the old kit
     Rotate,
+}
+
+#[derive(Subcommand)]
+enum BioCmd {
+    /// Store a Touch ID-gated KEK in the Keychain; unlocks then prompt for
+    /// biometrics instead of the master password. Password always remains
+    /// as fallback.
+    Enroll,
+    /// Remove biometric unlock: deletes the Keychain item and wrap slot
+    Off,
 }
 
 fn vault_dir(cli: &Cli) -> PathBuf {
@@ -261,36 +280,78 @@ fn unlock(dir: &Path, recovery_mode: bool) -> Result<Vault, String> {
         .check_bounds(DEVICE_KDF_CAP_KIB)
         .map_err(|e| e.to_string())?;
 
-    let (slot_type, secret) = if recovery_mode {
-        let code = read_password("recovery code: ");
-        let raw = recovery::parse_code(&code).map_err(|_| "malformed recovery code".to_string())?;
-        (SLOT_RECOVERY, Zeroizing::new(raw.to_vec()))
-    } else {
-        let pw = read_password("master password: ");
-        (SLOT_PASSWORD, Zeroizing::new(pw.as_bytes().to_vec()))
-    };
-
     let mut bundle = None;
-    for slot in &manifest.wrap_slots {
-        if slot.slot_type != slot_type {
-            continue;
+
+    // Biometric slot first (macOS): a Touch ID-gated KEK in the Keychain
+    // unwraps the bundle without any password prompt. Skipped when
+    // --recovery, $MPM_PASSWORD (scripting), or $MPM_NO_BIO is set.
+    #[cfg(target_os = "macos")]
+    {
+        if !recovery_mode
+            && std::env::var_os("MPM_PASSWORD").is_none()
+            && std::env::var_os("MPM_NO_BIO").is_none()
+            && manifest
+                .wrap_slots
+                .iter()
+                .any(|s| s.slot_type == SLOT_BIOMETRIC)
+        {
+            if let Some(kek) = bio::load(&manifest.vault_id) {
+                for slot in &manifest.wrap_slots {
+                    if slot.slot_type != SLOT_BIOMETRIC {
+                        continue;
+                    }
+                    if let Ok(b) = KeyBundle::unwrap(
+                        &kek,
+                        &mpm_core::aad::wrap_slot(
+                            &manifest.vault_id,
+                            manifest.key_epoch,
+                            SLOT_BIOMETRIC,
+                        ),
+                        &slot.blob,
+                    ) {
+                        bundle = Some(b);
+                        break;
+                    }
+                }
+                if bundle.is_none() {
+                    eprintln!("warning: biometric key didn't unwrap — password fallback");
+                }
+            }
         }
-        let Some((params, salt)) = &slot.kdf else {
-            continue;
+    }
+
+    if bundle.is_none() {
+        let (slot_type, secret) = if recovery_mode {
+            let code = read_password("recovery code: ");
+            let raw =
+                recovery::parse_code(&code).map_err(|_| "malformed recovery code".to_string())?;
+            (SLOT_RECOVERY, Zeroizing::new(raw.to_vec()))
+        } else {
+            let pw = read_password("master password: ");
+            (SLOT_PASSWORD, Zeroizing::new(pw.as_bytes().to_vec()))
         };
-        // one malformed/hostile slot must not brick the whole vault
-        if params.check_bounds(DEVICE_KDF_CAP_KIB).is_err() {
-            eprintln!("warning: skipping slot with out-of-bounds KDF params");
-            continue;
-        }
-        let kek = kdf::derive_kek(&secret, salt, params).map_err(|e| e.to_string())?;
-        if let Ok(b) = KeyBundle::unwrap(
-            &kek,
-            &mpm_core::aad::wrap_slot(&manifest.vault_id, manifest.key_epoch, slot_type),
-            &slot.blob,
-        ) {
-            bundle = Some(b);
-            break;
+
+        for slot in &manifest.wrap_slots {
+            if slot.slot_type != slot_type {
+                continue;
+            }
+            let Some((params, salt)) = &slot.kdf else {
+                continue;
+            };
+            // one malformed/hostile slot must not brick the whole vault
+            if params.check_bounds(DEVICE_KDF_CAP_KIB).is_err() {
+                eprintln!("warning: skipping slot with out-of-bounds KDF params");
+                continue;
+            }
+            let kek = kdf::derive_kek(&secret, salt, params).map_err(|e| e.to_string())?;
+            if let Ok(b) = KeyBundle::unwrap(
+                &kek,
+                &mpm_core::aad::wrap_slot(&manifest.vault_id, manifest.key_epoch, slot_type),
+                &slot.blob,
+            ) {
+                bundle = Some(b);
+                break;
+            }
         }
     }
     let bundle = bundle.ok_or("unlock failed")?;
@@ -681,8 +742,8 @@ fn b32_encode(b: &[u8]) -> String {
 }
 
 fn cmd_list(dir: &Path, rec: bool) -> Result<(), String> {
-    println!("{:<10} {:<40} ID", "KIND", "NAME");
     if let Some(rows) = daemon::try_list(dir)? {
+        println!("{:<10} {:<40} ID", "KIND", "NAME");
         for (kind, name, rid) in rows {
             println!(
                 "{:<10} {:<40} {}",
@@ -694,6 +755,7 @@ fn cmd_list(dir: &Path, rec: bool) -> Result<(), String> {
         return Ok(());
     }
     let vault = unlock(dir, rec)?;
+    println!("{:<10} {:<40} ID", "KIND", "NAME");
     let mut rows: Vec<_> = vault.records().collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     for r in rows {
@@ -1701,6 +1763,89 @@ fn cmd_lock(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// ── biometric unlock (macOS Touch ID) ───────────────────────────────
+
+/// `bio enroll`: unlock with password → mint a random KEK → store it in
+/// the Keychain gated by an LAContext prompt → wrap the bundle in a
+/// SLOT_BIOMETRIC slot → re-sign the manifest.
+#[cfg(target_os = "macos")]
+fn cmd_bio_enroll(dir: &Path, rec: bool) -> Result<(), String> {
+    if !bio::available() {
+        return Err("no biometrics on this Mac (Touch ID unavailable/not enrolled)".into());
+    }
+    let _lock = mpm_store::lock_vault(dir).map_err(|e| e.to_string())?;
+    // force the password path — enrolling biometrics must prove you know it
+    let mut vault = if rec {
+        unlock(dir, true)?
+    } else {
+        let keep = std::env::var_os("MPM_NO_BIO");
+        std::env::set_var("MPM_NO_BIO", "1");
+        let v = unlock(dir, false);
+        match keep {
+            Some(v2) => std::env::set_var("MPM_NO_BIO", v2),
+            None => std::env::remove_var("MPM_NO_BIO"),
+        }
+        v?
+    };
+
+    let mut key = Zeroizing::new([0u8; bio::BIO_KEY_LEN]);
+    rand_core_fill(&mut *key);
+    bio::enroll(&vault.manifest.vault_id, &key)?;
+
+    vault
+        .manifest
+        .wrap_slots
+        .retain(|s| s.slot_type != SLOT_BIOMETRIC);
+    vault.manifest.wrap_slots.push(WrapSlot {
+        slot_type: SLOT_BIOMETRIC,
+        kdf: None, // KEK is stored directly, no password KDF
+        blob: vault
+            .bundle()
+            .wrap(
+                &key,
+                &mpm_core::aad::wrap_slot(
+                    &vault.manifest.vault_id,
+                    vault.manifest.key_epoch,
+                    SLOT_BIOMETRIC,
+                ),
+            )
+            .map_err(|e| e.to_string())?,
+        extra: Vec::new(),
+    });
+    let owner_sk = vault.bundle().owner_signing_key();
+    let bytes = vault.manifest.to_file(&owner_sk);
+    mpm_store::write_manifest(dir, &bytes).map_err(|e| e.to_string())?;
+    eprintln!("Touch ID enrolled — unlocks now prompt for biometrics.");
+    eprintln!("password still works ($MPM_NO_BIO=1 or --recovery to skip the prompt)");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn cmd_bio_off(dir: &Path, rec: bool) -> Result<(), String> {
+    let _lock = mpm_store::lock_vault(dir).map_err(|e| e.to_string())?;
+    let mut vault = unlock(dir, rec)?; // bio path ok — you own the fingers
+    bio::remove(&vault.manifest.vault_id);
+    vault
+        .manifest
+        .wrap_slots
+        .retain(|s| s.slot_type != SLOT_BIOMETRIC);
+    let owner_sk = vault.bundle().owner_signing_key();
+    let bytes = vault.manifest.to_file(&owner_sk);
+    mpm_store::write_manifest(dir, &bytes).map_err(|e| e.to_string())?;
+    eprintln!("biometric unlock removed");
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cmd_bio_enroll(_dir: &Path, _rec: bool) -> Result<(), String> {
+    Err("biometric unlock is macOS-only so far (Windows Hello / secret-service come with those ports)".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cmd_bio_off(_dir: &Path, _rec: bool) -> Result<(), String> {
+    Err("no biometric enrollment on this platform".into())
+}
+
 fn main() {
     let cli = Cli::parse();
     let dir = vault_dir(&cli);
@@ -1731,6 +1876,10 @@ fn main() {
         Cmd::Restore { src } => cmd_restore(&dir, src),
         Cmd::Daemon { idle_ttl } => cmd_daemon(&dir, rec, *idle_ttl),
         Cmd::Lock => cmd_lock(&dir),
+        Cmd::Bio { sub } => match sub {
+            BioCmd::Enroll => cmd_bio_enroll(&dir, rec),
+            BioCmd::Off => cmd_bio_off(&dir, rec),
+        },
     };
 
     if let Err(e) = res {

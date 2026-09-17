@@ -15,13 +15,17 @@ const FAST: KdfParams = KdfParams {
 };
 
 fn tmpdir() -> std::path::PathBuf {
+    // nanos alone can collide across test threads (macOS clock granularity
+    // is coarser than ns) — the counter makes it collision-proof
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let d = std::env::temp_dir().join(format!(
-        "mpm-test-{}-{}",
+        "mpm-test-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&d).unwrap();
     d

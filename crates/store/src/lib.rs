@@ -80,7 +80,15 @@ pub fn lock_vault(dir: &Path) -> Result<File> {
 /// Durable manifest write: unique tmp (O_EXCL — never follows a planted
 /// symlink) → fsync → rename → fsync dir.
 pub fn write_manifest(dir: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = dir.join(format!(".MANIFEST.{}.tmp", std::process::id()));
+    // unique per call within the process too — concurrent same-dir writes
+    // must not share a tmp path (one's error-cleanup would delete the
+    // other's file under rename)
+    static TMPN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = dir.join(format!(
+        ".MANIFEST.{}.{}.tmp",
+        std::process::id(),
+        TMPN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let dst = dir.join(MANIFEST);
     let res = (|| -> Result<()> {
         {

@@ -526,6 +526,14 @@ Electron, anywhere a keyboard works.
   - macOS/iOS: Keychain item with `kSecAccessControlBiometryCurrentSet`
     *or* SE P-256 key doing ECIES-wrap of the DEK — different properties,
     pick deliberately.
+  - *Shipped today (unsigned CLI):* LAContext prompt gates a plain-keychain
+    KEK that wraps the bundle in `SLOT_BIOMETRIC`. The ACL'd-item and
+    Secure-Enclave paths were tried first — both need a signed binary
+    (`errSec -34018` on access-controlled items, `Kill: 9` on the
+    restricted entitlement). So the current gate is user-presence, not a
+    hardware boundary: a same-uid process could read the KEK without the
+    prompt. A signed release upgrades to the SE design with zero format
+    change — the slot already binds vault_id + key_epoch.
   - Android: Keystore/StrongBox AES key, `setUserAuthenticationRequired`.
   - Windows: Hello/DPAPI. Linux: secret-service, TPM2 optional.
 - **Failed-attempt handling**: local escalating delay only; optional
@@ -583,7 +591,7 @@ Electron, anywhere a keyboard works.
 |---|---|
 | M0 | `docs/FORMAT.md` + `docs/THREATMODEL.md` + `docs/SYNC.md` + test vectors + workspace + CI gates + **throwaway iOS AutoFill-extension spike** (measures memory ceiling, cold-launch latency, Argon2 fit — before anything freezes). **Spec before code.** |
 | M1 | `core`+`crypto`+`store`: vault init/open/CRUD/merge + all item kinds, fuzzed + proptested, handle-based secrecy API, single device, **no sync yet**. Format v1 freezes here — informed by the M0 spike. |
-| M2 | CLI + daemon (macOS): ~~init/unlock/add/get/list/edit/copy/reveal, gen, recovery kit, TOTP/`otp` (RFC 6238, SHA-1/256/512, `otpauth://`), `run` env injection, unix-socket daemon w/ idle auto-lock + `lock`, MPMEXP passphrase-sealed export/import + CSV import (Bitwarden/1Password), verified backup/restore~~ ✓. **Daily-usable on your laptop.** |
+| M2 | CLI + daemon (macOS): ~~init/unlock/add/get/list/edit/copy/reveal, gen, recovery kit, TOTP/`otp` (RFC 6238, SHA-1/256/512, `otpauth://`), `run` env injection, unix-socket daemon w/ idle auto-lock + `lock`, MPMEXP passphrase-sealed export/import + CSV import (Bitwarden/1Password), verified backup/restore, Touch ID unlock (`bio enroll`/`bio off`)~~ ✓. **Daily-usable on your laptop.** |
 | M3 | `syncd` self-host binary + device enrollment (pairing direction spiked *with* a phone) + merge + tombstones + compaction + conflict UI + gossip-vector verification. Test matrix: two offline devices editing one record, day-skewed clock, mid-sync partial file, restored-from-backup device, atomic `key_epoch` rotation, equivocation detection. **Phone↔laptop anywhere sync lands here.** |
 | M4 | iOS app (SwiftUI + uniffi) + AutoFill extension + FaceID unlock (ThisDeviceOnly) + foreground-pull sync + `otpauth://` QR import. **The "use it everywhere" point.** |
 | M5 | Minimal macOS app — shares the iOS SwiftUI codebase, so it's nearly free and kills the "CLI-only on your work machine" inversion; menu bar + autotype + TouchID |
