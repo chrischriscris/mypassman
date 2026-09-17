@@ -188,9 +188,10 @@ async function fill(item: VaultItem, fields: string[], mode: "paste" | "type", o
     t.hide();
   }
   // Phase 1 — everything that can fail while the window is still open:
-  // permission check + (for paste) the concealed clipboard write.
+  // CGEvent permission check for typing; the concealed clipboard write
+  // for paste (its keystroke goes through System Events instead).
   try {
-    await run(["__preflight"]);
+    if (mode === "type") await run(["__preflight"]);
     if (mode === "paste") {
       await run(otp ? ["otp", item.id, "--copy"] : ["get", item.id, "--copy", useFields[0]]);
     }
