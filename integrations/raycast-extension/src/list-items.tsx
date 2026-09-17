@@ -163,9 +163,22 @@ async function waitForFocus() {
 // from the daemon to the pasteboard/frontmost app and never enters this
 // process. `closeMainWindow` first so focus returns to the target app
 // before the synthetic keystrokes land.
+const fail = async (title: string, e: unknown, closed: boolean) => {
+  const msg = e instanceof Error ? e.message : String(e);
+  // once the window is closed only HUDs render; toasts need it open
+  if (closed) await showHUD(`⚠ ${title}: ${msg.split("\n").pop()}`);
+  else
+    await showToast({
+      style: Toast.Style.Failure,
+      title,
+      message: /unlock/i.test(msg) ? "Vault locked — run Unlock Vault first" : msg,
+    });
+};
+
 async function fill(item: VaultItem, fields: string[], mode: "paste" | "type", otp: boolean) {
   // paste mode is single-field; multi-field fill is type-only
   const useFields = mode === "paste" ? fields.slice(0, 1) : fields;
+  const what = otp ? "code" : useFields.join(" ⇥ ");
   // a code rolling in <5s usually dies before the form submits — wait for it
   const left = otp ? totpLeft(item, Date.now()) : null;
   const wait = left !== null && left <= 5 ? left * 1000 + 400 : 0;
@@ -174,21 +187,33 @@ async function fill(item: VaultItem, fields: string[], mode: "paste" | "type", o
     await new Promise((r) => setTimeout(r, wait));
     t.hide();
   }
+  // Phase 1 — everything that can fail while the window is still open:
+  // permission check + (for paste) the concealed clipboard write.
+  try {
+    await run(["__preflight"]);
+    if (mode === "paste") {
+      await run(otp ? ["otp", item.id, "--copy"] : ["get", item.id, "--copy", useFields[0]]);
+    }
+  } catch (e) {
+    return fail(`Couldn't ${mode} ${what}`, e, false);
+  }
+  // Phase 2 — close, let focus return, then post the event(s).
   await closeMainWindow({ clearRootSearch: true });
   await waitForFocus();
   try {
-    const args = otp
-      ? ["otp", item.id, `--${mode}`]
-      : ["get", item.id, ...useFields.flatMap((f) => [`--${mode}`, f])];
-    await run(args);
-    await showHUD(`${otp ? "code" : useFields.join(" ⇥ ")} ${mode === "paste" ? "pasted" : "typed"}`);
+    if (mode === "paste") {
+      await run(["__dopaste"]);
+    } else {
+      await run(
+        otp
+          ? ["otp", item.id, "--type"]
+          : ["get", item.id, ...useFields.flatMap((f) => ["--type", f])],
+      );
+    }
+    await showHUD(`${what} ${mode === "paste" ? "pasted" : "typed"}`);
     bumpRecent(item.id);
   } catch (e) {
-    await showToast({
-      style: Toast.Style.Failure,
-      title: `Couldn't ${mode} ${otp ? "code" : useFields.join(", ")}`,
-      message: e instanceof Error ? e.message : String(e),
-    });
+    await fail(`Couldn't ${mode} ${what}`, e, true);
   }
 }
 

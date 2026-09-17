@@ -132,6 +132,14 @@ enum Cmd {
     /// after TTL iff it still holds our payload. Hash arrives on stdin.
     #[command(hide = true, name = "__clipclear")]
     Clipclear,
+    /// (internal) check/request Accessibility post-event access — launchers
+    /// call this while their window is still up so failures are visible
+    #[command(hide = true, name = "__preflight")]
+    Preflight,
+    /// (internal) post ⌘V into the frontmost app — the clipboard write
+    /// happened earlier via get --copy while the caller's UI was still open
+    #[command(hide = true, name = "__dopaste")]
+    Dopaste,
     /// Export all items to a passphrase-sealed portable file (MPMEXP).
     /// The export passphrase is prompted (or $MPM_EXPORT_PASSWORD).
     Export { path: PathBuf },
@@ -2342,6 +2350,8 @@ fn main() {
         Cmd::Edit { name, fields } => cmd_edit(&dir, rec, name, fields),
         Cmd::Run { inject, cmd } => cmd_run(&dir, rec, inject, cmd),
         Cmd::Clipclear => cmd_clipclear(),
+        Cmd::Preflight => autofill_preflight().map(|_| println!("ok")),
+        Cmd::Dopaste => paste_into_app().map(|_| eprintln!("pasted")),
         Cmd::Export { path } => cmd_export(&dir, rec, path),
         Cmd::Import {
             path,
