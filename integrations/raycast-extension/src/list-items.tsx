@@ -175,7 +175,20 @@ const fail = async (title: string, e: unknown, closed: boolean) => {
     });
 };
 
+let fillInFlight = false; // overlapping fills can swap clipboard contents
 async function fill(item: VaultItem, fields: string[], mode: "paste" | "type", otp: boolean) {
+  if (fillInFlight) {
+    return showToast({ style: Toast.Style.Failure, title: "A fill is already in progress" });
+  }
+  fillInFlight = true;
+  try {
+    await fillInner(item, fields, mode, otp);
+  } finally {
+    fillInFlight = false;
+  }
+}
+
+async function fillInner(item: VaultItem, fields: string[], mode: "paste" | "type", otp: boolean) {
   // paste mode is single-field; multi-field fill is type-only
   const useFields = mode === "paste" ? fields.slice(0, 1) : fields;
   const what = otp ? "code" : useFields.join(" ⇥ ");
@@ -187,6 +200,13 @@ async function fill(item: VaultItem, fields: string[], mode: "paste" | "type", o
     await new Promise((r) => setTimeout(r, wait));
     t.hide();
   }
+  // the app that was frontmost when Raycast opened is the fill's intended
+  // destination — verify it's still frontmost after our window closes so
+  // a focus jump can't carry a secret somewhere else
+  let intended = "";
+  try {
+    intended = (await getFrontmostApplication()).bundleId ?? "";
+  } catch {}
   // Phase 1 — everything that can fail while the window is still open:
   // CGEvent permission check for typing; the concealed clipboard write
   // for paste (its keystroke goes through System Events instead).
@@ -202,12 +222,21 @@ async function fill(item: VaultItem, fields: string[], mode: "paste" | "type", o
   await closeMainWindow({ clearRootSearch: true });
   await waitForFocus();
   let target = "";
+  let targetOk = true;
   try {
-    target = (await getFrontmostApplication()).name;
+    const app = await getFrontmostApplication();
+    target = app.name;
+    targetOk = !intended || !app.bundleId || app.bundleId === intended;
   } catch {}
+  if (!targetOk) {
+    // the copy stays sealed — the janitor clears it within the clip TTL;
+    // better a missed fill than a password in the wrong window
+    return showHUD(`⚠ Focus moved to ${target} — fill aborted`);
+  }
   try {
     if (mode === "paste") {
-      await run(["__dopaste"]);
+      // __dopaste re-verifies the pasteboard still holds this exact value
+      await run(["__dopaste", item.id, otp ? "--otp" : useFields[0]]);
     } else {
       await run(
         otp
@@ -277,10 +306,11 @@ async function unlockVault(revalidate: () => void) {
   toast.message = "Run `mypassman daemon` in a terminal to unlock with your password";
 }
 
-async function lockVault() {
+async function lockVault(revalidate: () => void) {
   try {
     await run(["lock"]);
     await showToast({ style: Toast.Style.Success, title: "Vault locked" });
+    revalidate(); // daemon is gone — list flips to the locked state
   } catch {
     await showToast({ style: Toast.Style.Failure, title: "Lock failed" });
   }
@@ -387,7 +417,7 @@ function RowActions({
           icon={Icon.Lock}
           style={Action.Style.Destructive}
           shortcut={{ modifiers: ["cmd", "shift"], key: "l" }}
-          onAction={lockVault}
+          onAction={() => lockVault(revalidate)}
         />
       </ActionPanel.Section>
     </ActionPanel>

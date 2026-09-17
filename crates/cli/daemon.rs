@@ -604,11 +604,21 @@ pub fn try_list(dir: &Path) -> Result<Option<Vec<ListRow>>, String> {
                             row.rid = mpm_store::hex(id);
                         }
                         T_FIELDS => {
-                            row.fields = iv.iter().map(|t| crate::tag_name(*t)).collect();
+                            // ≤256 tag bytes exist; more is wire garbage —
+                            // don't let it amplify into heap strings
+                            if iv.len() <= 256 {
+                                row.fields = iv.iter().map(|t| crate::tag_name(*t)).collect();
+                            }
                         }
                         T_META => {
                             let mut mr = Reader::new(iv);
                             while let Some((mt, mv)) = mr.next_field().map_err(|e| e.to_string())? {
+                                // re-classify client-side: a hostile or
+                                // buggy producer can't smuggle secret-tag
+                                // values into the metadata channel
+                                if crate::tag_secret(mt) {
+                                    continue;
+                                }
                                 row.meta.push((
                                     crate::tag_name(mt),
                                     String::from_utf8_lossy(mv).into_owned(),

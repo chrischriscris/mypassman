@@ -99,6 +99,9 @@ pub fn paste() -> Result<(), String> {
             "-e",
             "tell application \"System Events\" to keystroke \"v\" using command down",
         ])
+        // never forward credential env vars to a subprocess we don't own
+        .env_remove("MPM_PASSWORD")
+        .env_remove("MPM_EXPORT_PASSWORD")
         .output()
         .map_err(|e| format!("osascript spawn: {e}"))?;
     if out.status.success() {
@@ -115,6 +118,18 @@ System Settings → Privacy & Security → Automation"
 /// Per-char events (not one big string) for compatibility with fields
 /// that drop multi-char synthetic input.
 pub fn type_seq(parts: &[&str]) -> Result<(), String> {
+    // unbounded typing is a self-DoS: at ~9ms/char a pathological field
+    // would type for hours into wherever focus wanders. Bound it.
+    let cap: usize = std::env::var("MPM_TYPE_MAX_CHARS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4096);
+    let total: usize = parts.iter().map(|p| p.chars().count()).sum();
+    if total > cap {
+        return Err(format!(
+            "{total} chars to type exceeds {cap} cap — copy instead"
+        ));
+    }
     preflight()?;
     settle();
     for (i, part) in parts.iter().enumerate() {

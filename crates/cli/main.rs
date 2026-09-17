@@ -136,10 +136,10 @@ enum Cmd {
     /// call this while their window is still up so failures are visible
     #[command(hide = true, name = "__preflight")]
     Preflight,
-    /// (internal) post ⌘V into the frontmost app — the clipboard write
-    /// happened earlier via get --copy while the caller's UI was still open
+    /// (internal) verify the pasteboard still holds <id>'s <field> — or
+    /// the current code with `--otp` — then post ⌘V into the frontmost app
     #[command(hide = true, name = "__dopaste")]
-    Dopaste,
+    Dopaste { id: String, field: String },
     /// Export all items to a passphrase-sealed portable file (MPMEXP).
     /// The export passphrase is prompted (or $MPM_EXPORT_PASSWORD).
     Export { path: PathBuf },
@@ -779,36 +779,42 @@ fn b32_encode(b: &[u8]) -> String {
     out
 }
 
+/// field tag → is-secret, via field_map. Unknown tags are secret —
+/// a newer build's sensitive field must never leak through an older
+/// reader's metadata path.
+fn tag_secret(t: u8) -> bool {
+    field_map()
+        .values()
+        .find(|(ft, _)| *ft == t)
+        .map(|(_, s)| *s)
+        .unwrap_or(true)
+}
+
 /// (all field tags present, non-secret tag→first-value) — shared by the
 /// daemon LIST op and `list --json`. Tag→name mapping stays client-side.
+/// Meta values are truncated: a pathological vault must not blow the
+/// 1 MiB wire budget. Output is tag-sorted — canonical inner TLV order.
 fn row_meta_tags(vault: &mpm_core::Vault, rid: &[u8; 16]) -> (Vec<u8>, Vec<(u8, Vec<u8>)>) {
+    const META_VALUE_CAP: usize = 2048;
     let Ok(item) = vault.item(rid) else {
         return (vec![], vec![]);
-    };
-    let fmap = field_map();
-    let secret_of = |t: u8| {
-        fmap.values()
-            .find(|(ft, _)| *ft == t)
-            .map(|(_, s)| *s)
-            .unwrap_or(true) // unknown tags are secret — never leak
     };
     let mut all = Vec::new();
     let mut ns = Vec::new();
     for (t, vals) in &item.fields {
         all.push(*t);
-        if !secret_of(*t) {
+        if !tag_secret(*t) {
             if let Some(v) = vals.first() {
-                ns.push((*t, v.clone()));
+                ns.push((*t, v[..v.len().min(META_VALUE_CAP)].to_vec()));
             }
         }
     }
     // totp items that didn't set an explicit period still roll every 30s —
     // surface the default so clients can render a countdown
-    if let (Some(&(pt, false)), Some(&(st, _))) = (fmap.get("period"), fmap.get("totp_secret")) {
-        if all.contains(&st) && !all.contains(&pt) {
-            ns.push((pt, b"30".to_vec()));
-        }
+    if all.contains(&tag::TOTP_SECRET) && !all.contains(&tag::TOTP_PERIOD) {
+        ns.push((tag::TOTP_PERIOD, b"30".to_vec()));
     }
+    ns.sort_by_key(|(t, _)| *t);
     (all, ns)
 }
 
@@ -992,16 +998,59 @@ fn pick_out(c: Option<&String>, p: Option<&String>, t: &[String]) -> Result<Out,
     }
 }
 
-fn cmd_get(dir: &Path, rec: bool, name: &str, show: bool, out: &Out) -> Result<(), String> {
+/// Daemon-first item fetch — daemon when live, vault unlock otherwise.
+fn fetch_item(dir: &Path, rec: bool, name: &str) -> Result<mpm_core::Item, String> {
     match daemon::item(dir, name)? {
-        daemon::DaemonItem::Found(item, _, _, _) => return render_item(&item, show, out),
+        daemon::DaemonItem::Found(item, ..) => return Ok(item),
         daemon::DaemonItem::Missing => return Err(format!("'{name}': not found")),
         daemon::DaemonItem::Offline => {}
     }
     let vault = unlock(dir, rec)?;
     let rid = find_one(&vault, name)?;
-    let item = vault.item(&rid).map_err(|e| e.to_string())?;
-    render_item(&item, show, out)
+    vault.item(&rid).map_err(|e| e.to_string())
+}
+
+fn cmd_get(dir: &Path, rec: bool, name: &str, show: bool, out: &Out) -> Result<(), String> {
+    render_item(&fetch_item(dir, rec, name)?, show, out)
+}
+
+/// `__dopaste <id> <field>` — the second half of a two-phase fill. The
+/// caller's earlier `get --copy` already published the field; we re-fetch
+/// it and refuse to post ⌘V unless the pasteboard still holds exactly
+/// that — overlapping fills, janitor clears, or foreign copies can never
+/// emit the wrong secret. `--otp` recomputes the code (a rolled code
+/// fails the compare, correctly aborting a stale paste).
+fn cmd_dopaste(dir: &Path, rec: bool, id: &str, field: &str) -> Result<(), String> {
+    let expected: Vec<u8> = if field == "--otp" {
+        totp_code(&fetch_item(dir, rec, id)?)?.0.into_bytes()
+    } else {
+        let fmap = field_map();
+        let Some((t, _)) = fmap.get(field) else {
+            return Err(format!("unknown field '{field}'"));
+        };
+        fetch_item(dir, rec, id)?
+            .get(*t)
+            .ok_or("field absent")?
+            .to_vec()
+    };
+    match clip_read() {
+        Some(cur) if cur == expected => {}
+        _ => return Err("clipboard changed since the copy — refusing to paste".into()),
+    }
+    match paste_into_app() {
+        Ok(()) => {
+            eprintln!("pasted");
+            Ok(())
+        }
+        Err(e) => {
+            // it's still our secret on the pasteboard — don't leave it
+            // sitting there on a failed fill
+            if clip_read().as_deref() == Some(expected.as_slice()) {
+                clip_clear();
+            }
+            Err(e)
+        }
+    }
 }
 
 fn render_item(item: &mpm_core::Item, show: bool, out: &Out) -> Result<(), String> {
@@ -1168,18 +1217,8 @@ fn cmd_gen(
     Ok(())
 }
 
-/// `otp <name>` — current TOTP code for any item carrying a totp_secret
-/// (a login can hold its own 2FA; a `totp` item is the standalone form).
-fn cmd_otp(dir: &Path, rec: bool, name: &str, out: &Out) -> Result<(), String> {
-    let item = match daemon::item(dir, name)? {
-        daemon::DaemonItem::Found(i, _, _, _) => i,
-        daemon::DaemonItem::Missing => return Err(format!("'{name}': not found")),
-        daemon::DaemonItem::Offline => {
-            let vault = unlock(dir, rec)?;
-            let rid = find_one(&vault, name)?;
-            vault.item(&rid).map_err(|e| e.to_string())?
-        }
-    };
+/// current TOTP code + seconds-left for an item carrying totp_secret
+fn totp_code(item: &mpm_core::Item) -> Result<(String, u64), String> {
     let b32 = item
         .get_str(tag::TOTP_SECRET)
         .ok_or("item has no totp_secret field")?;
@@ -1198,7 +1237,22 @@ fn cmd_otp(dir: &Path, rec: bool, name: &str, out: &Out) -> Result<(), String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let (code, left) = mpm_core::totp::totp(&secret, now, period, digits, algo);
+    Ok(mpm_core::totp::totp(&secret, now, period, digits, algo))
+}
+
+/// `otp <name>` — current TOTP code for any item carrying a totp_secret
+/// (a login can hold its own 2FA; a `totp` item is the standalone form).
+fn cmd_otp(dir: &Path, rec: bool, name: &str, out: &Out) -> Result<(), String> {
+    let item = match daemon::item(dir, name)? {
+        daemon::DaemonItem::Found(i, _, _, _) => i,
+        daemon::DaemonItem::Missing => return Err(format!("'{name}': not found")),
+        daemon::DaemonItem::Offline => {
+            let vault = unlock(dir, rec)?;
+            let rid = find_one(&vault, name)?;
+            vault.item(&rid).map_err(|e| e.to_string())?
+        }
+    };
+    let (code, left) = totp_code(&item)?;
     match out {
         Out::Copy(_) => {
             copy_to_clipboard(code.as_bytes())?;
@@ -1784,8 +1838,15 @@ fn cmd_import(
     dry_run: bool,
 ) -> Result<(), String> {
     if dry_run {
-        // parse + simulate collisions, never touch the vault or keys
-        let items = load_import_items(path, csv, otpauth)?;
+        // parse + canonicalize + validate, never touch the vault or keys —
+        // a dry-run must fail on everything the real import would fail on
+        let mut items = load_import_items(path, csv, otpauth)?;
+        for (_, _, item) in &mut items {
+            finalize_totp(item)?;
+        }
+        if items.len() > 100_000 {
+            return Err(format!("{} items — absurd, refusing", items.len()));
+        }
         println!("would import {} items:", items.len());
         let mut kinds: std::collections::BTreeMap<&str, usize> = Default::default();
         for (k, _, _) in &items {
@@ -1948,9 +2009,19 @@ fn otpauth_to_items(raw: &[u8]) -> Result<Vec<(ItemKind, String, mpm_core::Item)
         if !oa.issuer.is_empty() {
             item.set(tag::TOTP_ISSUER, oa.issuer.clone().into_bytes());
         }
-        // label is usually "Issuer:account" already — else issuer, else acct
+        // label is usually "Issuer:account" already. A bare-account label
+        // with a separate issuer param MUST become issuer:account — two
+        // issuers both exporting "alice" would otherwise collide on the
+        // same name and a later import would overwrite the earlier secret
         let name = if !oa.label.is_empty() {
-            oa.label.clone()
+            if !oa.issuer.is_empty()
+                && oa.label != oa.issuer
+                && !oa.label.starts_with(&format!("{}:", oa.issuer))
+            {
+                format!("{}:{}", oa.issuer, oa.label)
+            } else {
+                oa.label.clone()
+            }
         } else if !oa.issuer.is_empty() {
             oa.issuer.clone()
         } else {
@@ -2351,7 +2422,7 @@ fn main() {
         Cmd::Run { inject, cmd } => cmd_run(&dir, rec, inject, cmd),
         Cmd::Clipclear => cmd_clipclear(),
         Cmd::Preflight => autofill_preflight().map(|_| println!("ok")),
-        Cmd::Dopaste => paste_into_app().map(|_| eprintln!("pasted")),
+        Cmd::Dopaste { id, field } => cmd_dopaste(&dir, rec, id, field),
         Cmd::Export { path } => cmd_export(&dir, rec, path),
         Cmd::Import {
             path,
