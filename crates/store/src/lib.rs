@@ -292,6 +292,17 @@ pub fn save_checkpoint(
     Ok(())
 }
 
+/// Remove the stored checkpoint for a vault — used ONLY by `restore`,
+/// which is a deliberate, user-invoked rollback. After the restored vault
+/// verifies, the next unlock re-baselines the checkpoint to its head.
+pub fn clear_checkpoint(vault_id: &[u8; 16]) -> Result<()> {
+    match fs::remove_file(ckpt_path(vault_id)?) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// A verified checkpoint for this device: (seq, head).
 pub fn load_checkpoint(vault_id: &[u8; 16], device: &DeviceKey) -> Result<Option<(u64, [u8; 32])>> {
     let buf = match fs::read(ckpt_path(vault_id)?) {

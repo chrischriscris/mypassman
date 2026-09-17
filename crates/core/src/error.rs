@@ -30,6 +30,10 @@ pub enum CoreError {
     NotFound,
     #[error("device not enrolled")]
     NotEnrolled,
+    #[error("export passphrase wrong or blob tampered")]
+    BadExportPassphrase,
+    #[error("corrupt: {0}")]
+    Corrupt(String),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

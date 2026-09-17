@@ -7,6 +7,8 @@ use mpm_core::manifest::{WrapSlot, SLOT_PASSWORD, SLOT_RECOVERY};
 use mpm_core::{gen, recovery, Manifest, Vault};
 use mpm_crypto::kdf::{self, KdfParams};
 use mpm_crypto::keys::{DeviceKey, KeyBundle};
+mod daemon;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
@@ -79,10 +81,61 @@ enum Cmd {
         #[arg(short, long)]
         copy: bool,
     },
+    /// Current TOTP code for an item holding a totp_secret (any kind —
+    /// a login can carry its own 2FA secret)
+    Otp {
+        name: String,
+        /// copy code to clipboard instead of printing
+        #[arg(short, long)]
+        copy: bool,
+    },
+    /// Edit fields of an existing item (refuses to create — use `add`)
+    Edit {
+        name: String,
+        #[arg(short = 'f', long = "field")]
+        fields: Vec<String>,
+    },
+    /// Run a command with secrets injected as env vars:
+    ///   mpm run -i openai/key=OPENAI_API_KEY -i gh/key=GH_TOKEN -- npm publish
+    Run {
+        /// item:field=ENV_VAR mappings
+        #[arg(short = 'i', long = "inject")]
+        inject: Vec<String>,
+        /// command + args
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
     /// (internal) clipboard janitor — spawned detached, clears clipboard
     /// after TTL iff it still holds our payload. Hash arrives on stdin.
     #[command(hide = true, name = "__clipclear")]
     Clipclear,
+    /// Export all items to a passphrase-sealed portable file (MPMEXP).
+    /// The export passphrase is prompted (or $MPM_EXPORT_PASSWORD).
+    Export { path: PathBuf },
+    /// Import items. Default: an MPMEXP sealed export; --csv reads a
+    /// Bitwarden/1Password-style CSV export (login/card/note rows).
+    Import {
+        path: PathBuf,
+        /// treat input as CSV instead of MPMEXP
+        #[arg(long)]
+        csv: bool,
+    },
+    /// Verified backup: replay-checks the vault, then copies MANIFEST+ops
+    /// into <dest>/mypassman-backup-<ts>-<vaultid>. It's already ciphertext.
+    Backup { dest: PathBuf },
+    /// Restore a backup directory into --vault (which must not exist yet),
+    /// then replay-verify it before accepting.
+    Restore { src: PathBuf },
+    /// Run the unlock daemon (unix): one Argon2 unlock, then commands
+    /// served over a private socket until the idle TTL lapses.
+    Daemon {
+        /// idle seconds before the daemon locks itself (default 900,
+        /// or $MPM_IDLE_TTL)
+        #[arg(long)]
+        idle_ttl: Option<u64>,
+    },
+    /// Lock now: tell a running daemon to drop the vault and exit
+    Lock,
 }
 
 #[derive(Subcommand)]
@@ -129,6 +182,7 @@ fn field_map() -> BTreeMap<&'static str, (u8, bool)> {
         ("issuer", tag::TOTP_ISSUER, false),
         ("digits", tag::TOTP_DIGITS, false),
         ("period", tag::TOTP_PERIOD, false),
+        ("algo", tag::TOTP_ALGO, false),
         ("text", tag::TEXT, true),
         ("full_name", tag::FULL_NAME, false),
         ("address", tag::ADDRESS, false),
@@ -415,6 +469,85 @@ fn cmd_add(
     let kind = ItemKind::from_name(kind).map_err(|_| format!("unknown kind '{kind}'"))?;
     let fmap = field_map();
 
+    let mut given = BTreeMap::new();
+    for f in cli_fields {
+        let Some((k, v)) = f.split_once('=') else {
+            return Err(format!("bad -f '{f}' (want name=value)"));
+        };
+        let Some((t, _)) = fmap.get(k) else {
+            return Err(format!("unknown field '{k}'"));
+        };
+        given.insert(k.to_string(), (*t, v.to_string()));
+    }
+
+    // daemon path: merge or create without a fresh unlock
+    match daemon::item(dir, name)? {
+        daemon::DaemonItem::Found(mut item, Some(k), rec_name) => {
+            if k != kind {
+                return Err(format!(
+                    "'{name}' exists as {} — rm it first to change kind",
+                    k.name()
+                ));
+            }
+            for (t, v) in given.values() {
+                item.set(*t, v.clone().into_bytes());
+            }
+            item.set(tag::NAME, rec_name.into_bytes()); // NAME is outer-layer
+            for (fname, secret) in required_fields(kind) {
+                let t = fmap[*fname].0;
+                if *secret && item.get(t).is_none() {
+                    item.set(t, prompt_secret(fname).as_bytes().to_vec());
+                }
+            }
+            item.set(tag::NAME, name.as_bytes().to_vec());
+            finalize_totp(&mut item)?;
+            let Some((rid, _)) = daemon::try_put(dir, kind, name, &item)? else {
+                return Err("daemon vanished mid-add".into());
+            };
+            eprintln!("updated '{}' ({})", name, mpm_store::hex(&rid));
+            return Ok(());
+        }
+        daemon::DaemonItem::Found(_, None, _) => {
+            return Err(format!("'{name}' exists with unknown kind"));
+        }
+        daemon::DaemonItem::Missing => {
+            let mut item = Item::default();
+            item.set(tag::NAME, name.as_bytes().to_vec());
+            for (fname, secret) in required_fields(kind) {
+                if given.contains_key(*fname) {
+                    continue;
+                }
+                let t = fmap[fname].0;
+                if *secret {
+                    let v = prompt_secret(fname);
+                    if !v.is_empty() {
+                        item.set(t, v.as_bytes().to_vec());
+                    }
+                } else {
+                    let v = read_line(fname);
+                    if !v.is_empty() {
+                        item.set(t, v.into_bytes());
+                    }
+                }
+            }
+            for (t, v) in given.into_values() {
+                item.set(t, v.into_bytes());
+            }
+            finalize_totp(&mut item)?;
+            let Some((rid, _)) = daemon::try_put(dir, kind, name, &item)? else {
+                return Err("daemon vanished mid-add".into());
+            };
+            eprintln!(
+                "added {} '{}' ({})",
+                kind.name(),
+                name,
+                mpm_store::hex(&rid)
+            );
+            return Ok(());
+        }
+        daemon::DaemonItem::Offline => {}
+    }
+
     // serialize the whole read-modify-write: two concurrent `add`s would
     // otherwise both mint seq N and corrupt the log
     let _lock = mpm_store::lock_vault(dir).map_err(|e| e.to_string())?;
@@ -426,17 +559,6 @@ fn cmd_add(
         .records()
         .find(|r| r.name == name)
         .map(|r| (r.record_id, r.kind));
-
-    let mut given = BTreeMap::new();
-    for f in cli_fields {
-        let Some((k, v)) = f.split_once('=') else {
-            return Err(format!("bad -f '{f}' (want name=value)"));
-        };
-        let Some((t, _)) = fmap.get(k) else {
-            return Err(format!("unknown field '{k}'"));
-        };
-        given.insert(k.to_string(), (*t, v.to_string()));
-    }
 
     if let Some((rid, Some(old_kind))) = existing {
         if old_kind != kind {
@@ -456,6 +578,7 @@ fn cmd_add(
             }
         }
         item.set(tag::NAME, name.as_bytes().to_vec());
+        finalize_totp(&mut item)?;
         let op = vault
             .make_update(&rid, kind, item)
             .map_err(|e| e.to_string())?;
@@ -492,6 +615,7 @@ fn cmd_add(
     for (t, v) in given.into_values() {
         item.set(t, v.into_bytes());
     }
+    finalize_totp(&mut item)?;
 
     let (op, rid) = vault.make_upsert(kind, item).map_err(|e| e.to_string())?;
     mpm_store::append_op(dir, vault.device_id(), &op).map_err(|e| e.to_string())?;
@@ -506,11 +630,72 @@ fn cmd_add(
     Ok(())
 }
 
+/// Normalize any item's TOTP_SECRET field: `otpauth://` URIs expand into
+/// issuer/digits/period/algo fields; bare base32 is validated and stored
+/// canonical (uppercase, no padding/spaces — re-pastable into other apps).
+/// Applies to ANY kind — a login can carry its own 2FA secret.
+fn finalize_totp(item: &mut mpm_core::Item) -> Result<(), String> {
+    let Some(raw) = item.get_str(tag::TOTP_SECRET).map(|s| s.to_string()) else {
+        return Ok(());
+    };
+    if raw.starts_with("otpauth://") {
+        let oa = mpm_core::totp::parse_otpauth(&raw).map_err(|e| e.to_string())?;
+        item.set(tag::TOTP_SECRET, b32_encode(&oa.secret).into_bytes());
+        if !oa.issuer.is_empty() && item.get(tag::TOTP_ISSUER).is_none() {
+            item.set(tag::TOTP_ISSUER, oa.issuer.into_bytes());
+        }
+        item.set(tag::TOTP_DIGITS, oa.digits.to_string().into_bytes());
+        item.set(tag::TOTP_PERIOD, oa.period.to_string().into_bytes());
+        item.set(
+            tag::TOTP_ALGO,
+            format!("{:?}", oa.algo).to_uppercase().into_bytes(),
+        );
+    } else {
+        let decoded = mpm_core::totp::base32_decode(&raw).map_err(|e| e.to_string())?;
+        if decoded.is_empty() {
+            return Err("empty totp secret".into());
+        }
+        item.set(tag::TOTP_SECRET, b32_encode(&decoded).into_bytes());
+    }
+    Ok(())
+}
+
+/// RFC 4648 base32, uppercase, no padding — canonical storage form.
+fn b32_encode(b: &[u8]) -> String {
+    const A: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = String::with_capacity((b.len() * 8).div_ceil(5));
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &byte in b {
+        acc = (acc << 8) | byte as u32;
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(A[((acc >> bits) & 31) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(A[((acc << (5 - bits)) & 31) as usize] as char);
+    }
+    out
+}
+
 fn cmd_list(dir: &Path, rec: bool) -> Result<(), String> {
+    println!("{:<10} {:<40} ID", "KIND", "NAME");
+    if let Some(rows) = daemon::try_list(dir)? {
+        for (kind, name, rid) in rows {
+            println!(
+                "{:<10} {:<40} {}",
+                kind.map(|k| k.name()).unwrap_or("-"),
+                name,
+                rid
+            );
+        }
+        return Ok(());
+    }
     let vault = unlock(dir, rec)?;
     let mut rows: Vec<_> = vault.records().collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
-    println!("{:<10} {:<40} ID", "KIND", "NAME");
     for r in rows {
         println!(
             "{:<10} {:<40} {}",
@@ -540,9 +725,18 @@ fn cmd_get(
     show: bool,
     copy: &Option<String>,
 ) -> Result<(), String> {
+    match daemon::item(dir, name)? {
+        daemon::DaemonItem::Found(item, _, _) => return render_item(&item, show, copy),
+        daemon::DaemonItem::Missing => return Err(format!("'{name}': not found")),
+        daemon::DaemonItem::Offline => {}
+    }
     let vault = unlock(dir, rec)?;
     let rid = find_one(&vault, name)?;
     let item = vault.item(&rid).map_err(|e| e.to_string())?;
+    render_item(&item, show, copy)
+}
+
+fn render_item(item: &mpm_core::Item, show: bool, copy: &Option<String>) -> Result<(), String> {
     let fmap = field_map();
     let inv: BTreeMap<u8, (&str, bool)> = fmap.iter().map(|(n, (t, s))| (*t, (*n, *s))).collect();
 
@@ -576,6 +770,10 @@ fn cmd_get(
 }
 
 fn cmd_rm(dir: &Path, rec: bool, name: &str) -> Result<(), String> {
+    if daemon::try_del(dir, name)?.is_some() {
+        eprintln!("deleted '{name}' (tombstoned)");
+        return Ok(());
+    }
     let _lock = mpm_store::lock_vault(dir).map_err(|e| e.to_string())?;
     let mut vault = unlock(dir, rec)?;
     let rid = find_one(&vault, name)?;
@@ -667,6 +865,172 @@ fn cmd_gen(
         println!("{}", out.as_str());
     }
     Ok(())
+}
+
+/// `otp <name>` — current TOTP code for any item carrying a totp_secret
+/// (a login can hold its own 2FA; a `totp` item is the standalone form).
+fn cmd_otp(dir: &Path, rec: bool, name: &str, copy: bool) -> Result<(), String> {
+    let item = match daemon::item(dir, name)? {
+        daemon::DaemonItem::Found(i, _, _) => i,
+        daemon::DaemonItem::Missing => return Err(format!("'{name}': not found")),
+        daemon::DaemonItem::Offline => {
+            let vault = unlock(dir, rec)?;
+            let rid = find_one(&vault, name)?;
+            vault.item(&rid).map_err(|e| e.to_string())?
+        }
+    };
+    let b32 = item
+        .get_str(tag::TOTP_SECRET)
+        .ok_or("item has no totp_secret field")?;
+    let secret = mpm_core::totp::base32_decode(b32).map_err(|e| e.to_string())?;
+    let digits: u32 = item
+        .get_str(tag::TOTP_DIGITS)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
+    let period: u64 = item
+        .get_str(tag::TOTP_PERIOD)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let algo = mpm_core::totp::TotpAlgo::from_name(item.get_str(tag::TOTP_ALGO).unwrap_or("SHA1"))
+        .map_err(|e| e.to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let (code, left) = mpm_core::totp::totp(&secret, now, period, digits, algo);
+    if copy {
+        copy_to_clipboard(code.as_bytes())?;
+        eprintln!("copied code — auto-clears in {}s", clip_ttl());
+    } else {
+        println!("{code}  (valid {left}s more)");
+    }
+    Ok(())
+}
+
+/// `edit <name> -f field=val …` — update fields on an EXISTING item.
+/// Unlike `add` it refuses to create: typos can't spawn stray records.
+fn cmd_edit(dir: &Path, rec: bool, name: &str, cli_fields: &[String]) -> Result<(), String> {
+    if cli_fields.is_empty() {
+        return Err("nothing to change — pass -f field=value".into());
+    }
+    if let daemon::DaemonItem::Found(mut item, kind, rec_name) = daemon::item(dir, name)? {
+        let fmap = field_map();
+        for f in cli_fields {
+            let Some((k, v)) = f.split_once('=') else {
+                return Err(format!("bad -f '{f}' (want field=value)"));
+            };
+            let Some((t, _)) = fmap.get(k) else {
+                return Err(format!("unknown field '{k}'"));
+            };
+            item.set(*t, v.as_bytes().to_vec());
+        }
+        item.set(tag::NAME, rec_name.into_bytes()); // NAME is outer-layer — re-inject
+        finalize_totp(&mut item)?;
+        let Some(kind) = kind else {
+            return Err("daemon: record kind unknown".into());
+        };
+        let Some((rid, _)) = daemon::try_put(dir, kind, name, &item)? else {
+            return Err("daemon vanished mid-edit".into());
+        };
+        eprintln!("updated '{name}' ({})", mpm_store::hex(&rid));
+        return Ok(());
+    }
+    let _lock = mpm_store::lock_vault(dir).map_err(|e| e.to_string())?;
+    let mut vault = unlock(dir, rec)?;
+    let rid = find_one(&vault, name)?;
+    let fmap = field_map();
+    let mut item = vault.item(&rid).map_err(|e| e.to_string())?;
+    let rec = vault
+        .records()
+        .find(|r| r.record_id == rid)
+        .map(|r| (r.name.clone(), r.kind))
+        .ok_or("record vanished")?;
+    item.set(tag::NAME, rec.0.into_bytes()); // NAME is outer-layer — re-inject
+    let kind = rec.1.ok_or("record has no kind")?;
+    for f in cli_fields {
+        let Some((k, v)) = f.split_once('=') else {
+            return Err(format!("bad -f '{f}' (want name=value)"));
+        };
+        let Some((t, _)) = fmap.get(k) else {
+            return Err(format!("unknown field '{k}'"));
+        };
+        item.set(*t, v.as_bytes().to_vec());
+    }
+    finalize_totp(&mut item)?;
+    let op = vault
+        .make_update(&rid, kind, item)
+        .map_err(|e| e.to_string())?;
+    mpm_store::append_op(dir, vault.device_id(), &op).map_err(|e| e.to_string())?;
+    vault.commit(&op).map_err(|e| e.to_string())?;
+    save_checkpoint(&vault)?;
+    eprintln!("updated '{}' ({})", name, mpm_store::hex(&rid));
+    Ok(())
+}
+
+/// `run -i item:field=ENV … -- cmd` — spawn with secrets in the child's
+/// environment. Never on argv (argv is world-readable via ps). The child
+/// inherits everything EXCEPT MPM_PASSWORD.
+fn cmd_run(dir: &Path, rec: bool, inject: &[String], cmd: &[String]) -> Result<(), String> {
+    let fmap = field_map();
+    // validate every mapping before unlocking or touching the daemon
+    struct Inj {
+        envvar: String,
+        iname: String,
+        tag: u8,
+    }
+    let mut specs = Vec::new();
+    for spec in inject {
+        let Some((itempart, envvar)) = spec.split_once('=') else {
+            return Err(format!("bad -i '{spec}' (want item:field=ENV_VAR)"));
+        };
+        let Some((iname, fname)) = itempart.split_once(':') else {
+            return Err(format!("bad -i '{spec}' (want item:field=ENV_VAR)"));
+        };
+        let Some((t, _)) = fmap.get(fname) else {
+            return Err(format!("unknown field '{fname}'"));
+        };
+        let mut ch = envvar.chars();
+        if envvar.is_empty()
+            || !envvar
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || ch.next().is_some_and(|c| c.is_ascii_digit())
+        {
+            return Err(format!("bad env var name '{envvar}'"));
+        }
+        specs.push(Inj {
+            envvar: envvar.to_string(),
+            iname: iname.to_string(),
+            tag: *t,
+        });
+    }
+
+    let mut c = std::process::Command::new(&cmd[0]);
+    c.args(&cmd[1..]).env_remove("MPM_PASSWORD");
+
+    if daemon::alive(dir) {
+        for spec in &specs {
+            let daemon::DaemonItem::Found(item, _, _) = daemon::item(dir, &spec.iname)? else {
+                return Err(format!("'{}': not found", spec.iname));
+            };
+            let val = item
+                .get(spec.tag)
+                .ok_or(format!("'{}' has no such field", spec.iname))?;
+            c.env(&spec.envvar, String::from_utf8_lossy(val).into_owned());
+        }
+    } else {
+        let vault = unlock(dir, rec)?;
+        for spec in &specs {
+            let rid = find_one(&vault, &spec.iname)?;
+            let item = vault.item(&rid).map_err(|e| e.to_string())?;
+            let val = item
+                .get(spec.tag)
+                .ok_or(format!("'{}' has no such field", spec.iname))?;
+            c.env(&spec.envvar, String::from_utf8_lossy(val).into_owned());
+        }
+    }
+    let st = c.status().map_err(|e| format!("spawn {}: {e}", cmd[0]))?;
+    std::process::exit(st.code().unwrap_or(1));
 }
 
 fn cmd_devices(dir: &Path, rec: bool) -> Result<(), String> {
@@ -971,6 +1335,372 @@ fn rand_core_fill(b: &mut [u8]) {
     rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, b);
 }
 
+// ── export / import ─────────────────────────────────────────────────
+
+/// Export passphrase: $MPM_EXPORT_PASSWORD (consumed) or a TTY/stdin
+/// prompt. Distinct from the vault password on purpose — an export blob
+/// must not inherit the vault's slot semantics.
+fn export_passphrase(confirm: bool) -> Result<Zeroizing<String>, String> {
+    if let Ok(p) = std::env::var("MPM_EXPORT_PASSWORD") {
+        std::env::remove_var("MPM_EXPORT_PASSWORD");
+        return Ok(Zeroizing::new(p));
+    }
+    let p = read_password("export passphrase: ");
+    if confirm {
+        let p2 = read_password("confirm passphrase: ");
+        if p.as_str() != p2.as_str() {
+            return Err("passphrases don't match".into());
+        }
+    }
+    if p.is_empty() {
+        return Err("empty passphrase".into());
+    }
+    Ok(p)
+}
+
+/// Create `path` 0600, refusing to overwrite. Export/backup artifacts are
+/// ciphertext, but permissions stay tight regardless.
+fn write_private_file(path: &Path, data: &[u8]) -> Result<(), String> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(path)
+        .map_err(|e| format!("create {}: {e}", path.display()))?;
+    std::io::Write::write_all(&mut f, data).map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn cmd_export(dir: &Path, rec: bool, path: &Path) -> Result<(), String> {
+    let vault = unlock(dir, rec)?; // consumes $MPM_PASSWORD first
+    let pw = export_passphrase(true)?;
+    let mut recs = Vec::new();
+    for r in vault.records() {
+        let Some(kind) = r.kind else { continue };
+        let item = vault.item(&r.record_id).map_err(|e| e.to_string())?;
+        recs.push(mpm_core::export::ExportRecord {
+            kind,
+            name: r.name.clone(),
+            fields: item.encode(),
+        });
+    }
+    let blob = mpm_core::export::seal_export(&recs, pw.as_bytes()).map_err(|e| e.to_string())?;
+    write_private_file(path, &blob)?;
+    eprintln!("exported {} records → {}", recs.len(), path.display());
+    Ok(())
+}
+
+fn cmd_import(dir: &Path, rec: bool, path: &Path, csv: bool) -> Result<(), String> {
+    let _lock = mpm_store::lock_vault(dir).map_err(|e| e.to_string())?;
+    let mut vault = unlock(dir, rec)?;
+    let items: Vec<(ItemKind, String, mpm_core::Item)> = if csv {
+        let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        csv_to_items(&raw)?
+    } else {
+        let blob = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let pw = export_passphrase(false)?;
+        let recs =
+            mpm_core::export::open_export(&blob, pw.as_bytes()).map_err(|e| e.to_string())?;
+        recs.iter()
+            .map(|r| {
+                Item::decode(&r.fields)
+                    .map(|it| (r.kind, r.name.clone(), it))
+                    .map_err(|e| e.to_string())
+            })
+            .collect::<Result<_, _>>()?
+    };
+
+    let mut created = 0usize;
+    let mut updated = 0usize;
+    for (kind, name, mut item) in items {
+        item.set(tag::NAME, name.as_bytes().to_vec());
+        finalize_totp(&mut item)?;
+        // same name + same kind → replace; name taken by another kind →
+        // find a free suffix rather than minting an ambiguous duplicate
+        let mut use_name = name.clone();
+        loop {
+            let existing = vault
+                .records()
+                .find(|r| r.name == use_name)
+                .map(|r| (r.record_id, r.kind));
+            match existing {
+                Some((rid, Some(k))) if k == kind => {
+                    let op = vault
+                        .make_update(&rid, kind, item)
+                        .map_err(|e| e.to_string())?;
+                    mpm_store::append_op(dir, vault.device_id(), &op).map_err(|e| e.to_string())?;
+                    vault.commit(&op).map_err(|e| e.to_string())?;
+                    updated += 1;
+                    break;
+                }
+                Some((_, Some(_))) => {
+                    use_name = format!("{use_name}-imported");
+                    continue;
+                }
+                _ => {
+                    item.set(tag::NAME, use_name.as_bytes().to_vec());
+                    let (op, _rid) = vault.make_upsert(kind, item).map_err(|e| e.to_string())?;
+                    mpm_store::append_op(dir, vault.device_id(), &op).map_err(|e| e.to_string())?;
+                    vault.commit(&op).map_err(|e| e.to_string())?;
+                    created += 1;
+                    break;
+                }
+            }
+        }
+    }
+    save_checkpoint(&vault)?;
+    eprintln!("imported {created} new, {updated} updated");
+    Ok(())
+}
+
+/// Minimal RFC4180 reader: quoted fields, "" escapes, \r\n endings.
+/// Input is attacker-ish (a foreign app's export) — lenient, never panics.
+fn parse_csv(raw: &[u8]) -> Vec<Vec<String>> {
+    let s = String::from_utf8_lossy(raw);
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut field = String::new();
+    let mut in_q = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_q {
+            match c {
+                '"' if chars.peek() == Some(&'"') => {
+                    chars.next();
+                    field.push('"');
+                }
+                '"' => in_q = false,
+                _ => field.push(c),
+            }
+        } else {
+            match c {
+                '"' if field.is_empty() => in_q = true,
+                ',' => row.push(std::mem::take(&mut field)),
+                '\n' => {
+                    row.push(std::mem::take(&mut field));
+                    rows.push(std::mem::take(&mut row));
+                }
+                '\r' => {}
+                _ => field.push(c),
+            }
+        }
+    }
+    if !field.is_empty() || !row.is_empty() {
+        row.push(field);
+        rows.push(row);
+    }
+    rows
+}
+
+/// Map Bitwarden/1Password-style CSV rows onto items. Header-driven;
+/// unmapped columns are ignored; rows without any usable data are skipped.
+fn csv_to_items(raw: &[u8]) -> Result<Vec<(ItemKind, String, mpm_core::Item)>, String> {
+    let rows = parse_csv(raw);
+    let Some(hdr) = rows.first() else {
+        return Err("empty csv".into());
+    };
+    let col = |aliases: &[&str]| -> Option<usize> {
+        hdr.iter()
+            .position(|h| aliases.contains(&h.trim().to_lowercase().as_str()))
+    };
+    let c_name = col(&["name", "title", "item name"]);
+    let c_user = col(&["username", "login_username", "user"]);
+    let c_pass = col(&["password", "login_password"]);
+    let c_url = col(&["url", "login_uri", "website", "urls"]);
+    let c_totp = col(&["totp", "login_totp", "otpauth", "otp"]);
+    let c_notes = col(&["notes", "note", "notesplain"]);
+    let c_type = col(&["type", "item type", "item_type"]);
+    let c_cnum = col(&["card_number", "number"]);
+    let c_chold = col(&["cardholder", "cardholder_name", "holder"]);
+    let c_cexp = col(&["exp", "expiry", "expiration"]);
+    let c_ccvv = col(&["cvv", "csc", "security code"]);
+
+    let mut out = Vec::new();
+    for (i, row) in rows.iter().skip(1).enumerate() {
+        let g = |c: Option<usize>| -> Option<&str> {
+            c.and_then(|j| row.get(j))
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+        };
+        let ty = g(c_type).unwrap_or("").to_lowercase();
+        let mut item = mpm_core::Item::default();
+        let mut kind = ItemKind::Login;
+        if ty.contains("card") || g(c_cnum).is_some() {
+            kind = ItemKind::Card;
+        } else if ty.contains("note")
+            || (g(c_user).is_none() && g(c_pass).is_none() && g(c_totp).is_none())
+        {
+            kind = ItemKind::Secret;
+        } else if g(c_pass).is_none() && g(c_user).is_none() && g(c_totp).is_some() {
+            kind = ItemKind::Totp;
+        }
+        let mut put = |t: u8, v: Option<&str>| {
+            if let Some(v) = v {
+                item.set(t, v.as_bytes().to_vec());
+            }
+        };
+        put(tag::USERNAME, g(c_user));
+        put(tag::PASSWORD, g(c_pass));
+        put(tag::URL, g(c_url));
+        put(tag::TOTP_SECRET, g(c_totp));
+        put(tag::NOTES, g(c_notes));
+        if kind == ItemKind::Secret {
+            put(tag::TEXT, g(c_notes));
+        }
+        put(tag::CARD_NUMBER, g(c_cnum));
+        put(tag::CARD_HOLDER, g(c_chold));
+        put(tag::CARD_EXP, g(c_cexp));
+        put(tag::CARD_CVV, g(c_ccvv));
+        let name = g(c_name)
+            .or(g(c_user))
+            .or(g(c_url))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("imported-{i}"));
+        out.push((kind, name, item));
+    }
+    if out.is_empty() {
+        return Err("no importable rows".into());
+    }
+    Ok(out)
+}
+
+// ── backup / restore ────────────────────────────────────────────────
+
+/// Copy a file with mode 0600 and fsync — used for backup/restore of the
+/// (already-encrypted) vault files.
+fn copy_private(src: &Path, dst: &Path) -> Result<(), String> {
+    let data = std::fs::read(src).map_err(|e| format!("read {}: {e}", src.display()))?;
+    write_private_file(dst, &data)
+}
+
+fn mkdir_private(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .map_err(|e| format!("mkdir {}: {e}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path).map_err(|e| format!("mkdir {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn cmd_backup(dir: &Path, rec: bool, dest: &Path) -> Result<(), String> {
+    // lock + full unlock: replay-verifying every op IS the backup integrity
+    // check — we never copy bytes we couldn't authenticate
+    let _lock = mpm_store::lock_vault(dir).map_err(|e| e.to_string())?;
+    let vault = unlock(dir, rec)?;
+    let (seq, _head) = vault.head();
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let out = dest.join(format!(
+        "mypassman-backup-{ts}-{}",
+        &mpm_store::hex(&vault.manifest.vault_id)[..8]
+    ));
+    mkdir_private(&out)?;
+    mkdir_private(&out.join(mpm_store::OPS_DIR))?;
+    copy_private(
+        &dir.join(mpm_store::MANIFEST),
+        &out.join(mpm_store::MANIFEST),
+    )?;
+    let mut nops = 0usize;
+    let ops_dir = dir.join(mpm_store::OPS_DIR);
+    if ops_dir.is_dir() {
+        for e in std::fs::read_dir(&ops_dir).map_err(|e| e.to_string())? {
+            let e = e.map_err(|e| e.to_string())?;
+            if e.path().extension().is_some_and(|x| x == "log") {
+                copy_private(&e.path(), &out.join(mpm_store::OPS_DIR).join(e.file_name()))?;
+                nops += 1;
+            }
+        }
+    }
+    let f = std::fs::File::open(&out).map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
+    eprintln!(
+        "backup verified (seq {seq}) → {} ({} logs)",
+        out.display(),
+        nops
+    );
+    Ok(())
+}
+
+fn cmd_restore(dir: &Path, src: &Path) -> Result<(), String> {
+    if !src.join(mpm_store::MANIFEST).is_file() {
+        return Err(format!("{}: no MANIFEST — not a backup dir", src.display()));
+    }
+    if dir.join(mpm_store::MANIFEST).exists() {
+        return Err(format!(
+            "{} already holds a vault — pick an empty --vault dir",
+            dir.display()
+        ));
+    }
+    mkdir_private(dir)?;
+    mkdir_private(&dir.join(mpm_store::OPS_DIR))?;
+    copy_private(
+        &src.join(mpm_store::MANIFEST),
+        &dir.join(mpm_store::MANIFEST),
+    )?;
+    let mut n = 0usize;
+    let src_ops = src.join(mpm_store::OPS_DIR);
+    if src_ops.is_dir() {
+        for e in std::fs::read_dir(&src_ops).map_err(|e| e.to_string())? {
+            let e = e.map_err(|e| e.to_string())?;
+            if e.path().extension().is_some_and(|x| x == "log") {
+                copy_private(&e.path(), &dir.join(mpm_store::OPS_DIR).join(e.file_name()))?;
+                n += 1;
+            }
+        }
+    }
+    // deliberate rollback: the stored checkpoint may be ahead of this
+    // snapshot — re-baseline AFTER the copy verifies (unlock re-saves it)
+    let manifest = mpm_store::load_manifest(dir).map_err(|e| e.to_string())?;
+    mpm_store::clear_checkpoint(&manifest.vault_id).map_err(|e| e.to_string())?;
+    eprintln!("restored {n} logs → {}; verifying…", dir.display());
+    let _vault = unlock(dir, false)?; // replay-verify; failures surface here
+    eprintln!("restore verified — vault is live");
+    Ok(())
+}
+
+// ── daemon / lock ───────────────────────────────────────────────────
+
+fn cmd_daemon(dir: &Path, rec: bool, idle_ttl: Option<u64>) -> Result<(), String> {
+    let ttl = idle_ttl
+        .or_else(|| {
+            std::env::var("MPM_IDLE_TTL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(900);
+    #[cfg(unix)]
+    {
+        daemon::run(dir, rec, ttl)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, rec, ttl);
+        Err("daemon is unix-only for now — every command re-unlocks on this platform".into())
+    }
+}
+
+fn cmd_lock(dir: &Path) -> Result<(), String> {
+    match daemon::lock(dir)? {
+        true => eprintln!("daemon locked"),
+        false => eprintln!("no daemon running"),
+    }
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     let dir = vault_dir(&cli);
@@ -991,10 +1721,53 @@ fn main() {
             no_symbols,
             copy,
         } => cmd_gen(*len, *passphrase, *no_symbols, *copy),
+        Cmd::Otp { name, copy } => cmd_otp(&dir, rec, name, *copy),
+        Cmd::Edit { name, fields } => cmd_edit(&dir, rec, name, fields),
+        Cmd::Run { inject, cmd } => cmd_run(&dir, rec, inject, cmd),
         Cmd::Clipclear => cmd_clipclear(),
+        Cmd::Export { path } => cmd_export(&dir, rec, path),
+        Cmd::Import { path, csv } => cmd_import(&dir, rec, path, *csv),
+        Cmd::Backup { dest } => cmd_backup(&dir, rec, dest),
+        Cmd::Restore { src } => cmd_restore(&dir, src),
+        Cmd::Daemon { idle_ttl } => cmd_daemon(&dir, rec, *idle_ttl),
+        Cmd::Lock => cmd_lock(&dir),
     };
+
     if let Err(e) = res {
         eprintln!("error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csv_quotes_and_commas() {
+        let rows = parse_csv(b"a,\"b,c\",d\r\n1,2,3\nlast,,\"x\"\"y\"");
+        assert_eq!(rows[0], vec!["a", "b,c", "d"]);
+        assert_eq!(rows[1], vec!["1", "2", "3"]);
+        assert_eq!(rows[2], vec!["last", "", "x\"y"]);
+    }
+
+    #[test]
+    fn csv_maps_bitwarden_and_1p() {
+        let bw = b"folder,type,name,login_uri,login_username,login_password,login_totp,notes\n,login,GH,https://github.com,u,pw,JBSWY3DPEHPK3PXP,n1\n";
+        let items = csv_to_items(bw).unwrap();
+        assert_eq!(items.len(), 1);
+        let (kind, name, it) = &items[0];
+        assert_eq!(*kind, ItemKind::Login);
+        assert_eq!(name, "GH");
+        assert_eq!(it.get_str(tag::PASSWORD), Some("pw"));
+        assert_eq!(it.get_str(tag::TOTP_SECRET), Some("JBSWY3DPEHPK3PXP"));
+
+        // 1Password-style headers + a card row + a note row
+        let op = b"Title,Type,Username,Password,Url,Number,CVV,Notes\nV,card,,,,4111,999,\nN,note,,,,,,sekrit\n";
+        let items = csv_to_items(op).unwrap();
+        assert_eq!(items[0].0, ItemKind::Card);
+        assert_eq!(items[0].2.get_str(tag::CARD_NUMBER), Some("4111"));
+        assert_eq!(items[1].0, ItemKind::Secret);
+        assert_eq!(items[1].2.get_str(tag::TEXT), Some("sekrit"));
     }
 }

@@ -4,12 +4,14 @@
 
 pub mod aad;
 pub mod error;
+pub mod export;
 pub mod gen;
 pub mod item;
 pub mod manifest;
 pub mod op;
 pub mod recovery;
 pub mod tlv;
+pub mod totp;
 pub mod vault;
 
 pub use error::{CoreError, Result};
