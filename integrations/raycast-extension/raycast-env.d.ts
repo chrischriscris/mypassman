@@ -7,7 +7,10 @@
 
 /* eslint-disable @typescript-eslint/ban-types */
 
-type ExtensionPreferences = {}
+type ExtensionPreferences = {
+  /** mypassman Binary Path - Path to the mypassman binary (~ is expanded) */
+  "binaryPath": string
+}
 
 /** Preferences accessible in all the extension's commands */
 declare type Preferences = ExtensionPreferences

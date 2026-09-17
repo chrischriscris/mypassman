@@ -1,8 +1,8 @@
 # MyPassman — Raycast extension
 
-A real Raycast view (searchable list + actions) on top of the `mypassman` CLI.
-The simpler Script Commands live in `../raycast/`; this extension is the nicer
-daily driver.
+A real Raycast view (searchable list + detail panel + actions) on top of the
+`mypassman` CLI. The simpler Script Commands live in `../raycast/`; this
+extension is the nicer daily driver.
 
 ## Install
 
@@ -16,37 +16,52 @@ After `npm run dev` has loaded it once, "Search Vault" is a normal Raycast
 command — you don't need dev mode running to use it. (For a permanent install
 independent of this repo, build with `npm run build` and import the folder.)
 
+The binary path defaults to `~/.local/bin/mypassman` — change it in the
+extension's preferences ("mypassman Binary Path") if yours lives elsewhere.
+
 ## What it does
 
-- **Search Vault** — `mypassman list --json`, kind icons, substring search
-- **Enter** — *paste into the frontmost app*: the window closes, the CLI
-  writes the concealed clipboard and synthesizes ⌘V (like a browser
-  extension's autofill). On `totp` items Enter pastes the code instead
-- **⌥T** — *type* the field as synthetic keystrokes: pasteboard never
-  touched at all
-- **⌥O** — paste TOTP code (non-totp items carrying 2FA)
-- Clipboard still available as ⌘K actions — `⌘P` password, `⌘U` username,
-  `⌘O` TOTP, `⌘L` url, `⌘N` card number, `⌘V` cvv — all concealed +
-  auto-clear
-- `⌘⇧L` locks the vault
+- **Search Vault** — `mypassman list --json`; kind icons, per-kind subtitles
+  (username / issuer / holder / endpoint), hostname accessories, live TOTP
+  countdown tags. Searches name + username + domain + issuer + kind
+- **Detail panel** (⌘D to toggle) — all non-secret metadata; secret fields
+  listed as `••••••••` so you see what's there without the value
+- **Kind filter** — dropdown in the search bar
+- **Enter** — fills into the frontmost app:
+  - login with user+pass → **Fill Login** (types `username⇥password`)
+  - totp → **Paste Code** (waits for a fresh code if <5s remain)
+  - card/apikey/secret/sshkey/identity → pastes the primary field
+  - If the primary field is missing, the next available field is offered
+    instead — actions only appear for fields that actually exist
+- **⌥T** — type the primary field (zero clipboard)
+- **⌥O** — paste TOTP code (logins carrying 2FA)
+- **Clipboard section** — `Copy {field}` for every field present, all
+  concealed + auto-clear (`⌘P` password, `⌘U` username, `⌘O` TOTP code)
+- **Vault section** — `⌘⇧O` Open URL, `⌘R` refresh, `⌘⇧L` lock
+- **Recent** — last 5 filled/copied items pinned to the top (record ids only,
+  in Raycast LocalStorage)
 - Vault locked? The empty view offers **Unlock Vault** — spawns the daemon,
-  which pops Touch ID if `mypassman bio enroll` is done. Note the Touch ID
-  sheet takes focus and Raycast's window hides — that's expected, once per
-  daemon session; reopen the command and everything is instant. All other
-  calls run with `MPM_NO_BIO=1` so they can never trigger the prompt
+  which pops Touch ID if `mypassman bio enroll` is done. The Touch ID sheet
+  takes focus and Raycast's window hides — expected, once per daemon
+  session; the extension tries to reopen itself afterward. All other calls
+  run with `MPM_NO_BIO=1` so they can never trigger the prompt
+- Error states distinguish locked vault / missing binary / other failures
 - Resolves items by record id — no fuzzy-name ambiguity
 
 ## Security notes
 
-- Secrets never enter the extension's JS: every copy action shells out to
-  `mypassman get <id> --copy <field>` / `otp --copy`, which uses the concealed
-  pasteboard + auto-clear janitor (`MPM_CLIP_TTL`, 45s default)
-- Only names/kinds/ids cross the JSON boundary — fields stay sealed
-- The binary path is hardcoded to `~/.local/bin/mypassman` — edit `MPM` in
-  `src/list-items.tsx` if yours differs
+- Secrets never enter the extension's JS: every fill/copy action shells out
+  to `mypassman get <id>` / `otp <id>` (`--paste`/`--type`/`--copy`), which
+  uses the concealed pasteboard + auto-clear janitor (`MPM_CLIP_TTL`, 45s
+  default) or synthetic keystrokes with no clipboard at all
+- `list --json` carries only metadata: kind, name, record id, field *names*
+  (presence is metadata, not a secret), and values of fields explicitly
+  classified non-secret (username, url, issuer, holder, endpoint…). Unknown
+  field tags default to secret and are never emitted
 - Paste/type autofill synthesizes CGEvents, which needs Accessibility
   ("post event") access for the app launching the CLI — Raycast, in this
   case. First use prompts once; if pastes silently no-op, check System
   Settings → Privacy & Security → Accessibility → Raycast
 - Focus lands wherever your cursor was — the CLI waits `MPM_FILL_DELAY_MS`
   (default 200ms) for the target app to refocus after the window closes
+- The daemon idle timeout is the built-in default: 900s

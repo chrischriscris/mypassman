@@ -17,6 +17,7 @@ type CGEventSourceRef = *const c_void;
 const K_CG_HID_EVENT_TAP: u32 = 0;
 const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 0x0010_0000;
 const K_VK_ANSI_V: u16 = 0x09;
+const K_VK_TAB: u16 = 0x30;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -90,12 +91,23 @@ pub fn paste() -> Result<(), String> {
     post_key(K_VK_ANSI_V, true, &[])
 }
 
-/// Type `text` char-by-char as Unicode events — zero clipboard use.
+/// Type each part in order, Tab between them — `user⇥pass` form fill.
 /// Per-char events (not one big string) for compatibility with fields
 /// that drop multi-char synthetic input.
-pub fn type_text(text: &str) -> Result<(), String> {
+pub fn type_seq(parts: &[&str]) -> Result<(), String> {
     preflight()?;
     settle();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            post_key(K_VK_TAB, false, &[])?;
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        type_chars(part)?;
+    }
+    Ok(())
+}
+
+fn type_chars(text: &str) -> Result<(), String> {
     for ch in text.chars() {
         let mut buf = [0u16; 2];
         let units = ch.encode_utf16(&mut buf);

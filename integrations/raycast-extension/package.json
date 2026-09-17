@@ -1,15 +1,26 @@
 {
   "name": "mypassman",
   "title": "MyPassman",
-  "description": "Search your mypassman vault and copy secrets — fields never touch JS, the CLI does the copying",
+  "description": "Search your mypassman vault and fill secrets — fields never touch JS, the CLI does the filling",
   "icon": "icon.png",
   "author": "chus",
   "license": "MIT",
+  "preferences": [
+    {
+      "name": "binaryPath",
+      "title": "mypassman Binary Path",
+      "description": "Path to the mypassman binary (~ is expanded)",
+      "type": "textfield",
+      "required": false,
+      "default": "~/.local/bin/mypassman",
+      "placeholder": "~/.local/bin/mypassman"
+    }
+  ],
   "commands": [
     {
       "name": "list-items",
       "title": "Search Vault",
-      "description": "Search vault items; Enter copies the password via concealed clipboard",
+      "description": "Search vault items; Enter fills into the frontmost app, ⌘K copies via concealed clipboard",
       "mode": "view"
     }
   ],

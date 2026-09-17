@@ -42,6 +42,8 @@ const T_RECORD: u8 = 0x04;
 const T_RID: u8 = 0x05;
 const T_CREATED: u8 = 0x06;
 const T_ERR: u8 = 0x07;
+const T_META: u8 = 0x08; // LIST row: inner TLV {field_tag → value} non-secret only
+const T_FIELDS: u8 = 0x09; // LIST row: raw u8 tag list — every field incl. secrets
 
 #[cfg(unix)]
 const MAX_MSG: usize = 1 << 20; // 1 MiB — same-uid peer, but bound it anyway
@@ -335,9 +337,16 @@ fn serve(
             rows.sort_by(|a, b| a.name.cmp(&b.name));
             for r in rows {
                 let mut inner = Writer::new();
-                inner.field(T_NAME, r.name.as_bytes()); // canonical: 1 < 2 < 5
+                inner.field(T_NAME, r.name.as_bytes()); // canonical: 1 < 2 < 5 < 8 < 9
                 inner.field(T_KIND, &[r.kind.map(|k| k as u8).unwrap_or(0)]);
                 inner.field(T_RID, &r.record_id);
+                let (tags, ns) = crate::row_meta_tags(vault, &r.record_id);
+                let mut meta = Writer::new();
+                for (t, v) in &ns {
+                    meta.field(*t, v);
+                }
+                inner.field(T_META, &meta.finish());
+                inner.field(T_FIELDS, &tags);
                 w.field(T_RECORD, &inner.finish());
             }
             Ok(w.finish())
@@ -556,9 +565,17 @@ pub fn item(dir: &Path, name: &str) -> Result<DaemonItem, String> {
     }
 }
 
-pub type ListRow = (Option<ItemKind>, String, String);
+pub struct ListRow {
+    pub kind: Option<ItemKind>,
+    pub name: String,
+    pub rid: String,
+    /// every field name present (secret presence is metadata, not a secret)
+    pub fields: Vec<String>,
+    /// non-secret (name, value) pairs only — secret values never cross
+    pub meta: Vec<(String, String)>,
+}
 
-/// List rows via the daemon: (kind, name, record_id hex).
+/// List rows via the daemon: kind/name/rid + field names + non-secret meta.
 pub fn try_list(dir: &Path) -> Result<Option<Vec<ListRow>>, String> {
     match call(dir, OP_LIST, &[])? {
         Some((0, p)) => {
@@ -570,20 +587,38 @@ pub fn try_list(dir: &Path) -> Result<Option<Vec<ListRow>>, String> {
                 if t != T_RECORD {
                     continue;
                 }
-                let (mut kind, mut name, mut rid) = (None, String::new(), String::new());
+                let mut row = ListRow {
+                    kind: None,
+                    name: String::new(),
+                    rid: String::new(),
+                    fields: Vec::new(),
+                    meta: Vec::new(),
+                };
                 let mut ir = Reader::new(v);
                 while let Some((it, iv)) = ir.next_field().map_err(|e| e.to_string())? {
                     match it {
-                        T_KIND if iv.len() == 1 => kind = ItemKind::from_u8(iv[0]).ok(),
-                        T_NAME => name = String::from_utf8_lossy(iv).into_owned(),
+                        T_KIND if iv.len() == 1 => row.kind = ItemKind::from_u8(iv[0]).ok(),
+                        T_NAME => row.name = String::from_utf8_lossy(iv).into_owned(),
                         T_RID => {
                             let id: &[u8; 16] = iv.try_into().unwrap_or(&[0u8; 16]);
-                            rid = mpm_store::hex(id);
+                            row.rid = mpm_store::hex(id);
+                        }
+                        T_FIELDS => {
+                            row.fields = iv.iter().map(|t| crate::tag_name(*t)).collect();
+                        }
+                        T_META => {
+                            let mut mr = Reader::new(iv);
+                            while let Some((mt, mv)) = mr.next_field().map_err(|e| e.to_string())? {
+                                row.meta.push((
+                                    crate::tag_name(mt),
+                                    String::from_utf8_lossy(mv).into_owned(),
+                                ));
+                            }
                         }
                         _ => {}
                     }
                 }
-                out.push((kind, name, rid));
+                out.push(row);
             }
             Ok(Some(out))
         }

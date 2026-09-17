@@ -62,9 +62,10 @@ enum Cmd {
         /// copy field then simulate ⌘V into the frontmost app (macOS)
         #[arg(long)]
         paste: Option<String>,
-        /// type field as synthetic keystrokes — clipboard never touched (macOS)
+        /// type field(s) as synthetic keystrokes, Tab between — repeat for
+        /// multi-field fills: --type username --type password (macOS)
         #[arg(long = "type")]
-        r#type: Option<String>,
+        r#type: Vec<String>,
     },
     /// List items (names + kinds only — fields stay sealed)
     #[command(alias = "ls")]
@@ -770,6 +771,48 @@ fn b32_encode(b: &[u8]) -> String {
     out
 }
 
+/// (all field tags present, non-secret tag→first-value) — shared by the
+/// daemon LIST op and `list --json`. Tag→name mapping stays client-side.
+fn row_meta_tags(vault: &mpm_core::Vault, rid: &[u8; 16]) -> (Vec<u8>, Vec<(u8, Vec<u8>)>) {
+    let Ok(item) = vault.item(rid) else {
+        return (vec![], vec![]);
+    };
+    let fmap = field_map();
+    let secret_of = |t: u8| {
+        fmap.values()
+            .find(|(ft, _)| *ft == t)
+            .map(|(_, s)| *s)
+            .unwrap_or(true) // unknown tags are secret — never leak
+    };
+    let mut all = Vec::new();
+    let mut ns = Vec::new();
+    for (t, vals) in &item.fields {
+        all.push(*t);
+        if !secret_of(*t) {
+            if let Some(v) = vals.first() {
+                ns.push((*t, v.clone()));
+            }
+        }
+    }
+    // totp items that didn't set an explicit period still roll every 30s —
+    // surface the default so clients can render a countdown
+    if let (Some(&(pt, false)), Some(&(st, _))) = (fmap.get("period"), fmap.get("totp_secret")) {
+        if all.contains(&st) && !all.contains(&pt) {
+            ns.push((pt, b"30".to_vec()));
+        }
+    }
+    (all, ns)
+}
+
+/// tag byte → field name, from field_map's inverse
+fn tag_name(t: u8) -> String {
+    field_map()
+        .iter()
+        .find(|(_, (ft, _))| *ft == t)
+        .map(|(n, _)| n.to_string())
+        .unwrap_or_else(|| format!("0x{t:02x}"))
+}
+
 fn cmd_list(dir: &Path, rec: bool, json: bool) -> Result<(), String> {
     let mut rows: Vec<daemon::ListRow> = if let Some(rows) = daemon::try_list(dir)? {
         rows
@@ -777,34 +820,60 @@ fn cmd_list(dir: &Path, rec: bool, json: bool) -> Result<(), String> {
         let vault = unlock(dir, rec)?;
         vault
             .records()
-            .map(|r| (r.kind, r.name.clone(), mpm_store::hex(&r.record_id)))
+            .map(|r| {
+                let (tags, ns) = row_meta_tags(&vault, &r.record_id);
+                daemon::ListRow {
+                    kind: r.kind,
+                    name: r.name.clone(),
+                    rid: mpm_store::hex(&r.record_id),
+                    fields: tags.iter().map(|t| tag_name(*t)).collect(),
+                    meta: ns
+                        .iter()
+                        .map(|(t, v)| (tag_name(*t), String::from_utf8_lossy(v).into_owned()))
+                        .collect(),
+                }
+            })
             .collect()
     };
-    rows.sort_by(|a, b| a.1.cmp(&b.1));
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
     if json {
-        // JSON escaping preserves control chars; disp() would corrupt them
+        // JSON escaping preserves control chars; disp() would corrupt them.
+        // fields = every field name present (secret presence is metadata,
+        // not a secret); meta = non-secret values only.
         print!("[");
-        for (i, (kind, name, rid)) in rows.iter().enumerate() {
+        for (i, r) in rows.iter().enumerate() {
             if i > 0 {
                 print!(",");
             }
+            let fields: Vec<String> = r
+                .fields
+                .iter()
+                .map(|f| format!("\"{}\"", json_esc(f)))
+                .collect();
+            let meta: Vec<String> = r
+                .meta
+                .iter()
+                .map(|(k, v)| format!("\"{}\":\"{}\"", json_esc(k), json_esc(v)))
+                .collect();
             print!(
-                "{{\"kind\":\"{}\",\"name\":\"{}\",\"id\":\"{}\"}}",
-                kind.map(|k| k.name()).unwrap_or(""),
-                json_esc(name),
-                rid
+                "{{\"kind\":\"{}\",\"name\":\"{}\",\"id\":\"{}\",\"fields\":[{}],\"meta\":{{{}}}}}",
+                r.kind.map(|k| k.name()).unwrap_or(""),
+                json_esc(&r.name),
+                r.rid,
+                fields.join(","),
+                meta.join(",")
             );
         }
         println!("]");
         return Ok(());
     }
     println!("{:<10} {:<40} ID", "KIND", "NAME");
-    for (kind, name, rid) in rows {
+    for r in rows {
         println!(
             "{:<10} {:<40} {}",
-            kind.map(|k| k.name()).unwrap_or("-"),
-            disp(&name),
-            rid
+            r.kind.map(|k| k.name()).unwrap_or("-"),
+            disp(&r.name),
+            r.rid
         );
     }
     Ok(())
@@ -865,14 +934,16 @@ enum Out {
     Copy(String),
     /// concealed clipboard write + synthetic ⌘V (macOS autofill)
     Paste(String),
-    /// synthetic per-char keystrokes — pasteboard never touched (macOS)
-    Type(String),
+    /// synthetic per-char keystrokes, Tab between fields — pasteboard
+    /// never touched (macOS)
+    Type(Vec<String>),
 }
 
-fn out_field(out: &Out) -> Option<&str> {
+fn out_fields<'a>(out: &'a Out) -> Vec<&'a str> {
     match out {
-        Out::Copy(f) | Out::Paste(f) | Out::Type(f) => Some(f),
-        Out::Print => None,
+        Out::Copy(f) | Out::Paste(f) => vec![f.as_str()],
+        Out::Type(fs) => fs.iter().map(|s| s.as_str()).collect(),
+        Out::Print => vec![],
     }
 }
 
@@ -893,22 +964,22 @@ fn paste_into_app() -> Result<(), String> {
     Err("paste autofill is macOS-only so far".into())
 }
 
-fn type_into_app(text: &str) -> Result<(), String> {
+fn type_into_app(parts: &[&str]) -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    return autofill::type_text(text);
+    return autofill::type_seq(parts);
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = text;
+        let _ = parts;
         Err("type autofill is macOS-only so far".into())
     }
 }
 
-fn pick_out(c: Option<&String>, p: Option<&String>, t: Option<&String>) -> Result<Out, String> {
-    match (c, p, t) {
-        (Some(f), None, None) => Ok(Out::Copy(f.clone())),
-        (None, Some(f), None) => Ok(Out::Paste(f.clone())),
-        (None, None, Some(f)) => Ok(Out::Type(f.clone())),
-        (None, None, None) => Ok(Out::Print),
+fn pick_out(c: Option<&String>, p: Option<&String>, t: &[String]) -> Result<Out, String> {
+    match (c, p, t.is_empty()) {
+        (Some(f), None, true) => Ok(Out::Copy(f.clone())),
+        (None, Some(f), true) => Ok(Out::Paste(f.clone())),
+        (None, None, false) => Ok(Out::Type(t.to_vec())),
+        (None, None, true) => Ok(Out::Print),
         _ => Err("pass only one of --copy/--paste/--type".into()),
     }
 }
@@ -929,30 +1000,46 @@ fn render_item(item: &mpm_core::Item, show: bool, out: &Out) -> Result<(), Strin
     let fmap = field_map();
     let inv: BTreeMap<u8, (&str, bool)> = fmap.iter().map(|(n, (t, s))| (*t, (*n, *s))).collect();
 
-    if let Some(field) = out_field(out) {
-        let Some((t, _)) = fmap.get(field) else {
-            return Err(format!("unknown field '{field}'"));
-        };
-        let val = item.get(*t).ok_or("field absent")?;
+    let fields = out_fields(out);
+    if !fields.is_empty() {
         match out {
-            Out::Copy(_) => {
-                copy_to_clipboard(val)?;
-                eprintln!(
-                    "copied '{field}' — concealed from clipboard managers, auto-clears in {}s",
-                    clip_ttl()
-                );
+            Out::Copy(f) | Out::Paste(f) => {
+                let field = f.as_str();
+                let Some((t, _)) = fmap.get(field) else {
+                    return Err(format!("unknown field '{field}'"));
+                };
+                let val = item.get(*t).ok_or("field absent")?;
+                match out {
+                    Out::Copy(_) => {
+                        copy_to_clipboard(val)?;
+                        eprintln!(
+                            "copied '{field}' — concealed from clipboard managers, auto-clears in {}s",
+                            clip_ttl()
+                        );
+                    }
+                    Out::Paste(_) => {
+                        autofill_preflight()?; // before publishing anything
+                        copy_to_clipboard(val)?; // concealed write + janitor, then ⌘V
+                        paste_into_app()?;
+                        eprintln!("pasted '{field}'");
+                    }
+                    _ => unreachable!(),
+                }
             }
-            Out::Paste(_) => {
-                autofill_preflight()?; // before publishing anything
-                copy_to_clipboard(val)?; // concealed write + janitor, then ⌘V
-                paste_into_app()?;
-                eprintln!("pasted '{field}'");
-            }
-            Out::Type(_) => {
-                let text =
-                    std::str::from_utf8(val).map_err(|_| "field isn't UTF-8 — can't type it")?;
-                type_into_app(text)?;
-                eprintln!("typed '{field}'");
+            Out::Type(fs) => {
+                let mut parts = Vec::with_capacity(fs.len());
+                for field in fs {
+                    let Some((t, _)) = fmap.get(field.as_str()) else {
+                        return Err(format!("unknown field '{field}'"));
+                    };
+                    let val = item.get(*t).ok_or(format!("'{field}' absent"))?;
+                    parts.push(
+                        std::str::from_utf8(val)
+                            .map_err(|_| "field isn't UTF-8 — can't type it")?,
+                    );
+                }
+                type_into_app(&parts)?;
+                eprintln!("typed {}", fs.join(" ⇥ "));
             }
             Out::Print => unreachable!(),
         }
@@ -1117,7 +1204,7 @@ fn cmd_otp(dir: &Path, rec: bool, name: &str, out: &Out) -> Result<(), String> {
         }
         Out::Type(_) => {
             autofill_preflight()?;
-            type_into_app(&code)?;
+            type_into_app(&[&code])?;
             eprintln!("typed code");
         }
         Out::Print => println!("{code}  (valid {left}s more)"),
@@ -2220,7 +2307,7 @@ fn main() {
             copy,
             paste,
             r#type,
-        } => pick_out(copy.as_ref(), paste.as_ref(), r#type.as_ref())
+        } => pick_out(copy.as_ref(), paste.as_ref(), r#type)
             .and_then(|out| cmd_get(&dir, rec, name, *show, &out)),
         Cmd::List { json } => cmd_list(&dir, rec, *json),
         Cmd::Rm { name } => cmd_rm(&dir, rec, name),
@@ -2244,7 +2331,11 @@ fn main() {
             pick_out(
                 copy.then_some(&s),
                 paste.then_some(&s),
-                r#type.then_some(&s),
+                if *r#type {
+                    std::slice::from_ref(&s)
+                } else {
+                    &[]
+                },
             )
             .and_then(|out| cmd_otp(&dir, rec, name, &out))
         }
