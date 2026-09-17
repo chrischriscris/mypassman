@@ -352,9 +352,9 @@ function RowActions({
             icon={Icon.Clipboard}
             shortcut={
               f === "password"
-                ? { modifiers: ["cmd"], key: "p" }
+                ? { modifiers: ["opt"], key: "p" }
                 : f === "username"
-                  ? { modifiers: ["cmd"], key: "u" }
+                  ? { modifiers: ["opt"], key: "u" }
                   : undefined
             }
             onAction={() => copyField(item, f, false)}
