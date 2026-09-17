@@ -4,7 +4,14 @@ import { execFile, spawn } from "child_process";
 import { promisify } from "util";
 
 const MPM = "/Users/chus/.local/bin/mypassman";
-const run = promisify(execFile);
+
+// MPM_NO_BIO: the LAContext Touch ID sheet steals focus and closes the
+// Raycast window — so interactive calls must NEVER trigger it. A locked
+// vault fails fast instead; only the explicit "Unlock Vault" action
+// (which spawns the daemon without this env) pops Touch ID.
+const ENV = { env: { ...process.env, MPM_NO_BIO: "1" } };
+const execFileP = promisify(execFile);
+const run = (args: string[]) => execFileP(MPM, args, ENV);
 
 interface VaultItem {
   kind: string;
@@ -30,7 +37,7 @@ async function fill(item: VaultItem, field: string, mode: "paste" | "type", otp:
   await closeMainWindow({ clearRootSearch: true });
   try {
     const args = otp ? ["otp", item.id, `--${mode}`] : ["get", item.id, `--${mode}`, field];
-    await run(MPM, args);
+    await run(args);
     await showHUD(`${otp ? "code" : field} ${mode === "paste" ? "pasted" : "typed"}`);
   } catch (e) {
     await showToast({
@@ -45,7 +52,7 @@ async function copyField(item: VaultItem, field: string, otp: boolean) {
   const toast = await showToast({ style: Toast.Style.Animated, title: `Copying ${otp ? "code" : field}…` });
   try {
     const args = otp ? ["otp", item.id, "--copy"] : ["get", item.id, "--copy", field];
-    await run(MPM, args);
+    await run(args);
     toast.style = Toast.Style.Success;
     toast.title = `${otp ? "code" : field} copied — auto-clears`;
   } catch (e) {
@@ -63,7 +70,7 @@ async function unlockVault(revalidate: () => void) {
   for (let i = 0; i < 40; i++) {
     await new Promise((r) => setTimeout(r, 750));
     try {
-      await run(MPM, ["list", "--json"]);
+      await run(["list", "--json"]);
       toast.style = Toast.Style.Success;
       toast.title = "Vault unlocked";
       revalidate();
@@ -79,7 +86,7 @@ async function unlockVault(revalidate: () => void) {
 
 async function lockVault() {
   try {
-    await run(MPM, ["lock"]);
+    await run(["lock"]);
     await showToast({ style: Toast.Style.Success, title: "Vault locked" });
   } catch {
     await showToast({ style: Toast.Style.Failure, title: "Lock failed" });
@@ -88,6 +95,7 @@ async function lockVault() {
 
 export default function Command() {
   const { data, isLoading, error, revalidate } = useExec(MPM, ["list", "--json"], {
+    env: ENV.env,
     parseOutput: ({ stdout }) => JSON.parse(stdout) as VaultItem[],
   });
 

@@ -30,7 +30,10 @@ independent of this repo, build with `npm run build` and import the folder.)
   auto-clear
 - `⌘⇧L` locks the vault
 - Vault locked? The empty view offers **Unlock Vault** — spawns the daemon,
-  which pops Touch ID if `mypassman bio enroll` is done
+  which pops Touch ID if `mypassman bio enroll` is done. Note the Touch ID
+  sheet takes focus and Raycast's window hides — that's expected, once per
+  daemon session; reopen the command and everything is instant. All other
+  calls run with `MPM_NO_BIO=1` so they can never trigger the prompt
 - Resolves items by record id — no fuzzy-name ambiguity
 
 ## Security notes
