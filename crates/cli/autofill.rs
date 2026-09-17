@@ -16,11 +16,15 @@ type CGEventSourceRef = *const c_void;
 
 const K_CG_HID_EVENT_TAP: u32 = 0;
 const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 0x0010_0000;
+// events created without a real source get silently filtered on modern
+// macOS — CGEventPost is void so the drop is invisible. Always source them.
+const K_CG_EVENT_SOURCE_STATE_HID_SYSTEM: u32 = 1;
 const K_VK_ANSI_V: u16 = 0x09;
 const K_VK_TAB: u16 = 0x30;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
+    fn CGEventSourceCreate(state: u32) -> CGEventSourceRef;
     fn CGEventCreateKeyboardEvent(src: CGEventSourceRef, key: u16, down: bool) -> CGEventRef;
     fn CGEventKeyboardSetUnicodeString(ev: CGEventRef, len: usize, s: *const u16);
     fn CGEventSetFlags(ev: CGEventRef, flags: u64);
@@ -66,9 +70,14 @@ fn settle() {
 
 fn post_key(key: u16, cmd: bool, utf16: &[u16]) -> Result<(), String> {
     unsafe {
+        let src = CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM);
+        if src.is_null() {
+            return Err("CGEventSourceCreate failed".into());
+        }
         for down in [true, false] {
-            let ev = CGEventCreateKeyboardEvent(std::ptr::null(), key, down);
+            let ev = CGEventCreateKeyboardEvent(src, key, down);
             if ev.is_null() {
+                CFRelease(src);
                 return Err("CGEventCreateKeyboardEvent failed".into());
             }
             if cmd {
@@ -80,6 +89,7 @@ fn post_key(key: u16, cmd: bool, utf16: &[u16]) -> Result<(), String> {
             CGEventPost(K_CG_HID_EVENT_TAP, ev);
             CFRelease(ev);
         }
+        CFRelease(src);
     }
     Ok(())
 }
