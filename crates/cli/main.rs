@@ -123,6 +123,9 @@ enum Cmd {
         /// treat input as CSV instead of MPMEXP
         #[arg(long)]
         csv: bool,
+        /// show what would happen — writes nothing, no unlock needed for CSV
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Verified backup: replay-checks the vault, then copies MANIFEST+ops
     /// into <dest>/mypassman-backup-<ts>-<vaultid>. It's already ciphertext.
@@ -1515,7 +1518,33 @@ fn cmd_export(dir: &Path, rec: bool, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_import(dir: &Path, rec: bool, path: &Path, csv: bool) -> Result<(), String> {
+fn cmd_import(dir: &Path, rec: bool, path: &Path, csv: bool, dry_run: bool) -> Result<(), String> {
+    if dry_run {
+        // parse + simulate collisions, never touch the vault or keys
+        let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let items = if csv {
+            csv_to_items(&raw)?
+        } else {
+            let pw = export_passphrase(false)?;
+            let recs =
+                mpm_core::export::open_export(&raw, pw.as_bytes()).map_err(|e| e.to_string())?;
+            recs.iter()
+                .map(|r| Item::decode(&r.fields).map(|it| (r.kind, r.name.clone(), it)))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        let manifest = mpm_store::load_manifest(dir).map_err(|e| e.to_string())?;
+        let _ = manifest;
+        println!("would import {} items:", items.len());
+        let mut kinds: std::collections::BTreeMap<&str, usize> = Default::default();
+        for (k, _, _) in &items {
+            *kinds.entry(k.name()).or_default() += 1;
+        }
+        for (k, n) in kinds {
+            println!("  {k}: {n}");
+        }
+        return Ok(());
+    }
     let _lock = mpm_store::lock_vault(dir).map_err(|e| e.to_string())?;
     let mut vault = unlock(dir, rec)?;
     const MAX_IMPORT: u64 = 64 << 20; // bound hostile files before alloc
@@ -1678,27 +1707,34 @@ fn csv_to_items(raw: &[u8]) -> Result<Vec<(ItemKind, String, mpm_core::Item)>, S
     let c_notes = col(&["notes", "note", "notesplain"]);
     let c_type = col(&["type", "item type", "item_type"]);
     let c_cnum = col(&["card_number", "number"]);
-    let c_chold = col(&["cardholder", "cardholder_name", "holder"]);
+    let c_chold = col(&["cardholder", "cardholder_name", "holder", "cardholdername"]);
     let c_cexp = col(&["exp", "expiry", "expiration"]);
-    let c_ccvv = col(&["cvv", "csc", "security code"]);
+    let c_expm = col(&["expmonth", "exp_month"]);
+    let c_expy = col(&["expyear", "exp_year"]);
+    let c_ccvv = col(&["cvv", "csc", "security code", "code"]);
 
     let mut out = Vec::new();
     for (i, row) in rows.iter().skip(1).enumerate() {
         if row.iter().all(|c| c.is_empty()) {
             continue; // blank line
         }
-        if row.len() != width {
+        // shorter than the header is normal (missing trailing columns —
+        // pad); LONGER means an unquoted comma broke the row — refusing
+        // beats silently mapping fields into the wrong columns
+        if row.len() > width {
             return Err(format!(
-                "csv: row {} has {} cells, header has {width}",
+                "csv: row {} has {} cells, header has {width} — likely an unquoted comma",
                 i + 1,
                 row.len()
             ));
         }
         // data cells are NOT trimmed — a password may legitimately have
         // leading/trailing whitespace; only emptiness is filtered
+        let pad = vec![String::new(); width.saturating_sub(row.len())];
+        let row: Vec<&str> = row.iter().chain(&pad).map(|s| s.as_str()).collect();
         let g = |c: Option<usize>| -> Option<&str> {
             c.and_then(|j| row.get(j))
-                .map(|s| s.as_str())
+                .copied()
                 .filter(|s| !s.is_empty())
         };
         let ty = g(c_type).unwrap_or("").to_lowercase();
@@ -1729,6 +1765,13 @@ fn csv_to_items(raw: &[u8]) -> Result<Vec<(ItemKind, String, mpm_core::Item)>, S
         put(tag::CARD_NUMBER, g(c_cnum));
         put(tag::CARD_HOLDER, g(c_chold));
         put(tag::CARD_EXP, g(c_cexp));
+        // Bitwarden exports exp as separate expMonth/expYear columns
+        if g(c_cexp).is_none() {
+            if let (Some(mo), Some(yr)) = (g(c_expm), g(c_expy)) {
+                let yr = yr.strip_prefix("20").unwrap_or(yr);
+                put(tag::CARD_EXP, Some(&format!("{mo:0>2}/{yr}")));
+            }
+        }
         put(tag::CARD_CVV, g(c_ccvv));
         if item.fields.is_empty() {
             continue; // row mapped to nothing — don't mint an empty Secret
@@ -2001,7 +2044,7 @@ fn main() {
         Cmd::Run { inject, cmd } => cmd_run(&dir, rec, inject, cmd),
         Cmd::Clipclear => cmd_clipclear(),
         Cmd::Export { path } => cmd_export(&dir, rec, path),
-        Cmd::Import { path, csv } => cmd_import(&dir, rec, path, *csv),
+        Cmd::Import { path, csv, dry_run } => cmd_import(&dir, rec, path, *csv, *dry_run),
         Cmd::Backup { dest } => cmd_backup(&dir, rec, dest),
         Cmd::Restore { src } => cmd_restore(&dir, src),
         Cmd::Daemon { idle_ttl } => cmd_daemon(&dir, rec, *idle_ttl),
