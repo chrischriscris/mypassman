@@ -1,2 +1,4 @@
 /target
 Cargo.lock.bak
+integrations/raycast-extension/node_modules/
+integrations/raycast-extension/dist/

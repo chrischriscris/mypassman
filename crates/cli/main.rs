@@ -60,7 +60,11 @@ enum Cmd {
     },
     /// List items (names + kinds only — fields stay sealed)
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Emit a JSON array of {kind, name, id} — for integrations
+        #[arg(long)]
+        json: bool,
+    },
     /// Tombstone an item
     Rm { name: String },
     /// Show enrolled devices
@@ -748,32 +752,60 @@ fn b32_encode(b: &[u8]) -> String {
     out
 }
 
-fn cmd_list(dir: &Path, rec: bool) -> Result<(), String> {
-    if let Some(rows) = daemon::try_list(dir)? {
-        println!("{:<10} {:<40} ID", "KIND", "NAME");
-        for (kind, name, rid) in rows {
-            println!(
-                "{:<10} {:<40} {}",
-                kind.map(|k| k.name()).unwrap_or("-"),
-                disp(&name),
+fn cmd_list(dir: &Path, rec: bool, json: bool) -> Result<(), String> {
+    let mut rows: Vec<daemon::ListRow> = if let Some(rows) = daemon::try_list(dir)? {
+        rows
+    } else {
+        let vault = unlock(dir, rec)?;
+        vault
+            .records()
+            .map(|r| (r.kind, r.name.clone(), mpm_store::hex(&r.record_id)))
+            .collect()
+    };
+    rows.sort_by(|a, b| a.1.cmp(&b.1));
+    if json {
+        // JSON escaping preserves control chars; disp() would corrupt them
+        print!("[");
+        for (i, (kind, name, rid)) in rows.iter().enumerate() {
+            if i > 0 {
+                print!(",");
+            }
+            print!(
+                "{{\"kind\":\"{}\",\"name\":\"{}\",\"id\":\"{}\"}}",
+                kind.map(|k| k.name()).unwrap_or(""),
+                json_esc(name),
                 rid
             );
         }
+        println!("]");
         return Ok(());
     }
-    let vault = unlock(dir, rec)?;
     println!("{:<10} {:<40} ID", "KIND", "NAME");
-    let mut rows: Vec<_> = vault.records().collect();
-    rows.sort_by(|a, b| a.name.cmp(&b.name));
-    for r in rows {
+    for (kind, name, rid) in rows {
         println!(
             "{:<10} {:<40} {}",
-            r.kind.map(|k| k.name()).unwrap_or("-"),
-            disp(&r.name),
-            mpm_store::hex(&r.record_id)
+            kind.map(|k| k.name()).unwrap_or("-"),
+            disp(&name),
+            rid
         );
     }
     Ok(())
+}
+
+fn json_esc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
 }
 
 /// A torn tail means bytes past the verified prefix never replayed —
@@ -2027,7 +2059,7 @@ fn main() {
         Cmd::Init => cmd_init(&dir),
         Cmd::Add { kind, name, fields } => cmd_add(&dir, rec, kind, name, fields),
         Cmd::Get { name, show, copy } => cmd_get(&dir, rec, name, *show, copy),
-        Cmd::List => cmd_list(&dir, rec),
+        Cmd::List { json } => cmd_list(&dir, rec, *json),
         Cmd::Rm { name } => cmd_rm(&dir, rec, name),
         Cmd::Devices => cmd_devices(&dir, cli.recovery),
         Cmd::Recovery { sub } => match sub {

@@ -1,0 +1,31 @@
+{
+  "name": "mypassman",
+  "title": "MyPassman",
+  "description": "Search your mypassman vault and copy secrets — fields never touch JS, the CLI does the copying",
+  "icon": "icon.png",
+  "author": "chus",
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "list-items",
+      "title": "Search Vault",
+      "description": "Search vault items; Enter copies the password via concealed clipboard",
+      "mode": "view"
+    }
+  ],
+  "scripts": {
+    "build": "ray build -e dist",
+    "dev": "ray develop",
+    "lint": "ray lint"
+  },
+  "dependencies": {
+    "@raycast/api": "^1.83.0",
+    "@raycast/utils": "^2.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.17",
+    "@types/react": "^19.0.10",
+    "react": "^19.3.0",
+    "typescript": "^5.9.3"
+  }
+}
