@@ -146,9 +146,13 @@ fn peer_is_us(_s: &std::os::unix::net::UnixStream) -> bool {
 /// unlocks (the client dispatch below just finds no socket).
 #[cfg(unix)]
 pub fn run(dir: &Path, rec: bool, idle_ttl: u64) -> Result<(), String> {
+    use fs2::FileExt;
     use std::os::unix::net::UnixListener;
 
-    let mut vault = unlock(dir, rec)?;
+    // Singleton BEFORE the password prompt: a second daemon must never
+    // unlink a live one's socket (the orphan stays unlocked but
+    // unreachable — `mpm lock` couldn't find it). The flock outlives us
+    // only while we hold it.
     let sdir = sock_dir()?;
     std::fs::create_dir_all(&sdir).map_err(|e| e.to_string())?;
     #[cfg(unix)]
@@ -158,10 +162,24 @@ pub fn run(dir: &Path, rec: bool, idle_ttl: u64) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     let path = sock_path(dir).ok_or("no manifest")?;
+    let lck = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("daemon.lock"))
+        .map_err(|e| e.to_string())?;
+    lck.try_lock_exclusive()
+        .map_err(|_| "daemon already running for this vault".to_string())?;
     if path.exists() {
-        // stale socket from a dead daemon — bind over it
-        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+        // flock says no live daemon — but if a peer answers anyway (lock
+        // file deleted under a running daemon), refuse rather than orphan it
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            return Err("live daemon socket present — refusing to replace it".into());
+        }
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?; // stale
     }
+    let mut vault = unlock(dir, rec)?;
     let listener =
         UnixListener::bind(&path).map_err(|e| format!("bind {}: {e}", path.display()))?;
     #[cfg(unix)]
@@ -174,16 +192,21 @@ pub fn run(dir: &Path, rec: bool, idle_ttl: u64) -> Result<(), String> {
     eprintln!("daemon: vault unlocked, listening on {}", path.display());
     eprintln!("daemon: auto-locks after {idle_ttl}s idle — `mpm lock` to lock now");
 
-    // ops already applied at startup — the refresh watermark
-    let mut known = mpm_store::read_ops(dir, vault.device_id())
-        .map(|l| l.ops.len())
-        .unwrap_or(0);
+    // ops applied at startup — derive from the vault's own replay head,
+    // not a fresh read (an op appended between unlock and a re-read would
+    // be counted-but-never-applied → our next append forks the chain)
+    let mut known = vault.head().0 as usize;
     let mut last = Instant::now();
     let ttl = Duration::from_secs(idle_ttl);
     loop {
         match listener.accept() {
             Ok((mut s, _)) => {
-                last = Instant::now();
+                // a conn accepted after the deadline is NOT served — the
+                // vault is already supposed to be locked
+                if last.elapsed() > ttl {
+                    eprintln!("daemon: idle ttl — locking");
+                    break;
+                }
                 if !peer_is_us(&s) {
                     continue; // not our user — drop silently
                 }
@@ -202,8 +225,29 @@ pub fn run(dir: &Path, rec: bool, idle_ttl: u64) -> Result<(), String> {
                     let _ = write_msg(&mut s, 0, b"");
                     break; // vault drops → keys zeroized → we exit
                 }
+                if op[0] == OP_PING {
+                    // aliveness probe — no vault lock, no state, and it
+                    // does NOT count as activity toward the idle TTL
+                    let _ = write_msg(&mut s, 0, b"");
+                    continue;
+                }
+                // vault lock held across refresh→append→commit: an
+                // out-of-band writer between refresh and append would
+                // fork our own log otherwise
+                let _lock = match mpm_store::lock_vault(dir) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        let mut w = Writer::new();
+                        w.field(T_ERR, e.to_string().as_bytes());
+                        let _ = write_msg(&mut s, 1, &w.finish());
+                        continue;
+                    }
+                };
                 let (status, resp) = handle(op[0], &payload, &mut vault, dir, &mut known);
                 let _ = write_msg(&mut s, status, &resp);
+                if op[0] != OP_PING {
+                    last = Instant::now(); // only real ops reset idle
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(50));
@@ -220,19 +264,27 @@ pub fn run(dir: &Path, rec: bool, idle_ttl: u64) -> Result<(), String> {
 }
 
 /// Refresh in-memory state from our own op log if another process appended
-/// while we slept. Fork/divergence → honest error (client falls back).
+/// while we slept. CALLER HOLDS THE VAULT LOCK. Fork/divergence → honest
+/// error (client falls back).
 #[cfg(unix)]
-fn refresh(vault: &mut Vault, dir: &Path, known: &mut usize) -> Result<(), String> {
-    let _lock = mpm_store::lock_vault(dir).map_err(|e| e.to_string())?;
+fn refresh(vault: &mut Vault, dir: &Path, known: &mut usize) -> Result<bool, String> {
     let lr = mpm_store::read_ops(dir, vault.device_id()).map_err(|e| e.to_string())?;
+    let torn = lr.torn_tail;
     if lr.ops.len() < *known {
         return Err("op log shrank under the daemon — restart it".into());
     }
+    // same length ≠ same log: a same-length prefix rewrite is silent
+    // without comparing the applied tip
+    if *known > 0 && lr.ops[*known - 1].hash() != vault.head().1 {
+        return Err("op log diverged under the daemon — restart it".into());
+    }
     for op in &lr.ops[*known..] {
         vault.apply_own_op(op).map_err(|e| e.to_string())?;
+        // advance per-op: a bad tail op must not force replay of the
+        // valid prefix it follows
+        *known += 1;
     }
-    *known = lr.ops.len();
-    Ok(())
+    Ok(torn)
 }
 
 #[cfg(unix)]
@@ -266,12 +318,15 @@ fn serve(
     dir: &Path,
     known: &mut usize,
 ) -> Result<Vec<u8>, String> {
-    if op == OP_PING {
-        return Ok(Vec::new());
+    // catch up with any out-of-band appends before answering (the caller
+    // holds the vault lock across the whole request)
+    let torn = refresh(vault, dir, known).map_err(|e| format!("refresh: {e}"))?;
+    if torn && matches!(op, OP_PUT | OP_DEL) {
+        // appending past the tear would orphan the new op at next unlock
+        return Err(
+            "op log has a torn tail — refusing to write (backup+restore rebuilds clean)".into(),
+        );
     }
-
-    // catch up with any out-of-band appends before answering
-    refresh(vault, dir, known).map_err(|e| format!("refresh: {e}"))?;
 
     match op {
         OP_LIST => {
@@ -280,8 +335,8 @@ fn serve(
             rows.sort_by(|a, b| a.name.cmp(&b.name));
             for r in rows {
                 let mut inner = Writer::new();
+                inner.field(T_NAME, r.name.as_bytes()); // canonical: 1 < 2 < 5
                 inner.field(T_KIND, &[r.kind.map(|k| k as u8).unwrap_or(0)]);
-                inner.field(T_NAME, r.name.as_bytes());
                 inner.field(T_RID, &r.record_id);
                 w.field(T_RECORD, &inner.finish());
             }
@@ -296,14 +351,16 @@ fn serve(
                         .records()
                         .find(|r| r.record_id == rid)
                         .and_then(|r| r.kind);
+                    let enc = zeroize::Zeroizing::new(item.encode());
                     let mut w = Writer::new();
+                    if let Some(r) = vault.records().find(|r| r.record_id == rid) {
+                        w.field(T_NAME, r.name.as_bytes()); // canonical: 1<2<3<5
+                    }
                     if let Some(k) = kind {
                         w.field(T_KIND, &[k as u8]);
                     }
-                    if let Some(r) = vault.records().find(|r| r.record_id == rid) {
-                        w.field(T_NAME, r.name.as_bytes());
-                    }
-                    w.field(T_ITEM, &item.encode());
+                    w.field(T_ITEM, &enc);
+                    w.field(T_RID, &rid);
                     Ok(w.finish())
                 }
                 Err(e) => Err(format!("MISSING:{e}")),
@@ -311,14 +368,27 @@ fn serve(
         }
         OP_PUT => {
             let mut r = Reader::new(payload);
-            let (mut kind, mut name, mut tlv) = (None, None, None);
+            let (mut kind, mut name, mut tlv, mut want_rid) = (None, None, None, None);
             let mut ord = OrderGuard::default();
             while let Some((t, v)) = r.next_field().map_err(|e| e.to_string())? {
                 ord.check(t, &[]).map_err(|e| e.to_string())?;
                 match t {
-                    T_KIND => kind = Some(v[0]),
-                    T_NAME => name = Some(String::from_utf8_lossy(v).into_owned()),
-                    T_ITEM => tlv = Some(v.to_vec()),
+                    T_KIND => {
+                        if v.len() != 1 {
+                            return Err("PUT: bad kind".into());
+                        }
+                        kind = Some(v[0]);
+                    }
+                    T_NAME => {
+                        let n = String::from_utf8(v.to_vec())
+                            .map_err(|_| "PUT: name not utf-8".to_string())?;
+                        if n.is_empty() || n.chars().any(|c| c.is_control()) {
+                            return Err("PUT: bad name".into());
+                        }
+                        name = Some(n);
+                    }
+                    T_ITEM => tlv = Some(zeroize::Zeroizing::new(v.to_vec())),
+                    T_RID => want_rid = Some(<[u8; 16]>::try_from(v).map_err(|_| "PUT: bad rid")?),
                     _ => {}
                 }
             }
@@ -328,27 +398,47 @@ fn serve(
             };
             let kind = ItemKind::from_u8(kv).map_err(|e| e.to_string())?;
             let item = Item::decode(&tlv).map_err(|e| e.to_string())?;
-            // exact-name semantics: same kind → update in place; other kind
-            // → refuse (prevents silent name collision)
-            let existing = vault
-                .records()
-                .find(|r| r.name == name)
-                .map(|r| (r.record_id, r.kind));
-            let (op, created, rid) = match existing {
-                Some((rid, Some(k))) if k == kind => (
-                    vault
-                        .make_update(&rid, kind, item)
-                        .map_err(|e| e.to_string())?,
-                    false,
-                    rid,
-                ),
-                Some((_, Some(k))) => {
-                    return Err(format!("'{name}' exists as {} — rm it first", k.name()))
+            // T_RID → update-only, addressed by id (edit semantics): a
+            // fetch→delete→put sequence must NOT silently create
+            let (op, created, rid) = if let Some(rid) = want_rid {
+                let rec = vault
+                    .records()
+                    .find(|r| r.record_id == rid)
+                    .map(|r| (r.tombstoned, r.kind));
+                match rec {
+                    Some((false, Some(k))) => (
+                        vault
+                            .make_update(&rid, k, item)
+                            .map_err(|e| e.to_string())?,
+                        false,
+                        rid,
+                    ),
+                    Some((false, None)) => return Err("record kind unknown".into()),
+                    _ => return Err("MISSING:record gone — nothing updated".into()),
                 }
-                Some((_, None)) => return Err(format!("'{name}' exists with unknown kind")),
-                None => {
-                    let (op, rid) = vault.make_upsert(kind, item).map_err(|e| e.to_string())?;
-                    (op, true, rid)
+            } else {
+                // exact-name semantics: same kind → update in place; other kind
+                // → refuse (prevents silent name collision)
+                let existing = vault
+                    .records()
+                    .find(|r| r.name == name)
+                    .map(|r| (r.record_id, r.kind));
+                match existing {
+                    Some((rid, Some(k))) if k == kind => (
+                        vault
+                            .make_update(&rid, kind, item)
+                            .map_err(|e| e.to_string())?,
+                        false,
+                        rid,
+                    ),
+                    Some((_, Some(k))) => {
+                        return Err(format!("'{name}' exists as {} — rm it first", k.name()))
+                    }
+                    Some((_, None)) => return Err(format!("'{name}' exists with unknown kind")),
+                    None => {
+                        let (op, rid) = vault.make_upsert(kind, item).map_err(|e| e.to_string())?;
+                        (op, true, rid)
+                    }
                 }
             };
             mpm_store::append_op(dir, vault.device_id(), &op).map_err(|e| e.to_string())?;
@@ -430,9 +520,10 @@ fn name_payload(name: &str) -> Vec<u8> {
 }
 
 pub enum DaemonItem {
-    /// (item, kind, record-name) — name lives in the op's outer layer, so
-    /// the daemon returns it separately; clients must re-set NAME on PUT.
-    Found(Item, Option<ItemKind>, String),
+    /// (item, kind, record-name, record-id) — name/id live in the op's
+    /// outer layer, so the daemon returns them separately; clients must
+    /// re-set NAME on PUT and pass rid for update-only edits.
+    Found(Item, Option<ItemKind>, String, [u8; 16]),
     Missing, // daemon is alive and says no such record (or ambiguous)
     Offline, // no daemon → caller uses the standalone path
 }
@@ -441,13 +532,14 @@ pub enum DaemonItem {
 pub fn item(dir: &Path, name: &str) -> Result<DaemonItem, String> {
     match call(dir, OP_ITEM, &name_payload(name))? {
         Some((0, p)) => {
-            let (mut kind, mut item, mut name) = (None, None, String::new());
+            let (mut kind, mut item, mut name, mut rid) = (None, None, String::new(), None);
             let mut r = Reader::new(&p);
             while let Some((t, v)) = r.next_field().map_err(|e| e.to_string())? {
                 match t {
-                    T_KIND => kind = ItemKind::from_u8(v[0]).ok(),
+                    T_KIND if v.len() == 1 => kind = ItemKind::from_u8(v[0]).ok(),
                     T_NAME => name = String::from_utf8_lossy(v).into_owned(),
                     T_ITEM => item = Some(Item::decode(v).map_err(|e| e.to_string())?),
+                    T_RID => rid = <[u8; 16]>::try_from(v).ok(),
                     _ => {}
                 }
             }
@@ -455,6 +547,7 @@ pub fn item(dir: &Path, name: &str) -> Result<DaemonItem, String> {
                 item.ok_or("daemon: no item")?,
                 kind,
                 name,
+                rid.ok_or("daemon: no rid")?,
             ))
         }
         Some((2, _)) => Ok(DaemonItem::Missing),
@@ -481,7 +574,7 @@ pub fn try_list(dir: &Path) -> Result<Option<Vec<ListRow>>, String> {
                 let mut ir = Reader::new(v);
                 while let Some((it, iv)) = ir.next_field().map_err(|e| e.to_string())? {
                     match it {
-                        T_KIND => kind = ItemKind::from_u8(iv[0]).ok(),
+                        T_KIND if iv.len() == 1 => kind = ItemKind::from_u8(iv[0]).ok(),
                         T_NAME => name = String::from_utf8_lossy(iv).into_owned(),
                         T_RID => {
                             let id: &[u8; 16] = iv.try_into().unwrap_or(&[0u8; 16]);
@@ -499,17 +592,23 @@ pub fn try_list(dir: &Path) -> Result<Option<Vec<ListRow>>, String> {
     }
 }
 
-/// Create-or-update via the daemon. Returns (record_id, created).
+/// Create-or-update via the daemon. `rid: Some` → update-only addressed
+/// by record id (edit); `None` → upsert by name (add).
 pub fn try_put(
     dir: &Path,
     kind: ItemKind,
     name: &str,
+    rid: Option<&[u8; 16]>,
     item: &Item,
 ) -> Result<Option<([u8; 16], bool)>, String> {
+    let enc = zeroize::Zeroizing::new(item.encode());
     let mut w = Writer::new();
-    w.field(T_NAME, name.as_bytes()); // canonical order: NAME(1) < KIND(2) < ITEM(3)
+    w.field(T_NAME, name.as_bytes()); // canonical order: 1 < 2 < 3 < 5
     w.field(T_KIND, &[kind as u8]);
-    w.field(T_ITEM, &item.encode());
+    w.field(T_ITEM, &enc);
+    if let Some(r) = rid {
+        w.field(T_RID, r);
+    }
     match call(dir, OP_PUT, &w.finish())? {
         Some((0, p)) => {
             let (mut rid, mut created) = (None, false);

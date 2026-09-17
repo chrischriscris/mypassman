@@ -528,6 +528,9 @@ fn cmd_add(
     cli_fields: &[String],
 ) -> Result<(), String> {
     let kind = ItemKind::from_name(kind).map_err(|_| format!("unknown kind '{kind}'"))?;
+    if name.is_empty() || name.chars().any(|c| c.is_control()) {
+        return Err("bad name (empty or contains control chars)".into());
+    }
     let fmap = field_map();
 
     let mut given = BTreeMap::new();
@@ -543,7 +546,7 @@ fn cmd_add(
 
     // daemon path: merge or create without a fresh unlock
     match daemon::item(dir, name)? {
-        daemon::DaemonItem::Found(mut item, Some(k), rec_name) => {
+        daemon::DaemonItem::Found(mut item, Some(k), rec_name, rid0) => {
             if k != kind {
                 return Err(format!(
                     "'{name}' exists as {} — rm it first to change kind",
@@ -553,22 +556,23 @@ fn cmd_add(
             for (t, v) in given.values() {
                 item.set(*t, v.clone().into_bytes());
             }
-            item.set(tag::NAME, rec_name.into_bytes()); // NAME is outer-layer
+            item.set(tag::NAME, rec_name.clone().into_bytes()); // NAME is outer-layer
             for (fname, secret) in required_fields(kind) {
                 let t = fmap[*fname].0;
                 if *secret && item.get(t).is_none() {
                     item.set(t, prompt_secret(fname).as_bytes().to_vec());
                 }
             }
-            item.set(tag::NAME, name.as_bytes().to_vec());
             finalize_totp(&mut item)?;
-            let Some((rid, _)) = daemon::try_put(dir, kind, name, &item)? else {
+            // resolved name + rid — never the raw lookup string, and the
+            // update is addressed by id so it can't create a duplicate
+            let Some((rid, _)) = daemon::try_put(dir, kind, &rec_name, Some(&rid0), &item)? else {
                 return Err("daemon vanished mid-add".into());
             };
-            eprintln!("updated '{}' ({})", name, mpm_store::hex(&rid));
+            eprintln!("updated '{rec_name}' ({})", mpm_store::hex(&rid));
             return Ok(());
         }
-        daemon::DaemonItem::Found(_, None, _) => {
+        daemon::DaemonItem::Found(_, None, _, _) => {
             return Err(format!("'{name}' exists with unknown kind"));
         }
         daemon::DaemonItem::Missing => {
@@ -595,7 +599,7 @@ fn cmd_add(
                 item.set(t, v.into_bytes());
             }
             finalize_totp(&mut item)?;
-            let Some((rid, _)) = daemon::try_put(dir, kind, name, &item)? else {
+            let Some((rid, _)) = daemon::try_put(dir, kind, name, None, &item)? else {
                 return Err("daemon vanished mid-add".into());
             };
             eprintln!(
@@ -748,7 +752,7 @@ fn cmd_list(dir: &Path, rec: bool) -> Result<(), String> {
             println!(
                 "{:<10} {:<40} {}",
                 kind.map(|k| k.name()).unwrap_or("-"),
-                name,
+                disp(&name),
                 rid
             );
         }
@@ -762,11 +766,33 @@ fn cmd_list(dir: &Path, rec: bool) -> Result<(), String> {
         println!(
             "{:<10} {:<40} {}",
             r.kind.map(|k| k.name()).unwrap_or("-"),
-            r.name,
+            disp(&r.name),
             mpm_store::hex(&r.record_id)
         );
     }
     Ok(())
+}
+
+/// A torn tail means bytes past the verified prefix never replayed —
+/// appending on top would silently orphan the new op at next unlock.
+/// Refuse mutations; `backup` + `restore` into a fresh dir rebuilds clean.
+fn refuse_if_torn(dir: &Path, vault: &mpm_core::Vault) -> Result<(), String> {
+    let lr = mpm_store::read_ops(dir, vault.device_id()).map_err(|e| e.to_string())?;
+    if lr.torn_tail {
+        return Err(
+            "op log has a torn tail — refusing to write. `backup` then `restore`              into a fresh --vault dir rebuilds a clean log"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Terminal-safe name for printing — a hostile import could embed escape
+/// sequences in a name; we only ever print it sanitized.
+fn disp(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 fn find_one(vault: &mpm_core::Vault, name: &str) -> Result<[u8; 16], String> {
@@ -788,7 +814,7 @@ fn cmd_get(
     copy: &Option<String>,
 ) -> Result<(), String> {
     match daemon::item(dir, name)? {
-        daemon::DaemonItem::Found(item, _, _) => return render_item(&item, show, copy),
+        daemon::DaemonItem::Found(item, _, _, _) => return render_item(&item, show, copy),
         daemon::DaemonItem::Missing => return Err(format!("'{name}': not found")),
         daemon::DaemonItem::Offline => {}
     }
@@ -933,7 +959,7 @@ fn cmd_gen(
 /// (a login can hold its own 2FA; a `totp` item is the standalone form).
 fn cmd_otp(dir: &Path, rec: bool, name: &str, copy: bool) -> Result<(), String> {
     let item = match daemon::item(dir, name)? {
-        daemon::DaemonItem::Found(i, _, _) => i,
+        daemon::DaemonItem::Found(i, _, _, _) => i,
         daemon::DaemonItem::Missing => return Err(format!("'{name}': not found")),
         daemon::DaemonItem::Offline => {
             let vault = unlock(dir, rec)?;
@@ -975,7 +1001,7 @@ fn cmd_edit(dir: &Path, rec: bool, name: &str, cli_fields: &[String]) -> Result<
     if cli_fields.is_empty() {
         return Err("nothing to change — pass -f field=value".into());
     }
-    if let daemon::DaemonItem::Found(mut item, kind, rec_name) = daemon::item(dir, name)? {
+    if let daemon::DaemonItem::Found(mut item, kind, rec_name, rid0) = daemon::item(dir, name)? {
         let fmap = field_map();
         for f in cli_fields {
             let Some((k, v)) = f.split_once('=') else {
@@ -986,15 +1012,16 @@ fn cmd_edit(dir: &Path, rec: bool, name: &str, cli_fields: &[String]) -> Result<
             };
             item.set(*t, v.as_bytes().to_vec());
         }
-        item.set(tag::NAME, rec_name.into_bytes()); // NAME is outer-layer — re-inject
+        item.set(tag::NAME, rec_name.clone().into_bytes()); // NAME is outer-layer — re-inject
         finalize_totp(&mut item)?;
         let Some(kind) = kind else {
             return Err("daemon: record kind unknown".into());
         };
-        let Some((rid, _)) = daemon::try_put(dir, kind, name, &item)? else {
+        // update-by-rid: a concurrent delete can't turn this into a create
+        let Some((rid, _)) = daemon::try_put(dir, kind, &rec_name, Some(&rid0), &item)? else {
             return Err("daemon vanished mid-edit".into());
         };
-        eprintln!("updated '{name}' ({})", mpm_store::hex(&rid));
+        eprintln!("updated '{rec_name}' ({})", mpm_store::hex(&rid));
         return Ok(());
     }
     let _lock = mpm_store::lock_vault(dir).map_err(|e| e.to_string())?;
@@ -1022,10 +1049,11 @@ fn cmd_edit(dir: &Path, rec: bool, name: &str, cli_fields: &[String]) -> Result<
     let op = vault
         .make_update(&rid, kind, item)
         .map_err(|e| e.to_string())?;
+    refuse_if_torn(dir, &vault)?;
     mpm_store::append_op(dir, vault.device_id(), &op).map_err(|e| e.to_string())?;
     vault.commit(&op).map_err(|e| e.to_string())?;
     save_checkpoint(&vault)?;
-    eprintln!("updated '{}' ({})", name, mpm_store::hex(&rid));
+    eprintln!("updated '{}' ({})", disp(name), mpm_store::hex(&rid));
     Ok(())
 }
 
@@ -1045,7 +1073,8 @@ fn cmd_run(dir: &Path, rec: bool, inject: &[String], cmd: &[String]) -> Result<(
         let Some((itempart, envvar)) = spec.split_once('=') else {
             return Err(format!("bad -i '{spec}' (want item:field=ENV_VAR)"));
         };
-        let Some((iname, fname)) = itempart.split_once(':') else {
+        // rsplit: the item name may itself contain ':' (aws:prod)
+        let Some((iname, fname)) = itempart.rsplit_once(':') else {
             return Err(format!("bad -i '{spec}' (want item:field=ENV_VAR)"));
         };
         let Some((t, _)) = fmap.get(fname) else {
@@ -1068,19 +1097,37 @@ fn cmd_run(dir: &Path, rec: bool, inject: &[String], cmd: &[String]) -> Result<(
     }
 
     let mut c = std::process::Command::new(&cmd[0]);
-    c.args(&cmd[1..]).env_remove("MPM_PASSWORD");
+    c.args(&cmd[1..]);
+    // every reserved credential var — a child must not inherit an
+    // unrelated passphrase just because it was in our environment
+    for var in ["MPM_PASSWORD", "MPM_EXPORT_PASSWORD"] {
+        c.env_remove(var);
+    }
 
+    // daemon first; a daemon that died between alive() and item() is
+    // Offline → fall through to a real unlock rather than "not found".
+    // Missing stays authoritative when the daemon is alive.
+    let mut offline = false;
     if daemon::alive(dir) {
         for spec in &specs {
-            let daemon::DaemonItem::Found(item, _, _) = daemon::item(dir, &spec.iname)? else {
-                return Err(format!("'{}': not found", spec.iname));
-            };
-            let val = item
-                .get(spec.tag)
-                .ok_or(format!("'{}' has no such field", spec.iname))?;
-            c.env(&spec.envvar, String::from_utf8_lossy(val).into_owned());
+            match daemon::item(dir, &spec.iname)? {
+                daemon::DaemonItem::Found(item, _, _, _) => {
+                    let val = item
+                        .get(spec.tag)
+                        .ok_or(format!("'{}' has no such field", spec.iname))?;
+                    c.env(&spec.envvar, String::from_utf8_lossy(val).into_owned());
+                }
+                daemon::DaemonItem::Missing => {
+                    return Err(format!("'{}': not found", spec.iname));
+                }
+                daemon::DaemonItem::Offline => {
+                    offline = true;
+                    break;
+                }
+            }
         }
-    } else {
+    }
+    if !daemon::alive(dir) || offline {
         let vault = unlock(dir, rec)?;
         for spec in &specs {
             let rid = find_one(&vault, &spec.iname)?;
@@ -1403,19 +1450,22 @@ fn rand_core_fill(b: &mut [u8]) {
 /// prompt. Distinct from the vault password on purpose — an export blob
 /// must not inherit the vault's slot semantics.
 fn export_passphrase(confirm: bool) -> Result<Zeroizing<String>, String> {
-    if let Ok(p) = std::env::var("MPM_EXPORT_PASSWORD") {
+    let p = if let Ok(p) = std::env::var("MPM_EXPORT_PASSWORD") {
         std::env::remove_var("MPM_EXPORT_PASSWORD");
-        return Ok(Zeroizing::new(p));
-    }
-    let p = read_password("export passphrase: ");
-    if confirm {
-        let p2 = read_password("confirm passphrase: ");
-        if p.as_str() != p2.as_str() {
-            return Err("passphrases don't match".into());
+        Zeroizing::new(p)
+    } else {
+        let p = read_password("export passphrase: ");
+        if confirm {
+            let p2 = read_password("confirm passphrase: ");
+            if p.as_str() != p2.as_str() {
+                return Err("passphrases don't match".into());
+            }
         }
-    }
-    if p.is_empty() {
-        return Err("empty passphrase".into());
+        p
+    };
+    // the whole vault sits under this one passphrase — floor it
+    if p.len() < 8 {
+        return Err("export passphrase must be ≥8 chars".into());
     }
     Ok(p)
 }
@@ -1442,25 +1492,40 @@ fn cmd_export(dir: &Path, rec: bool, path: &Path) -> Result<(), String> {
     let vault = unlock(dir, rec)?; // consumes $MPM_PASSWORD first
     let pw = export_passphrase(true)?;
     let mut recs = Vec::new();
+    let mut skipped = 0usize;
     for r in vault.records() {
-        let Some(kind) = r.kind else { continue };
+        let Some(kind) = r.kind else {
+            skipped += 1;
+            continue;
+        };
         let item = vault.item(&r.record_id).map_err(|e| e.to_string())?;
         recs.push(mpm_core::export::ExportRecord {
             kind,
             name: r.name.clone(),
-            fields: item.encode(),
+            fields: zeroize::Zeroizing::new(item.encode()),
         });
     }
     let blob = mpm_core::export::seal_export(&recs, pw.as_bytes()).map_err(|e| e.to_string())?;
     write_private_file(path, &blob)?;
-    eprintln!("exported {} records → {}", recs.len(), path.display());
+    eprint!("exported {} records → {}", recs.len(), path.display());
+    if skipped > 0 {
+        eprint!(" ({skipped} skipped: unknown kind)");
+    }
+    eprintln!();
     Ok(())
 }
 
 fn cmd_import(dir: &Path, rec: bool, path: &Path, csv: bool) -> Result<(), String> {
     let _lock = mpm_store::lock_vault(dir).map_err(|e| e.to_string())?;
     let mut vault = unlock(dir, rec)?;
-    let items: Vec<(ItemKind, String, mpm_core::Item)> = if csv {
+    const MAX_IMPORT: u64 = 64 << 20; // bound hostile files before alloc
+    let len = std::fs::metadata(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?
+        .len();
+    if len > MAX_IMPORT {
+        return Err(format!("{}: >64 MiB — refusing to import", path.display()));
+    }
+    let mut items: Vec<(ItemKind, String, mpm_core::Item)> = if csv {
         let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         csv_to_items(&raw)?
     } else {
@@ -1477,14 +1542,38 @@ fn cmd_import(dir: &Path, rec: bool, path: &Path, csv: bool) -> Result<(), Strin
             .collect::<Result<_, _>>()?
     };
 
+    // validate/canonicalize everything up front — finalize_totp inside the
+    // append loop would abort a HALF-applied import with no rollback
+    for (_, _, item) in &mut items {
+        finalize_totp(item)?;
+    }
+    if items.len() > 100_000 {
+        return Err(format!("{} items — absurd, refusing", items.len()));
+    }
+    refuse_if_torn(dir, &vault)?;
     let mut created = 0usize;
     let mut updated = 0usize;
+    // names minted in THIS batch — a second "Google" row must become
+    // "Google-2", not silently replace the first
+    let mut batch_names: std::collections::HashSet<String> = Default::default();
     for (kind, name, mut item) in items {
-        item.set(tag::NAME, name.as_bytes().to_vec());
-        finalize_totp(&mut item)?;
+        if batch_names.contains(&name) {
+            let mut n = 2;
+            while batch_names.contains(&format!("{name}-{n}")) {
+                n += 1;
+            }
+            batch_names.insert(format!("{name}-{n}"));
+            item.set(tag::NAME, format!("{name}-{n}").into_bytes());
+        } else {
+            batch_names.insert(name.clone());
+            item.set(tag::NAME, name.as_bytes().to_vec());
+        }
         // same name + same kind → replace; name taken by another kind →
         // find a free suffix rather than minting an ambiguous duplicate
-        let mut use_name = name.clone();
+        let mut use_name = item
+            .get_str(tag::NAME)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| name.clone());
         loop {
             let existing = vault
                 .records()
@@ -1492,6 +1581,10 @@ fn cmd_import(dir: &Path, rec: bool, path: &Path, csv: bool) -> Result<(), Strin
                 .map(|r| (r.record_id, r.kind));
             match existing {
                 Some((rid, Some(k))) if k == kind => {
+                    // NAME must be use_name, not the original — else the
+                    // update renames the suffixed record back onto the
+                    // conflicting name
+                    item.set(tag::NAME, use_name.as_bytes().to_vec());
                     let op = vault
                         .make_update(&rid, kind, item)
                         .map_err(|e| e.to_string())?;
@@ -1521,9 +1614,10 @@ fn cmd_import(dir: &Path, rec: bool, path: &Path, csv: bool) -> Result<(), Strin
 }
 
 /// Minimal RFC4180 reader: quoted fields, "" escapes, \r\n endings.
-/// Input is attacker-ish (a foreign app's export) — lenient, never panics.
-fn parse_csv(raw: &[u8]) -> Vec<Vec<String>> {
-    let s = String::from_utf8_lossy(raw);
+/// Input is attacker-ish (a foreign app's export) — strict UTF-8,
+/// unclosed quotes rejected, never panics.
+fn parse_csv(raw: &[u8]) -> Result<Vec<Vec<String>>, String> {
+    let s = std::str::from_utf8(raw).map_err(|_| "csv is not valid UTF-8".to_string())?;
     let mut rows = Vec::new();
     let mut row = Vec::new();
     let mut field = String::new();
@@ -1552,20 +1646,26 @@ fn parse_csv(raw: &[u8]) -> Vec<Vec<String>> {
             }
         }
     }
+    if in_q {
+        return Err("csv: unclosed quoted field".into());
+    }
     if !field.is_empty() || !row.is_empty() {
         row.push(field);
         rows.push(row);
     }
-    rows
+    Ok(rows)
 }
 
 /// Map Bitwarden/1Password-style CSV rows onto items. Header-driven;
 /// unmapped columns are ignored; rows without any usable data are skipped.
 fn csv_to_items(raw: &[u8]) -> Result<Vec<(ItemKind, String, mpm_core::Item)>, String> {
-    let rows = parse_csv(raw);
+    // UTF-8 BOM (Excel/Windows exports) would corrupt the first header
+    let raw = raw.strip_prefix(b"\xef\xbb\xbf").unwrap_or(raw);
+    let rows = parse_csv(raw)?;
     let Some(hdr) = rows.first() else {
         return Err("empty csv".into());
     };
+    let width = hdr.len();
     let col = |aliases: &[&str]| -> Option<usize> {
         hdr.iter()
             .position(|h| aliases.contains(&h.trim().to_lowercase().as_str()))
@@ -1584,9 +1684,21 @@ fn csv_to_items(raw: &[u8]) -> Result<Vec<(ItemKind, String, mpm_core::Item)>, S
 
     let mut out = Vec::new();
     for (i, row) in rows.iter().skip(1).enumerate() {
+        if row.iter().all(|c| c.is_empty()) {
+            continue; // blank line
+        }
+        if row.len() != width {
+            return Err(format!(
+                "csv: row {} has {} cells, header has {width}",
+                i + 1,
+                row.len()
+            ));
+        }
+        // data cells are NOT trimmed — a password may legitimately have
+        // leading/trailing whitespace; only emptiness is filtered
         let g = |c: Option<usize>| -> Option<&str> {
             c.and_then(|j| row.get(j))
-                .map(|s| s.trim())
+                .map(|s| s.as_str())
                 .filter(|s| !s.is_empty())
         };
         let ty = g(c_type).unwrap_or("").to_lowercase();
@@ -1618,10 +1730,14 @@ fn csv_to_items(raw: &[u8]) -> Result<Vec<(ItemKind, String, mpm_core::Item)>, S
         put(tag::CARD_HOLDER, g(c_chold));
         put(tag::CARD_EXP, g(c_cexp));
         put(tag::CARD_CVV, g(c_ccvv));
+        if item.fields.is_empty() {
+            continue; // row mapped to nothing — don't mint an empty Secret
+        }
         let name = g(c_name)
             .or(g(c_user))
             .or(g(c_url))
-            .map(|s| s.to_string())
+            .map(|s| s.chars().filter(|c| !c.is_control()).collect::<String>())
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("imported-{i}"));
         out.push((kind, name, item));
     }
@@ -1724,12 +1840,26 @@ fn cmd_restore(dir: &Path, src: &Path) -> Result<(), String> {
             }
         }
     }
-    // deliberate rollback: the stored checkpoint may be ahead of this
-    // snapshot — re-baseline AFTER the copy verifies (unlock re-saves it)
+    // Deliberate rollback: the stored checkpoint may be ahead of this
+    // snapshot. Clear it only around the verification — if the restore
+    // fails, put the old checkpoint back so the previous vault's
+    // rollback protection survives a bad/cancelled restore.
     let manifest = mpm_store::load_manifest(dir).map_err(|e| e.to_string())?;
+    let old_ckpt = mpm_store::read_checkpoint_raw(&manifest.vault_id).map_err(|e| e.to_string())?;
     mpm_store::clear_checkpoint(&manifest.vault_id).map_err(|e| e.to_string())?;
     eprintln!("restored {n} logs → {}; verifying…", dir.display());
-    let _vault = unlock(dir, false)?; // replay-verify; failures surface here
+    let vault = match unlock(dir, false) {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(b) = old_ckpt {
+                let _ = mpm_store::write_checkpoint_raw(&manifest.vault_id, &b);
+            }
+            return Err(format!(
+                "restore verify failed ({e}) — old checkpoint restored"
+            ));
+        }
+    };
+    save_checkpoint(&vault)?; // re-baseline to the restored head now
     eprintln!("restore verified — vault is live");
     Ok(())
 }
@@ -1894,7 +2024,7 @@ mod tests {
 
     #[test]
     fn csv_quotes_and_commas() {
-        let rows = parse_csv(b"a,\"b,c\",d\r\n1,2,3\nlast,,\"x\"\"y\"");
+        let rows = parse_csv(b"a,\"b,c\",d\r\n1,2,3\nlast,,\"x\"\"y\"").unwrap();
         assert_eq!(rows[0], vec!["a", "b,c", "d"]);
         assert_eq!(rows[1], vec!["1", "2", "3"]);
         assert_eq!(rows[2], vec!["last", "", "x\"y"]);

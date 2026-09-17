@@ -300,6 +300,34 @@ pub fn save_checkpoint(
     Ok(())
 }
 
+/// Raw checkpoint bytes — used by `restore` to put the OLD checkpoint
+/// back if the restored vault fails verification (a failed restore must
+/// not erase the rollback protection of the vault it replaces).
+pub fn read_checkpoint_raw(vault_id: &[u8; 16]) -> Result<Option<Vec<u8>>> {
+    match fs::read(ckpt_path(vault_id)?) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Write raw checkpoint bytes back (restore-failure path only — normal
+/// writes go through the device-signed `save_checkpoint`).
+pub fn write_checkpoint_raw(vault_id: &[u8; 16], buf: &[u8]) -> Result<()> {
+    let dir = device_dir()?;
+    private_dirs().create(&dir)?;
+    let path = ckpt_path(vault_id)?;
+    let tmp = path.with_extension(format!("{}.r.tmp", std::process::id()));
+    {
+        let mut f = private_files().create_new(true).open(&tmp)?;
+        f.write_all(buf)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    set_private_file(&path)?;
+    Ok(())
+}
+
 /// Remove the stored checkpoint for a vault — used ONLY by `restore`,
 /// which is a deliberate, user-invoked rollback. After the restored vault
 /// verifies, the next unlock re-baselines the checkpoint to its head.

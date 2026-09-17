@@ -26,7 +26,7 @@ const T_FIELDS: u8 = 0x03;
 pub struct ExportRecord {
     pub kind: ItemKind,
     pub name: String,
-    pub fields: Vec<u8>, // Item::encode() output
+    pub fields: Zeroizing<Vec<u8>>, // Item::encode() output
 }
 
 /// Seal `records` under `passphrase`. Returns the portable blob.
@@ -117,7 +117,7 @@ pub fn open_export(blob: &[u8], passphrase: &[u8]) -> Result<Vec<ExportRecord>> 
                             .to_owned(),
                     )
                 }
-                T_FIELDS => fields = Some(iv.to_vec()),
+                T_FIELDS => fields = Some(Zeroizing::new(iv.to_vec())),
                 _ => {}
             }
         }
@@ -145,7 +145,7 @@ mod tests {
         ExportRecord {
             kind: ItemKind::Login,
             name: name.into(),
-            fields: it.encode(),
+            fields: Zeroizing::new(it.encode()),
         }
     }
 

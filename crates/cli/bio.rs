@@ -27,7 +27,9 @@ use objc2::runtime::Bool;
 use objc2_foundation::{NSError, NSString};
 use objc2_local_authentication::{LAContext, LAPolicy};
 use security_framework_sys::item::*;
-use security_framework_sys::keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete};
+use security_framework_sys::keychain_item::{
+    SecItemAdd, SecItemCopyMatching, SecItemDelete, SecItemUpdate,
+};
 use std::ptr;
 use zeroize::Zeroizing;
 
@@ -91,20 +93,32 @@ fn authenticate() -> bool {
     rx.recv().unwrap_or(false)
 }
 
-/// Store `key` (the KEK) as a plain keychain item.
+/// Store `key` (the KEK) as a plain keychain item. Add-or-update in place:
+/// a delete+add would leave the item absent if the add failed, breaking
+/// an existing biometric slot on re-enroll.
 pub fn enroll(vault_id: &[u8; 16], key: &[u8; BIO_KEY_LEN]) -> Result<(), String> {
-    remove(vault_id); // idempotent re-enroll
     let mut d = query(vault_id);
     d.set(k!(kSecValueData), CFData::from_buffer(key).as_CFType());
     d.set(
         k!(kSecAttrLabel),
         CFString::new("mypassman vault key (Touch ID-gated)").as_CFType(),
     );
-    let status = unsafe { SecItemAdd(d.as_concrete_TypeRef(), ptr::null_mut()) };
+    let mut status = unsafe { SecItemAdd(d.as_concrete_TypeRef(), ptr::null_mut()) };
+    if status == -25299 {
+        // errSecDuplicateItem → update the existing item's value
+        let mut upd: Dict = CFMutableDictionary::new();
+        upd.set(k!(kSecValueData), CFData::from_buffer(key).as_CFType());
+        status = unsafe {
+            SecItemUpdate(
+                query(vault_id).as_concrete_TypeRef(),
+                upd.as_concrete_TypeRef(),
+            )
+        };
+    }
     if status == 0 {
         Ok(())
     } else {
-        Err(format!("SecItemAdd: errSec {status}"))
+        Err(format!("keychain write: errSec {status}"))
     }
 }
 

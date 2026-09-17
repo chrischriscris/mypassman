@@ -74,9 +74,10 @@ fn hotp(secret: &[u8], counter: u64, digits: u32, algo: TotpAlgo) -> u32 {
         }
     };
     let off = (mac[mac.len() - 1] & 0x0f) as usize;
-    let code = (u32::from_be_bytes([mac[off] & 0x7f, mac[off + 1], mac[off + 2], mac[off + 3]]))
-        % 10u32.pow(digits);
-    // mac is a derived secret — zeroize before drop
+    let code = (u32::from_be_bytes([mac[off] & 0x7f, mac[off + 1], mac[off + 2], mac[off + 3]])
+        as u64
+        % 10u64.pow(digits)) as u32; // digits ≤ 10 → u64 modulus can't overflow
+                                     // mac is a derived secret — zeroize before drop
     let mut mac = mac;
     zeroize::Zeroize::zeroize(&mut mac);
     code
@@ -86,7 +87,7 @@ fn hotp(secret: &[u8], counter: u64, digits: u32, algo: TotpAlgo) -> u32 {
 /// seconds until rollover).
 pub fn totp(secret: &[u8], time: u64, period: u64, digits: u32, algo: TotpAlgo) -> (String, u64) {
     let period = if period == 0 { 30 } else { period };
-    let digits = if digits == 0 { 6 } else { digits };
+    let digits = if digits == 0 { 6 } else { digits.min(10) };
     let counter = time / period;
     let code = hotp(secret, counter, digits, algo);
     (
@@ -123,14 +124,24 @@ pub fn parse_otpauth(uri: &str) -> Result<OtpAuth> {
         match k {
             "secret" => secret = Some(base32_decode(&pct_decode(v))?),
             "issuer" => issuer = pct_decode(v),
-            "digits" => digits = v.parse().unwrap_or(6),
-            "period" => period = v.parse().unwrap_or(30),
+            "digits" => digits = v.parse().map_err(|_| CoreError::Tlv("bad digits"))?,
+            "period" => period = v.parse().map_err(|_| CoreError::Tlv("bad period"))?,
             "algorithm" => algo = TotpAlgo::from_name(v)?,
             _ => {}
         }
     }
+    if !(1..=10).contains(&digits) {
+        return Err(CoreError::Tlv("digits out of range (1-10)"));
+    }
+    if !(1..=86400).contains(&period) {
+        return Err(CoreError::Tlv("period out of range"));
+    }
+    let secret = secret.ok_or(CoreError::Tlv("otpauth missing secret"))?;
+    if secret.is_empty() {
+        return Err(CoreError::Tlv("otpauth empty secret"));
+    }
     Ok(OtpAuth {
-        secret: secret.ok_or(CoreError::Tlv("otpauth missing secret"))?,
+        secret,
         issuer,
         label: pct_decode(label),
         digits,
@@ -140,13 +151,17 @@ pub fn parse_otpauth(uri: &str) -> Result<OtpAuth> {
 }
 
 fn pct_decode(s: &str) -> String {
-    let mut out = Vec::with_capacity(s.len());
+    // decode %XY from BYTES — slicing a str at byte offsets panics inside
+    // multibyte chars (e.g. "%€" in an otpauth label)
     let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
+            let h = (b[i + 1] as char).to_digit(16);
+            let l = (b[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (h, l) {
+                out.push((h * 16 + l) as u8);
                 i += 3;
                 continue;
             }
