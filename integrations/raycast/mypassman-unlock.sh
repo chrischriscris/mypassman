@@ -16,8 +16,8 @@ if MPM_NO_BIO=1 "$BIN" list >/dev/null 2>&1; then
     exit 0
 fi
 
-# daemon runs until idle TTL or `mpm lock` — detach so Raycast doesn't wait
-MPM_IDLE_TTL="${MPM_IDLE_TTL:-3600}" nohup "$BIN" daemon >/dev/null 2>&1 &
+# daemon runs until idle TTL (900s default) or `mpm lock` — detach so Raycast doesn't wait
+nohup "$BIN" daemon >/dev/null 2>&1 &
 sleep 0.5
 if MPM_NO_BIO=1 "$BIN" list >/dev/null 2>&1; then
     echo "unlock prompt sent — Touch ID if enrolled"
