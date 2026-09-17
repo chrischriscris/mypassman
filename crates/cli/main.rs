@@ -121,12 +121,16 @@ enum Cmd {
     /// The export passphrase is prompted (or $MPM_EXPORT_PASSWORD).
     Export { path: PathBuf },
     /// Import items. Default: an MPMEXP sealed export; --csv reads a
-    /// Bitwarden/1Password-style CSV export (login/card/note rows).
+    /// Bitwarden/1Password-style CSV export (login/card/note rows);
+    /// --otpauth reads plaintext otpauth:// URI lists (Ente, Aegis, 2FAS).
     Import {
         path: PathBuf,
         /// treat input as CSV instead of MPMEXP
         #[arg(long)]
         csv: bool,
+        /// treat input as newline/comma-separated otpauth:// URIs
+        #[arg(long)]
+        otpauth: bool,
         /// show what would happen — writes nothing, no unlock needed for CSV
         #[arg(long)]
         dry_run: bool,
@@ -1550,23 +1554,52 @@ fn cmd_export(dir: &Path, rec: bool, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_import(dir: &Path, rec: bool, path: &Path, csv: bool, dry_run: bool) -> Result<(), String> {
+/// Parse an import file into items, from any of the three formats.
+/// otpauth is auto-detected too — a plaintext URI list needs no flag.
+fn load_import_items(
+    path: &Path,
+    csv: bool,
+    otpauth: bool,
+) -> Result<Vec<(ItemKind, String, mpm_core::Item)>, String> {
+    if csv && otpauth {
+        return Err("--csv and --otpauth are mutually exclusive".into());
+    }
+    const MAX_IMPORT: u64 = 64 << 20; // bound hostile files before alloc
+    let len = std::fs::metadata(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?
+        .len();
+    if len > MAX_IMPORT {
+        return Err(format!("{}: >64 MiB — refusing to import", path.display()));
+    }
+    let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if otpauth || (!csv && raw.trim_ascii_start().starts_with(b"otpauth://")) {
+        return otpauth_to_items(&raw);
+    }
+    if csv {
+        return csv_to_items(&raw);
+    }
+    let pw = export_passphrase(false)?;
+    let recs = mpm_core::export::open_export(&raw, pw.as_bytes()).map_err(|e| e.to_string())?;
+    recs.iter()
+        .map(|r| {
+            Item::decode(&r.fields)
+                .map(|it| (r.kind, r.name.clone(), it))
+                .map_err(|e| e.to_string())
+        })
+        .collect()
+}
+
+fn cmd_import(
+    dir: &Path,
+    rec: bool,
+    path: &Path,
+    csv: bool,
+    otpauth: bool,
+    dry_run: bool,
+) -> Result<(), String> {
     if dry_run {
         // parse + simulate collisions, never touch the vault or keys
-        let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let items = if csv {
-            csv_to_items(&raw)?
-        } else {
-            let pw = export_passphrase(false)?;
-            let recs =
-                mpm_core::export::open_export(&raw, pw.as_bytes()).map_err(|e| e.to_string())?;
-            recs.iter()
-                .map(|r| Item::decode(&r.fields).map(|it| (r.kind, r.name.clone(), it)))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?
-        };
-        let manifest = mpm_store::load_manifest(dir).map_err(|e| e.to_string())?;
-        let _ = manifest;
+        let items = load_import_items(path, csv, otpauth)?;
         println!("would import {} items:", items.len());
         let mut kinds: std::collections::BTreeMap<&str, usize> = Default::default();
         for (k, _, _) in &items {
@@ -1579,29 +1612,7 @@ fn cmd_import(dir: &Path, rec: bool, path: &Path, csv: bool, dry_run: bool) -> R
     }
     let _lock = mpm_store::lock_vault(dir).map_err(|e| e.to_string())?;
     let mut vault = unlock(dir, rec)?;
-    const MAX_IMPORT: u64 = 64 << 20; // bound hostile files before alloc
-    let len = std::fs::metadata(path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?
-        .len();
-    if len > MAX_IMPORT {
-        return Err(format!("{}: >64 MiB — refusing to import", path.display()));
-    }
-    let mut items: Vec<(ItemKind, String, mpm_core::Item)> = if csv {
-        let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        csv_to_items(&raw)?
-    } else {
-        let blob = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let pw = export_passphrase(false)?;
-        let recs =
-            mpm_core::export::open_export(&blob, pw.as_bytes()).map_err(|e| e.to_string())?;
-        recs.iter()
-            .map(|r| {
-                Item::decode(&r.fields)
-                    .map(|it| (r.kind, r.name.clone(), it))
-                    .map_err(|e| e.to_string())
-            })
-            .collect::<Result<_, _>>()?
-    };
+    let mut items = load_import_items(path, csv, otpauth)?;
 
     // validate/canonicalize everything up front — finalize_totp inside the
     // append loop would abort a HALF-applied import with no rollback
@@ -1715,6 +1726,60 @@ fn parse_csv(raw: &[u8]) -> Result<Vec<Vec<String>>, String> {
         rows.push(row);
     }
     Ok(rows)
+}
+
+/// Plaintext otpauth export (Ente, Aegis, 2FAS, Google takeout): URIs
+/// separated by newlines, commas, or whitespace. We split at each
+/// `otpauth://` marker and end a URI at the next separator — URI params
+/// can only contain percent-encoded specials, never raw separators.
+fn otpauth_to_items(raw: &[u8]) -> Result<Vec<(ItemKind, String, mpm_core::Item)>, String> {
+    let text = std::str::from_utf8(raw).map_err(|_| "otpauth file isn't UTF-8")?;
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("otpauth://") {
+        rest = &rest[start..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == ',')
+            .unwrap_or(rest.len());
+        let uri = &rest[..end];
+        rest = &rest[end..];
+        let oa = match mpm_core::totp::parse_otpauth(uri) {
+            Ok(o) => o,
+            // hotp:// and malformed lines warn+skip rather than abort the batch
+            Err(e) => {
+                eprintln!("warning: skipping otpauth entry {}: {e}", out.len() + 1);
+                continue;
+            }
+        };
+        let mut item = mpm_core::Item::default();
+        item.set(tag::TOTP_SECRET, b32_encode(&oa.secret).into_bytes());
+        item.set(tag::TOTP_DIGITS, oa.digits.to_string().into_bytes());
+        item.set(tag::TOTP_PERIOD, oa.period.to_string().into_bytes());
+        item.set(
+            tag::TOTP_ALGO,
+            format!("{:?}", oa.algo).to_uppercase().into_bytes(),
+        );
+        if !oa.issuer.is_empty() {
+            item.set(tag::TOTP_ISSUER, oa.issuer.clone().into_bytes());
+        }
+        // label is usually "Issuer:account" already — else issuer, else acct
+        let name = if !oa.label.is_empty() {
+            oa.label.clone()
+        } else if !oa.issuer.is_empty() {
+            oa.issuer.clone()
+        } else {
+            format!("totp-{}", out.len() + 1)
+        };
+        let name: String = name.chars().filter(|c| !c.is_control()).collect();
+        if name.is_empty() {
+            continue;
+        }
+        out.push((ItemKind::Totp, name, item));
+    }
+    if out.is_empty() {
+        return Err("no otpauth:// URIs found".into());
+    }
+    Ok(out)
 }
 
 /// Map Bitwarden/1Password-style CSV rows onto items. Header-driven;
@@ -2076,7 +2141,12 @@ fn main() {
         Cmd::Run { inject, cmd } => cmd_run(&dir, rec, inject, cmd),
         Cmd::Clipclear => cmd_clipclear(),
         Cmd::Export { path } => cmd_export(&dir, rec, path),
-        Cmd::Import { path, csv, dry_run } => cmd_import(&dir, rec, path, *csv, *dry_run),
+        Cmd::Import {
+            path,
+            csv,
+            otpauth,
+            dry_run,
+        } => cmd_import(&dir, rec, path, *csv, *otpauth, *dry_run),
         Cmd::Backup { dest } => cmd_backup(&dir, rec, dest),
         Cmd::Restore { src } => cmd_restore(&dir, src),
         Cmd::Daemon { idle_ttl } => cmd_daemon(&dir, rec, *idle_ttl),
