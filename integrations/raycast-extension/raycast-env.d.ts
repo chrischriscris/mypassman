@@ -9,7 +9,9 @@
 
 type ExtensionPreferences = {
   /** mypassman Binary Path - Path to the mypassman binary (~ is expanded) */
-  "binaryPath": string
+  "binaryPath": string,
+  /** Site Icons - Fetches each item's domain icon from a third-party favicon service (api.ray.so). Disable to keep vault domains fully local. */
+  "siteIcons": boolean
 }
 
 /** Preferences accessible in all the extension's commands */

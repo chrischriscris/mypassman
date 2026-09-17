@@ -14,6 +14,15 @@
       "required": false,
       "default": "~/.local/bin/mypassman",
       "placeholder": "~/.local/bin/mypassman"
+    },
+    {
+      "name": "siteIcons",
+      "title": "Site Icons",
+      "label": "Show favicons for items with a URL",
+      "description": "Fetches each item's domain icon from a third-party favicon service (api.ray.so). Disable to keep vault domains fully local.",
+      "type": "checkbox",
+      "required": false,
+      "default": true
     }
   ],
   "commands": [

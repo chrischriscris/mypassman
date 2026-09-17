@@ -3,6 +3,7 @@ import {
   ActionPanel,
   Color,
   Icon,
+  Image,
   List,
   LocalStorage,
   Toast,
@@ -13,14 +14,15 @@ import {
   showHUD,
   showToast,
 } from "@raycast/api";
-import { useExec } from "@raycast/utils";
+import { getFavicon, useExec } from "@raycast/utils";
 import { execFile, spawn } from "child_process";
 import { homedir } from "os";
 import { promisify } from "util";
 import { useEffect, useState } from "react";
 
-const prefs = getPreferenceValues<{ binaryPath?: string }>();
+const prefs = getPreferenceValues<{ binaryPath?: string; siteIcons?: boolean }>();
 const MPM = (prefs.binaryPath || "~/.local/bin/mypassman").replace(/^~/, homedir());
+const SITE_ICONS = prefs.siteIcons !== false;
 
 // MPM_NO_BIO: the LAContext Touch ID sheet steals focus and closes the
 // Raycast window — so interactive calls must NEVER trigger it. A locked
@@ -38,15 +40,40 @@ interface VaultItem {
   meta: Record<string, string>;
 }
 
-const KIND_ICON: Record<string, Icon> = {
-  login: Icon.Globe,
-  card: Icon.CreditCard,
-  secret: Icon.Lock,
-  apikey: Icon.Terminal,
-  totp: Icon.Clock,
-  identity: Icon.Person,
-  sshkey: Icon.Key,
+// Kind → tinted icon — rendered inside a rounded tile (the Passwords-app
+// look) wherever an item has no favicon
+const KIND_STYLE: Record<string, { icon: Icon; color: Color.ColorLike }> = {
+  login: { icon: Icon.Globe, color: Color.Blue },
+  card: { icon: Icon.CreditCard, color: Color.Orange },
+  secret: { icon: Icon.Lock, color: Color.Red },
+  apikey: { icon: Icon.Terminal, color: Color.Purple },
+  totp: { icon: Icon.Clock, color: Color.Green },
+  identity: { icon: Icon.PersonCircle, color: Color.Yellow },
+  sshkey: { icon: Icon.Fingerprint, color: Color.Magenta },
 };
+const kindIcon = (kind: string): Image.ImageLike => {
+  const s = KIND_STYLE[kind] ?? { icon: Icon.Key, color: Color.SecondaryText };
+  return { source: s.icon, tintColor: s.color, mask: Image.Mask.RoundedRectangle };
+};
+
+// Favicon of the item's URL, falling back to the tinted kind tile. The
+// fetch goes to a third-party icon service — `siteIcons` preference opts
+// out (vault domains then never leave the machine).
+function itemIcon(item: VaultItem): Image.ImageLike {
+  const fb = kindIcon(item.kind);
+  const url = item.meta.url;
+  if (!SITE_ICONS || !url) return fb;
+  const target = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+  try {
+    // Image.Fallback only takes a bare Icon — the kind glyph untinted
+    return getFavicon(target, {
+      mask: Image.Mask.RoundedRectangle,
+      fallback: (KIND_STYLE[item.kind] ?? { icon: Icon.Key }).icon,
+    });
+  } catch {
+    return fb;
+  }
+}
 
 const FIELD_LABEL: Record<string, string> = {
   password: "Password",
@@ -119,17 +146,30 @@ function totpLeft(item: VaultItem, now: number): number | null {
 
 const hasTotp = (item: VaultItem) => item.fields.includes("totp_secret");
 
+// display order for non-secret meta — the fields a reader looks for first
+const META_ORDER = ["username", "url", "issuer", "holder", "email", "full_name", "endpoint", "env"];
+
 function detail(item: VaultItem) {
   const secretNames = item.fields.filter((f) => !(f in item.meta));
+  const metaEntries = Object.entries(item.meta).sort(([a], [b]) => {
+    const ia = META_ORDER.indexOf(a);
+    const ib = META_ORDER.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.localeCompare(b);
+  });
+  const sub = subtitle(item);
+  const url = item.meta.url ? (/^https?:\/\//i.test(item.meta.url) ? item.meta.url : `https://${item.meta.url}`) : "";
+  const markdown = [
+    `## ${item.name}`,
+    [sub, hostname(item.meta.url), item.kind].filter(Boolean).join("  ·  "),
+  ].join("\n\n");
   return (
     <List.Item.Detail
+      markdown={markdown}
       metadata={
         <List.Item.Detail.Metadata>
-          <List.Item.Detail.Metadata.Label title="Name" text={item.name} />
-          <List.Item.Detail.Metadata.Label title="Kind" text={item.kind || "item"} />
-          {Object.entries(item.meta).map(([k, v]) =>
+          {metaEntries.map(([k, v]) =>
             k === "url" ? (
-              <List.Item.Detail.Metadata.Link key={k} title="URL" text={v} target={v} />
+              <List.Item.Detail.Metadata.Link key={k} title="URL" text={v} target={url} />
             ) : (
               <List.Item.Detail.Metadata.Label key={k} title={label(k)} text={v} />
             ),
@@ -511,7 +551,7 @@ export default function Command() {
     return (
       <List.Item
         key={item.id}
-        icon={KIND_ICON[item.kind] ?? Icon.Key}
+        icon={itemIcon(item)}
         title={item.name}
         subtitle={subtitle(item)}
         keywords={[item.name, subtitle(item), hostname(item.meta.url), item.meta.issuer ?? "", item.kind]}
@@ -535,15 +575,15 @@ export default function Command() {
       searchBarPlaceholder="Search vault — name, username, domain…"
       searchBarAccessory={
         <List.Dropdown tooltip="Filter by kind" value={kindFilter} onChange={setKindFilter}>
-          <List.Dropdown.Item title="All kinds" value="all" />
+          <List.Dropdown.Item title="All kinds" value="all" icon={kindIcon("")} />
           {KINDS.map((k) => (
-            <List.Dropdown.Item key={k} title={k} value={k} />
+            <List.Dropdown.Item key={k} title={k} value={k} icon={kindIcon(k)} />
           ))}
         </List.Dropdown>
       }
     >
       <List.EmptyView
-        icon={Icon.Key}
+        icon={kindIcon(kindFilter)}
         title={kindFilter === "all" ? "Vault is empty" : `No ${kindFilter} items`}
         description="Add items with `mypassman add` or `import --csv` / `--otpauth`"
         actions={
@@ -553,8 +593,10 @@ export default function Command() {
           </ActionPanel>
         }
       />
-      {recent.length > 0 && <List.Section title="Recent">{recent.map(row)}</List.Section>}
-      <List.Section title={recent.length > 0 ? "All Items" : undefined}>{items.map(row)}</List.Section>
+      {recent.length > 0 && <List.Section title="Recent" subtitle={`${recent.length}`}>{recent.map(row)}</List.Section>}
+      <List.Section title="All" subtitle={`${items.length} item${items.length === 1 ? "" : "s"}`}>
+        {items.map(row)}
+      </List.Section>
     </List>
   );
 }
