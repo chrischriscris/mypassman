@@ -100,7 +100,9 @@ pub fn type_seq(parts: &[&str]) -> Result<(), String> {
     for (i, part) in parts.iter().enumerate() {
         if i > 0 {
             post_key(K_VK_TAB, false, &[])?;
-            std::thread::sleep(std::time::Duration::from_millis(30));
+            // JS-heavy forms re-render on Tab — give the next field a beat
+            // before its input starts arriving
+            std::thread::sleep(std::time::Duration::from_millis(80));
         }
         type_chars(part)?;
     }

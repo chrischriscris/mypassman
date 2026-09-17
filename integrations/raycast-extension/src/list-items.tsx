@@ -144,6 +144,21 @@ function detail(item: VaultItem) {
   );
 }
 
+// closeMainWindow resolves before macOS finishes moving focus back to the
+// target app — firing ⌘V/keystrokes during that gap loses the fill. Poll
+// until Raycast is no longer frontmost (bounded, in case it never leaves).
+async function waitForFocus() {
+  for (let i = 0; i < 50; i++) {
+    try {
+      const app = await getFrontmostApplication();
+      if (app.bundleId !== "com.raycast.macos" && app.name !== "Raycast") return;
+    } catch {
+      return; // can't determine — don't stall the fill
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
 // Every secret hand-off shells back to the CLI — the value goes straight
 // from the daemon to the pasteboard/frontmost app and never enters this
 // process. `closeMainWindow` first so focus returns to the target app
@@ -160,6 +175,7 @@ async function fill(item: VaultItem, fields: string[], mode: "paste" | "type", o
     t.hide();
   }
   await closeMainWindow({ clearRootSearch: true });
+  await waitForFocus();
   try {
     const args = otp
       ? ["otp", item.id, `--${mode}`]
@@ -257,11 +273,9 @@ function RowActions({
   const loginPair = item.fields.includes("username") && item.fields.includes("password");
   const primaryAction = isTotp
     ? { title: `Paste Code into ${appName}`, run: () => fill(item, [], "paste", true) }
-    : item.kind === "login" && loginPair
-      ? { title: `Fill Login into ${appName}`, run: () => fill(item, ["username", "password"], "type", false) }
-      : primary
-        ? { title: `Paste ${label(primary)} into ${appName}`, run: () => fill(item, [primary], "paste", false) }
-        : null;
+    : primary
+      ? { title: `Paste ${label(primary)} into ${appName}`, run: () => fill(item, [primary], "paste", false) }
+      : null;
 
   const copyable = item.fields.filter((f) => !NO_COPY.has(f));
   return (
@@ -276,6 +290,16 @@ function RowActions({
             icon={Icon.Keyboard}
             shortcut={{ modifiers: ["opt"], key: "t" }}
             onAction={() => fill(item, [primary], "type", false)}
+          />
+        )}
+        {/* u⇥p typed fill is opt-in — Tab navigation fails on some forms and
+            would concatenate the password into the username field */}
+        {item.kind === "login" && loginPair && (
+          <Action
+            title={`Fill Username + Password into ${appName}`}
+            icon={Icon.Keyboard}
+            shortcut={{ modifiers: ["opt", "shift"], key: "t" }}
+            onAction={() => fill(item, ["username", "password"], "type", false)}
           />
         )}
         {!isTotp && hasTotp(item) && (

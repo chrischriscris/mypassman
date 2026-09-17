@@ -27,13 +27,14 @@ extension's preferences ("mypassman Binary Path") if yours lives elsewhere.
 - **Detail panel** (⌘D to toggle) — all non-secret metadata; secret fields
   listed as `••••••••` so you see what's there without the value
 - **Kind filter** — dropdown in the search bar
-- **Enter** — fills into the frontmost app:
-  - login with user+pass → **Fill Login** (types `username⇥password`)
-  - totp → **Paste Code** (waits for a fresh code if <5s remain)
-  - card/apikey/secret/sshkey/identity → pastes the primary field
-  - If the primary field is missing, the next available field is offered
-    instead — actions only appear for fields that actually exist
+- **Enter** — pastes the primary field into the frontmost app (password /
+  code / card number / key…). Waits for a fresh TOTP code if <5s remain.
+  If the primary field is missing the next available field is offered —
+  actions only appear for fields that actually exist
 - **⌥T** — type the primary field (zero clipboard)
+- **⌥⇧T** — *Fill Username + Password*: types `username⇥password` on
+  logins. Deliberately opt-in — Tab navigation fails on some forms and
+  would concatenate the password into the username field
 - **⌥O** — paste TOTP code (logins carrying 2FA)
 - **Clipboard section** — `Copy {field}` for every field present, all
   concealed + auto-clear (`⌘P` password, `⌘U` username, `⌘O` TOTP code)
@@ -62,6 +63,8 @@ extension's preferences ("mypassman Binary Path") if yours lives elsewhere.
   ("post event") access for the app launching the CLI — Raycast, in this
   case. First use prompts once; if pastes silently no-op, check System
   Settings → Privacy & Security → Accessibility → Raycast
-- Focus lands wherever your cursor was — the CLI waits `MPM_FILL_DELAY_MS`
-  (default 200ms) for the target app to refocus after the window closes
+- Focus lands wherever your cursor was — the extension polls
+  `getFrontmostApplication` until Raycast yields focus before spawning the
+  fill, and the CLI additionally waits `MPM_FILL_DELAY_MS` (default 200ms)
+  before posting events
 - The daemon idle timeout is the built-in default: 900s
