@@ -66,7 +66,12 @@ async function copyField(item: VaultItem, field: string, otp: boolean) {
 // Poll list until the daemon answers (or give up after ~30s).
 async function unlockVault(revalidate: () => void) {
   const toast = await showToast({ style: Toast.Style.Animated, title: "Unlocking — Touch ID" });
-  spawn(MPM, ["daemon"], { detached: true, stdio: "ignore" }).unref();
+  // 1h idle TTL matches the script commands' Unlock Vault
+  spawn(MPM, ["daemon"], {
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env, MPM_IDLE_TTL: "3600" },
+  }).unref();
   for (let i = 0; i < 40; i++) {
     await new Promise((r) => setTimeout(r, 750));
     try {
