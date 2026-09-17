@@ -2,6 +2,7 @@ import {
   Action,
   ActionPanel,
   Color,
+  Form,
   Icon,
   Image,
   List,
@@ -13,9 +14,10 @@ import {
   open,
   showHUD,
   showToast,
+  useNavigation,
 } from "@raycast/api";
 import { getFavicon, useExec } from "@raycast/utils";
-import { execFile, spawn } from "child_process";
+import { ChildProcess, execFile, spawn } from "child_process";
 import { homedir } from "os";
 import { promisify } from "util";
 import { useEffect, useState } from "react";
@@ -326,33 +328,102 @@ async function bumpRecent(id: string) {
   }
 }
 
-// Start the daemon detached — with `bio enroll` done this pops Touch ID.
-// Poll list until the daemon answers (or give up after ~30s).
-async function unlockVault(revalidate: () => void) {
-  const toast = await showToast({ style: Toast.Style.Animated, title: "Unlocking — Touch ID" });
-  // no MPM_IDLE_TTL override — daemon's built-in default is 900s
-  spawn(MPM, ["daemon"], { detached: true, stdio: "ignore" }).unref();
+// Poll until the freshly-spawned daemon answers LIST — an early process
+// exit means auth was rejected (wrong password / cancelled Touch ID).
+async function awaitDaemon(child: ChildProcess): Promise<"ok" | "denied" | "timeout"> {
+  let died = false;
+  child.on("exit", () => {
+    died = true;
+  });
   for (let i = 0; i < 40; i++) {
+    if (died) return "denied";
     await new Promise((r) => setTimeout(r, 750));
     try {
       await run(["list", "--json"]);
-      toast.style = Toast.Style.Success;
-      toast.title = "Vault unlocked";
-      revalidate();
-      try {
-        // land the user back in the list if the window hid behind the prompt
-        await open("raycast://extensions/chus/mypassman/list-items");
-      } catch {
-        // deeplink best-effort — the HUD still confirms unlock
-      }
-      return;
+      return "ok";
     } catch {
       // still locked — keep polling
     }
   }
+  return died ? "denied" : "timeout";
+}
+
+// Start the daemon detached — with `bio enroll` done this pops Touch ID.
+async function unlockVault(revalidate: () => void) {
+  const toast = await showToast({ style: Toast.Style.Animated, title: "Unlocking — Touch ID" });
+  // no MPM_IDLE_TTL override — daemon's built-in default is 900s
+  const child = spawn(MPM, ["daemon"], { detached: true, stdio: "ignore" });
+  child.unref();
+  const res = await awaitDaemon(child);
+  if (res === "ok") {
+    toast.style = Toast.Style.Success;
+    toast.title = "Vault unlocked";
+    revalidate();
+    try {
+      // land the user back in the list if the window hid behind the prompt
+      await open("raycast://extensions/chus/mypassman/list-items");
+    } catch {
+      // deeplink best-effort — the HUD still confirms unlock
+    }
+    return;
+  }
   toast.style = Toast.Style.Failure;
-  toast.title = "Still locked";
+  toast.title = res === "denied" ? "Unlock cancelled" : "Still locked";
   toast.message = "Run `mypassman daemon` in a terminal to unlock with your password";
+}
+
+// In-window unlock: the password is piped to the daemon's stdin — never
+// argv/env/disk. MPM_NO_BIO forces the password path so no Touch ID sheet
+// steals focus. Same tradeoff Bitwarden/1Password extensions make: the
+// string lives in JS memory until GC — it is never persisted.
+function PasswordUnlock({ onUnlocked }: { onUnlocked: () => void }) {
+  const { pop } = useNavigation();
+  const [error, setError] = useState<string>();
+  const [busy, setBusy] = useState(false);
+  return (
+    <Form
+      isLoading={busy}
+      navigationTitle="Unlock Vault"
+      actions={
+        <ActionPanel>
+          <Action.SubmitForm
+            title="Unlock"
+            onSubmit={async ({ password }: { password: string }) => {
+              if (!password) {
+                setError("Enter your vault password");
+                return;
+              }
+              setBusy(true);
+              setError(undefined);
+              // strip a stray inherited MPM_PASSWORD — the daemon would
+              // prefer it over our stdin pipe
+              const env: NodeJS.ProcessEnv = { ...process.env, MPM_NO_BIO: "1" };
+              delete env.MPM_PASSWORD;
+              const child = spawn(MPM, ["daemon"], {
+                detached: true,
+                stdio: ["pipe", "ignore", "ignore"],
+                env,
+              });
+              child.stdin?.write(password + "\n");
+              child.stdin?.end();
+              child.unref();
+              const res = await awaitDaemon(child);
+              setBusy(false);
+              if (res === "ok") {
+                pop();
+                onUnlocked();
+              } else {
+                setError(res === "denied" ? "Wrong password" : "Daemon didn't answer — try again");
+              }
+            }}
+          />
+        </ActionPanel>
+      }
+    >
+      <Form.PasswordField id="password" title="Vault Password" error={error} autoFocus />
+      <Form.Description text="Piped to the daemon's stdin — never stored, never on argv or in the environment. The Touch ID action uses the system prompt instead (Raycast hides while macOS shows it)." />
+    </Form>
+  );
 }
 
 async function lockVault(revalidate: () => void) {
@@ -523,7 +594,7 @@ export default function Command() {
           }
           description={
             locked
-              ? "Unlock with Touch ID — Raycast will hide while macOS prompts you; reopen with your hotkey."
+              ? "Unlock with Touch ID (system prompt — Raycast hides) or type your password in-window."
               : missing
                 ? "Point the binaryPath preference at your mypassman build."
                 : msg
@@ -531,7 +602,14 @@ export default function Command() {
           actions={
             <ActionPanel>
               {locked ? (
-                <Action title="Unlock Vault (Touch ID)" icon={Icon.LockUnlocked} onAction={() => unlockVault(revalidate)} />
+                <>
+                  <Action title="Unlock Vault (Touch ID)" icon={Icon.LockUnlocked} onAction={() => unlockVault(revalidate)} />
+                  <Action.Push
+                    title="Unlock with Password"
+                    icon={Icon.Keyboard}
+                    target={<PasswordUnlock onUnlocked={revalidate} />}
+                  />
+                </>
               ) : (
                 <Action title="Retry" icon={Icon.ArrowClockwise} onAction={revalidate} />
               )}
