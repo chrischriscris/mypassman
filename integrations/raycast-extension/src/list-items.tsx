@@ -200,6 +200,10 @@ async function fill(item: VaultItem, fields: string[], mode: "paste" | "type", o
   // Phase 2 — close, let focus return, then post the event(s).
   await closeMainWindow({ clearRootSearch: true });
   await waitForFocus();
+  let target = "";
+  try {
+    target = (await getFrontmostApplication()).name;
+  } catch {}
   try {
     if (mode === "paste") {
       await run(["__dopaste"]);
@@ -210,7 +214,7 @@ async function fill(item: VaultItem, fields: string[], mode: "paste" | "type", o
           : ["get", item.id, ...useFields.flatMap((f) => ["--type", f])],
       );
     }
-    await showHUD(`${what} ${mode === "paste" ? "pasted" : "typed"}`);
+    await showHUD(`${what} ${mode === "paste" ? "pasted" : "typed"}${target ? ` → ${target}` : ""}`);
     bumpRecent(item.id);
   } catch (e) {
     await fail(`Couldn't ${mode} ${what}`, e, true);

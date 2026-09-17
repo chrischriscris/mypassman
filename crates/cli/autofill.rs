@@ -60,7 +60,7 @@ fn settle() {
     let ms = std::env::var("MPM_FILL_DELAY_MS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(200);
+        .unwrap_or(350);
     std::thread::sleep(std::time::Duration::from_millis(ms));
 }
 
