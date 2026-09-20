@@ -234,9 +234,10 @@ async function fillInner(item: VaultItem, fields: string[], mode: "paste" | "typ
   // paste mode is single-field; multi-field fill is type-only
   const useFields = mode === "paste" ? fields.slice(0, 1) : fields;
   const what = otp ? "code" : useFields.join(" ⇥ ");
-  // a code rolling in <5s usually dies before the form submits — wait for it
+  // a code with <2s left will likely die before the form accepts it —
+  // wait out the roll; anything ≥2s pastes immediately
   const left = otp ? totpLeft(item, Date.now()) : null;
-  const wait = left !== null && left <= 5 ? left * 1000 + 400 : 0;
+  const wait = left !== null && left <= 2 ? left * 1000 + 400 : 0;
   if (wait > 0) {
     const t = await showToast({ style: Toast.Style.Animated, title: "Waiting for fresh code…" });
     await new Promise((r) => setTimeout(r, wait));
@@ -349,27 +350,40 @@ async function awaitDaemon(child: ChildProcess): Promise<"ok" | "denied" | "time
 }
 
 // Start the daemon detached — with `bio enroll` done this pops Touch ID.
-async function unlockVault(revalidate: () => void) {
-  const toast = await showToast({ style: Toast.Style.Animated, title: "Unlocking — Touch ID" });
-  // no MPM_IDLE_TTL override — daemon's built-in default is 900s
-  const child = spawn(MPM, ["daemon"], { detached: true, stdio: "ignore" });
-  child.unref();
-  const res = await awaitDaemon(child);
-  if (res === "ok") {
-    toast.style = Toast.Style.Success;
-    toast.title = "Vault unlocked";
-    revalidate();
-    try {
-      // land the user back in the list if the window hid behind the prompt
-      await open("raycast://extensions/chus/mypassman/list-items");
-    } catch {
-      // deeplink best-effort — the HUD still confirms unlock
+// `quiet` is for the unprompted attempt on first open: a cancel or a
+// missing bio slot shouldn't nag — the locked view is self-explanatory.
+let unlockInFlight = false;
+async function unlockVault(revalidate: () => void, quiet = false) {
+  if (unlockInFlight) return; // auto + manual presses share one daemon spawn
+  unlockInFlight = true;
+  try {
+    const toast = await showToast({ style: Toast.Style.Animated, title: "Unlocking — Touch ID" });
+    // no MPM_IDLE_TTL override — daemon's built-in default is 900s
+    const child = spawn(MPM, ["daemon"], { detached: true, stdio: "ignore" });
+    child.unref();
+    const res = await awaitDaemon(child);
+    if (res === "ok") {
+      toast.style = Toast.Style.Success;
+      toast.title = "Vault unlocked";
+      revalidate();
+      try {
+        // land the user back in the list if the window hid behind the prompt
+        await open("raycast://extensions/chus/mypassman/list-items");
+      } catch {
+        // deeplink best-effort — the HUD still confirms unlock
+      }
+      return;
     }
-    return;
+    if (quiet) {
+      toast.hide();
+      return;
+    }
+    toast.style = Toast.Style.Failure;
+    toast.title = res === "denied" ? "Unlock cancelled" : "Still locked";
+    toast.message = "Run `mypassman daemon` in a terminal to unlock with your password";
+  } finally {
+    unlockInFlight = false;
   }
-  toast.style = Toast.Style.Failure;
-  toast.title = res === "denied" ? "Unlock cancelled" : "Still locked";
-  toast.message = "Run `mypassman daemon` in a terminal to unlock with your password";
 }
 
 // In-window unlock: the password is piped to the daemon's stdin — never
@@ -426,7 +440,51 @@ function PasswordUnlock({ onUnlocked }: { onUnlocked: () => void }) {
   );
 }
 
+// Locked EmptyView as its own component so the auto-unlock effect fires
+// once per mount. The flag makes it once per process — module state is
+// all we have, since the Touch ID sheet can kill us between mount and
+// lock. lockVault spends it too: a fingerprint sheet the instant you
+// asked to lock would be a bug.
+let autoUnlockTried = false;
+function LockedEmptyView({ revalidate }: { revalidate: () => void }) {
+  useEffect(() => {
+    if (!autoUnlockTried) {
+      autoUnlockTried = true;
+      unlockVault(revalidate, true);
+    }
+    // The Touch ID sheet hides the Raycast window — and may suspend or
+    // kill this process mid-unlock, taking awaitDaemon's revalidate with
+    // it. Don't rely on surviving: poll the daemon ourselves and flip to
+    // the list the moment it answers, however the unlock happened.
+    const t = setInterval(() => {
+      run(["__ping"])
+        .then(() => revalidate())
+        .catch(() => {});
+    }, 1000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once per mount, on purpose
+  }, []);
+  return (
+    <List.EmptyView
+      icon={Icon.Lock}
+      title="Vault is locked"
+      description="Unlock with Touch ID (system prompt — Raycast hides) or type your password in-window."
+      actions={
+        <ActionPanel>
+          <Action title="Unlock Vault (Touch ID)" icon={Icon.LockUnlocked} onAction={() => unlockVault(revalidate)} />
+          <Action.Push
+            title="Unlock with Password"
+            icon={Icon.Keyboard}
+            target={<PasswordUnlock onUnlocked={revalidate} />}
+          />
+        </ActionPanel>
+      }
+    />
+  );
+}
+
 async function lockVault(revalidate: () => void) {
+  autoUnlockTried = true; // spend the auto-prompt — an explicit lock must not re-trigger it
   try {
     await run(["lock"]);
     await showToast({ style: Toast.Style.Success, title: "Vault locked" });
@@ -549,6 +607,9 @@ const KINDS = ["login", "card", "totp", "apikey", "secret", "identity", "sshkey"
 export default function Command() {
   const { data, isLoading, error, revalidate } = useExec(MPM, ["list", "--json"], {
     env: ENV.env,
+    // suppress the hook's default "Failed to fetch latest data" toast —
+    // the EmptyView below renders every failure mode already
+    onError: () => {},
     // parseOutput runs even on non-zero exits — surface stderr ("unlock
     // failed"…) instead of letting JSON.parse("") mask the real error
     parseOutput: ({ stdout, stderr, exitCode }) => {
@@ -587,35 +648,20 @@ export default function Command() {
     const missing = /ENOENT|spawn.*fail|not found|not a file/i.test(msg);
     return (
       <List>
-        <List.EmptyView
-          icon={locked ? Icon.Lock : missing ? Icon.Terminal : Icon.ExclamationMark}
-          title={
-            locked ? "Vault is locked" : missing ? `mypassman not found at ${MPM}` : "Something went wrong"
-          }
-          description={
-            locked
-              ? "Unlock with Touch ID (system prompt — Raycast hides) or type your password in-window."
-              : missing
-                ? "Point the binaryPath preference at your mypassman build."
-                : msg
-          }
-          actions={
-            <ActionPanel>
-              {locked ? (
-                <>
-                  <Action title="Unlock Vault (Touch ID)" icon={Icon.LockUnlocked} onAction={() => unlockVault(revalidate)} />
-                  <Action.Push
-                    title="Unlock with Password"
-                    icon={Icon.Keyboard}
-                    target={<PasswordUnlock onUnlocked={revalidate} />}
-                  />
-                </>
-              ) : (
+        {locked ? (
+          <LockedEmptyView revalidate={revalidate} />
+        ) : (
+          <List.EmptyView
+            icon={missing ? Icon.Terminal : Icon.ExclamationMark}
+            title={missing ? `mypassman not found at ${MPM}` : "Something went wrong"}
+            description={missing ? "Point the binaryPath preference at your mypassman build." : msg}
+            actions={
+              <ActionPanel>
                 <Action title="Retry" icon={Icon.ArrowClockwise} onAction={revalidate} />
-              )}
-            </ActionPanel>
-          }
-        />
+              </ActionPanel>
+            }
+          />
+        )}
       </List>
     );
   }

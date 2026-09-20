@@ -146,6 +146,11 @@ enum Cmd {
         #[arg(long)]
         otp: bool,
     },
+    /// (internal) exit 0 iff the unlock daemon answers PING — locked
+    /// launchers poll this instead of `list`, which would run a doomed
+    /// standalone unlock (Argon2 on an empty password) every poll
+    #[command(hide = true, name = "__ping")]
+    Ping,
     /// Export all items to a passphrase-sealed portable file (MPMEXP).
     /// The export passphrase is prompted (or $MPM_EXPORT_PASSWORD).
     Export { path: PathBuf },
@@ -2453,6 +2458,13 @@ fn main() {
         Cmd::Backup { dest } => cmd_backup(&dir, rec, dest),
         Cmd::Restore { src } => cmd_restore(&dir, src),
         Cmd::Daemon { idle_ttl } => cmd_daemon(&dir, rec, *idle_ttl),
+        Cmd::Ping => {
+            if daemon::alive(&dir) {
+                Ok(())
+            } else {
+                Err("locked".into())
+            }
+        }
         Cmd::Lock => cmd_lock(&dir),
         Cmd::Bio { sub } => match sub {
             BioCmd::Enroll => cmd_bio_enroll(&dir, rec),
