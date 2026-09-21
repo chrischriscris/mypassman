@@ -1,0 +1,11 @@
+{
+  "name": "mypassman-syncd",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-01",
+  "durable_objects": {
+    "bindings": [{ "name": "VAULT", "class_name": "VaultSync" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["VaultSync"] }],
+  // SETUP_KEY is a secret: `wrangler secret put SETUP_KEY`
+  "observability": { "enabled": true }
+}

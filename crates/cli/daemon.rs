@@ -10,7 +10,9 @@
 //! Consistency: before serving each request the daemon re-reads its OWN op
 //! log under the vault lock — a standalone CLI invocation appending while
 //! the daemon sleeps must not fork the chain (same device, same seq space).
-//! Foreign-device logs are replayed at startup only (real sync is M3).
+//! Foreign-device logs are also refreshed per request: a `sync` pull appends
+//! them on disk and the daemon merges the verified suffix without a
+//! re-unlock.
 
 #[cfg(unix)]
 use crate::{find_one, save_checkpoint, unlock};
@@ -19,6 +21,8 @@ use mpm_core::tlv::{OrderGuard, Reader, Writer};
 use mpm_core::Item;
 #[cfg(unix)]
 use mpm_core::Vault;
+#[cfg(unix)]
+use std::collections::HashMap;
 #[cfg(unix)]
 use std::io::{Read, Write};
 use std::path::Path;
@@ -198,6 +202,18 @@ pub fn run(dir: &Path, rec: bool, idle_ttl: u64) -> Result<(), String> {
     // not a fresh read (an op appended between unlock and a re-read would
     // be counted-but-never-applied → our next append forks the chain)
     let mut known = vault.head().0 as usize;
+    // foreign logs replayed at unlock: remember each tip so per-request
+    // refresh verifies only the suffix a sync pull appended
+    let mut foreign: HashMap<[u8; 16], (u64, [u8; 32])> = HashMap::new();
+    for dev in mpm_store::list_device_logs(dir).map_err(|e| e.to_string())? {
+        if &dev == vault.device_id() {
+            continue;
+        }
+        let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
+        if let Some(tip) = lr.ops.last() {
+            foreign.insert(dev, (lr.ops.len() as u64, tip.hash()));
+        }
+    }
     let mut last = Instant::now();
     let ttl = Duration::from_secs(idle_ttl);
     loop {
@@ -245,7 +261,8 @@ pub fn run(dir: &Path, rec: bool, idle_ttl: u64) -> Result<(), String> {
                         continue;
                     }
                 };
-                let (status, resp) = handle(op[0], &payload, &mut vault, dir, &mut known);
+                let (status, resp) =
+                    handle(op[0], &payload, &mut vault, dir, &mut known, &mut foreign);
                 let _ = write_msg(&mut s, status, &resp);
                 if op[0] != OP_PING {
                     last = Instant::now(); // only real ops reset idle
@@ -289,6 +306,67 @@ fn refresh(vault: &mut Vault, dir: &Path, known: &mut usize) -> Result<bool, Str
     Ok(torn)
 }
 
+/// Merge sync-pulled foreign ops: `sync` appends raw frames to
+/// ops/<device>.log while the daemon sleeps. Each request verifies and
+/// applies just the suffix past the last tip we saw — shrinkage or a
+/// diverged tip is honest failure, same posture as the own-log check.
+#[cfg(unix)]
+fn refresh_foreign(
+    vault: &mut Vault,
+    dir: &Path,
+    foreign: &mut HashMap<[u8; 16], (u64, [u8; 32])>,
+) -> Result<(), String> {
+    let devs = mpm_store::list_device_logs(dir).map_err(|e| e.to_string())?;
+    if devs.iter().all(|d| d == vault.device_id()) {
+        return Ok(());
+    }
+    // foreign logs exist → the on-disk manifest may have moved (device
+    // add/revoke via pair syncs as a manifest push). Reload it: ops from a
+    // device our in-memory copy doesn't know — or still trusts after a
+    // revocation — must verify against the CURRENT registry.
+    reload_manifest(vault, dir)?;
+    for dev in devs {
+        if &dev == vault.device_id() {
+            continue;
+        }
+        let (cnt, head) = foreign.get(&dev).copied().unwrap_or((0, [0u8; 32]));
+        let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
+        let n = lr.ops.len() as u64;
+        if n < cnt {
+            return Err(format!(
+                "foreign op log {} shrank under the daemon — restart it",
+                mpm_store::hex(&dev)
+            ));
+        }
+        if n == cnt {
+            continue;
+        }
+        let pts = vault
+            .verify_foreign_from(&dev, &lr.ops[cnt as usize..], cnt + 1, head)
+            .map_err(|e| e.to_string())?;
+        vault.apply_foreign(pts);
+        foreign.insert(dev, (n, lr.ops.last().unwrap().hash()));
+    }
+    Ok(())
+}
+
+/// Pick up a manifest written while the daemon slept (device add/revoke).
+/// Refuses anything beyond a registry/snapshot-epoch change — a key_epoch
+/// move re-encrypts op AAD and this process's DEK replay is stale.
+#[cfg(unix)]
+fn reload_manifest(vault: &mut Vault, dir: &Path) -> Result<(), String> {
+    let m = mpm_store::load_manifest(dir).map_err(|e| e.to_string())?;
+    if m.vault_id != vault.manifest.vault_id
+        || m.owner_vk != vault.manifest.owner_vk
+        || m.key_epoch != vault.manifest.key_epoch
+        || m.snapshot_epoch < vault.manifest.snapshot_epoch
+    {
+        return Err("manifest changed incompatibly — restart the daemon".into());
+    }
+    vault.manifest = m;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn handle(
     op: u8,
@@ -296,8 +374,9 @@ fn handle(
     vault: &mut Vault,
     dir: &Path,
     known: &mut usize,
+    foreign: &mut HashMap<[u8; 16], (u64, [u8; 32])>,
 ) -> (u8, Vec<u8>) {
-    match serve(op, payload, vault, dir, known) {
+    match serve(op, payload, vault, dir, known, foreign) {
         Ok(p) => (0, p),
         Err(e) => {
             let (status, msg) = if let Some(m) = e.strip_prefix("MISSING:") {
@@ -319,10 +398,12 @@ fn serve(
     vault: &mut Vault,
     dir: &Path,
     known: &mut usize,
+    foreign: &mut HashMap<[u8; 16], (u64, [u8; 32])>,
 ) -> Result<Vec<u8>, String> {
     // catch up with any out-of-band appends before answering (the caller
     // holds the vault lock across the whole request)
     let torn = refresh(vault, dir, known).map_err(|e| format!("refresh: {e}"))?;
+    refresh_foreign(vault, dir, foreign).map_err(|e| format!("refresh: {e}"))?;
     if torn && matches!(op, OP_PUT | OP_DEL) {
         // appending past the tear would orphan the new op at next unlock
         return Err(

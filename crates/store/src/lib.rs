@@ -200,6 +200,12 @@ pub fn list_device_logs(dir: &Path) -> Result<Vec<[u8; 16]>> {
 // ── device keys (OUTSIDE the vault dir) ─────────────────────────────
 
 fn device_dir() -> Result<PathBuf> {
+    // MPM_DATA relocates the whole per-user store (device keys, sync
+    // creds) — needed to host two devices of one vault on one machine
+    // (tests, restore drills); each keeps its own key file.
+    if let Some(d) = std::env::var_os("MPM_DATA") {
+        return Ok(PathBuf::from(d).join("devices"));
+    }
     let base = dirs::data_local_dir().ok_or_else(|| {
         StoreError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,

@@ -14,6 +14,7 @@ mod autofill;
 #[cfg(target_os = "macos")]
 mod bio;
 mod daemon;
+mod sync;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -190,6 +191,17 @@ enum Cmd {
         #[command(subcommand)]
         sub: BioCmd,
     },
+    /// Sync with a syncd relay: pull foreign ops, push ours, reconcile the
+    /// manifest. No unlock needed — everything moved is ciphertext.
+    Sync {
+        #[command(subcommand)]
+        sub: Option<SyncCmd>,
+    },
+    /// Device pairing: invite a new device, approve it, finish enrollment
+    Pair {
+        #[command(subcommand)]
+        sub: PairCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -206,6 +218,43 @@ enum BioCmd {
     Enroll,
     /// Remove biometric unlock: deletes the Keychain item and wrap slot
     Off,
+}
+
+#[derive(Subcommand)]
+enum SyncCmd {
+    /// Bootstrap this vault onto a syncd server (first device only); stores
+    /// the admin token + this device's read/write tokens locally.
+    Init {
+        /// syncd base URL, e.g. https://syncd.example.com or http://localhost:8787
+        url: String,
+        /// the SETUP_KEY wrangler secret from the deployment
+        #[arg(long)]
+        setup_key: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PairCmd {
+    /// Mint a short-lived invite for a new device (owner side).
+    /// Prints <vault_id>.<code> — the vault id routes the join request.
+    Invite,
+    /// List devices waiting for approval
+    Pending,
+    /// Approve a pending device (id prefix) — re-signs and pushes the manifest
+    Approve { device: String },
+    /// Decline a pending join request (id prefix)
+    Decline { device: String },
+    /// On the new device: request enrollment with <url> <invite>
+    /// (invite = <vault_id>.<code> printed by `pair invite`)
+    Join {
+        url: String,
+        invite: String,
+        /// label the approver sees, e.g. "work macbook"
+        #[arg(long, default_value = "new device")]
+        name: String,
+    },
+    /// On the new device: exchange the invite for tokens after approval
+    Finish,
 }
 
 fn vault_dir(cli: &Cli) -> PathBuf {
@@ -2469,6 +2518,18 @@ fn main() {
         Cmd::Bio { sub } => match sub {
             BioCmd::Enroll => cmd_bio_enroll(&dir, rec),
             BioCmd::Off => cmd_bio_off(&dir, rec),
+        },
+        Cmd::Sync { sub } => match sub {
+            Some(SyncCmd::Init { url, setup_key }) => sync::cmd_sync_init(&dir, url, setup_key),
+            None => sync::cmd_sync(&dir),
+        },
+        Cmd::Pair { sub } => match sub {
+            PairCmd::Invite => sync::cmd_pair_invite(&dir),
+            PairCmd::Pending => sync::cmd_pair_pending(&dir),
+            PairCmd::Approve { device } => sync::cmd_pair_approve(&dir, rec, device),
+            PairCmd::Decline { device } => sync::cmd_pair_decline(&dir, device),
+            PairCmd::Join { url, invite, name } => sync::cmd_pair_join(&dir, url, invite, name),
+            PairCmd::Finish => sync::cmd_pair_finish(&dir),
         },
     };
 

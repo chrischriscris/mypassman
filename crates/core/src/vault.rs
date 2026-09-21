@@ -113,6 +113,20 @@ impl Vault {
         device_id: &[u8; DEVICE_ID_LEN],
         ops: &[Op],
     ) -> Result<Vec<OpPlaintext>> {
+        self.verify_foreign_from(device_id, ops, 1, [0u8; HASH_LEN])
+    }
+
+    /// Verify a SUFFIX of a foreign log: ops starting at `first_seq`
+    /// chained onto `prev_head` (the hash of the last op we already
+    /// verified — zero hash for a fresh log). Lets a live daemon merge
+    /// sync-pulled ops without re-verifying the whole log.
+    pub fn verify_foreign_from(
+        &self,
+        device_id: &[u8; DEVICE_ID_LEN],
+        ops: &[Op],
+        first_seq: u64,
+        prev_head: [u8; HASH_LEN],
+    ) -> Result<Vec<OpPlaintext>> {
         let entry = self
             .manifest
             .device(device_id)
@@ -120,10 +134,10 @@ impl Vault {
         if !entry.active {
             return Err(CoreError::NotEnrolled); // revoked devices don't merge
         }
-        let mut head = [0u8; HASH_LEN];
+        let mut head = prev_head;
         let mut out = Vec::with_capacity(ops.len());
         for (i, op) in ops.iter().enumerate() {
-            if op.seq != i as u64 + 1 {
+            if op.seq != first_seq + i as u64 {
                 return Err(CoreError::ChainBreak(op.seq));
             }
             let pt = op.open(
