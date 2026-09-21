@@ -1234,3 +1234,144 @@ fn unknown_op_type_is_forward_compatible() {
     let v2 = reopen(&dir, pw, &seed, dev_id);
     assert_eq!(v2.records().count(), 2); // replay across the unknown op
 }
+
+/// LWW losers with different content materialize as real conflict-copy
+/// records — order-independent, idempotent, and never for identical
+/// content or tombstone losers.
+#[test]
+fn conflict_copy_preserves_losing_edit() {
+    let dir = tmpdir();
+    let pw = b"pw";
+    let (device, seed, _c) = init(&dir, pw);
+    let dev_id = device.id;
+    let mut v = reopen(&dir, pw, &seed, dev_id);
+
+    // enroll dev2
+    let dev2 = DeviceKey::generate();
+    let dev2_id = dev2.id;
+    {
+        let mut m = v.manifest.clone();
+        m.devices.push(mpm_core::DeviceEntry {
+            id: dev2.id,
+            vk: dev2.verifying_key(),
+            name: "laptop".into(),
+            active: true,
+            enrolled_at: 0,
+            revoked_seq: None,
+            extra: Vec::new(),
+        });
+        let sk = v.bundle().owner_signing_key();
+        let bytes = m.to_file(&sk);
+        mpm_store::write_manifest(&dir, &bytes).unwrap();
+        v.manifest = mpm_core::Manifest::from_file(&bytes).unwrap();
+    }
+
+    // shared record
+    let (op, rid) = v
+        .make_upsert(ItemKind::Login, login("shared", "u", "original"))
+        .unwrap();
+    mpm_store::append_op(&dir, &dev_id, &op).unwrap();
+    v.commit(&op).unwrap();
+
+    // dev2 edits the SAME record offline: different password, higher hlc
+    // than A's concurrent edit — dev2 wins the merge.
+    let mk_foreign = |v: &Vault, seq: u64, prev: [u8; 32], pass: &str, hlc: u64| {
+        let mut it = Item::default();
+        it.set(tag::USERNAME, b"u".to_vec());
+        it.set(tag::PASSWORD, pass.as_bytes().to_vec());
+        let fields_ct = mpm_core::OpPlaintext::seal_fields(
+            v.dek(),
+            &v.manifest.vault_id,
+            v.manifest.key_epoch,
+            &rid,
+            &it,
+        )
+        .unwrap();
+        let pt = mpm_core::OpPlaintext {
+            prev_op_hash: prev,
+            hlc,
+            op_type: mpm_core::OpType::Upsert,
+            record_id: rid,
+            kind: Some(ItemKind::Login),
+            schema_v: 1,
+            created: 0,
+            name: b"shared".to_vec(),
+            fields_ct,
+            gossip: Vec::new(),
+            snapshot: None,
+            origin_device: dev2_id,
+            origin_seq: seq,
+            key_epoch: 1,
+        };
+        mpm_core::Op::seal(
+            &pt,
+            seq,
+            v.dek(),
+            &v.manifest.vault_id,
+            v.manifest.format_v,
+            v.manifest.key_epoch,
+            &dev2,
+        )
+        .unwrap()
+    };
+
+    // dev2's chain: seq1 = original-ish (same fields? no — give it its own
+    // base version), seq2 = the concurrent winner.
+    let f1 = mk_foreign(&v, 1, [0u8; 32], "d2-base", 1);
+    let f2 = mk_foreign(&v, 2, f1.hash(), "d2-winner", u64::MAX - 1);
+
+    // A's concurrent edit (loses: lower hlc)
+    let losing = v
+        .make_update(&rid, ItemKind::Login, login("shared", "u", "a-version"))
+        .unwrap();
+    mpm_store::append_op(&dir, &dev_id, &losing).unwrap();
+    v.commit(&losing).unwrap();
+
+    // order 1: A's op already in index, then dev2's ops arrive (winner
+    // displaces A's version → A's edit is the conflict loser)
+    let r = v.verify_foreign_prefix(&dev2_id, &[f1.clone(), f2.clone()], 1, [0u8; 32]);
+    assert!(r.failed_at.is_none());
+    v.apply_foreign(&r.pts);
+    assert!(v.has_pending_conflicts());
+
+    // dev2's winner version is the live one
+    let it = v.item(&rid).unwrap();
+    assert_eq!(it.get(tag::PASSWORD).unwrap(), b"d2-winner");
+
+    // materialize → ONE new op producing the conflict record
+    let mut n = 0;
+    while let Some((cop, crid)) = v.materialize_conflict().unwrap() {
+        mpm_store::append_op(&dir, &dev_id, &cop).unwrap();
+        v.commit(&cop).unwrap();
+        n += 1;
+        // the copy carries the LOSER's fields under its own record key
+        let cit = v.item(&crid).unwrap();
+        assert_eq!(cit.get(tag::PASSWORD).unwrap(), b"a-version");
+    }
+    assert_eq!(n, 1);
+    assert!(!v.has_pending_conflicts());
+
+    // the copy shows as a normal record named for the losing device
+    let names: Vec<String> = v.records().map(|r| r.name.clone()).collect();
+    assert!(
+        names.iter().any(|n| n == "shared (conflict, this device)")
+            || names.iter().any(|n| n.starts_with("shared (conflict,")),
+        "conflict copy present: {names:?}"
+    );
+
+    // idempotent: a second materialize pass emits nothing (rid exists)
+    assert!(v.materialize_conflict().unwrap().is_none());
+
+    // replay: a fresh vault re-derives the same index — the conflict
+    // record is a real op, so it survives
+    let v2 = reopen(&dir, pw, &seed, dev_id);
+    let crid = mpm_core::vault::derive_conflict_id(&rid, &dev_id, 2);
+    assert!(v2.item(&crid).is_ok(), "conflict record survives replay");
+
+    // tombstone the copy → stays gone: replay must not resurrect it
+    let op = v.make_tombstone(&crid).unwrap();
+    mpm_store::append_op(&dir, &dev_id, &op).unwrap();
+    v.commit(&op).unwrap();
+    let v3 = reopen(&dir, pw, &seed, dev_id);
+    assert!(v3.item(&crid).is_err(), "deleted conflict copy stays gone");
+}

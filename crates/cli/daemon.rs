@@ -381,6 +381,7 @@ fn refresh(vault: &mut Vault, dir: &Path, known: &mut u64) -> Result<bool, Strin
 fn refresh_foreign(
     vault: &mut Vault,
     dir: &Path,
+    known: &mut u64,
     foreign: &mut HashMap<[u8; 16], (u64, [u8; 32])>,
     quarantined: &mut std::collections::HashSet<[u8; 16]>,
 ) -> Result<(), String> {
@@ -443,6 +444,11 @@ fn refresh_foreign(
             }
         }
     }
+    // Merge losers become real conflict-copy ops on our own log — the
+    // request handler already holds the vault lock. `known` must follow
+    // our own tip or the next refresh would try to re-apply them.
+    crate::flush_conflicts_locked(vault, dir);
+    *known = vault.head().0;
     Ok(())
 }
 
@@ -544,7 +550,7 @@ fn serve(
             format!("refresh: {e}")
         }
     })?;
-    refresh_foreign(vault, dir, foreign, quarantined).map_err(|e| {
+    refresh_foreign(vault, dir, known, foreign, quarantined).map_err(|e| {
         if e == REBUILD {
             e
         } else {

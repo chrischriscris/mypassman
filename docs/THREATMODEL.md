@@ -71,6 +71,14 @@ so a replica that adopts and then loses its relay history can't re-derive
 covered losers — that's why `history` notes the horizon and the relay is
 the full-history tier.
 
+**LWW never silently drops data.** A merge loser whose decrypted fields
+differ from the winner — and which is its device's last word on the
+record — is preserved as a conflict copy under a deterministic record id
+every replica derives identically. Identical losers drop (nothing lost);
+superseded same-device versions drop (plain history). The mechanism is
+content-preserving, not interactive: it can't merge two edits into one,
+it just refuses to let either vanish.
+
 ## What the relay still sees (metadata)
 
 - vault ids, device ids, device names, enrolled/active status, counts

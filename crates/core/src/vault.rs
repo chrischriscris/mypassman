@@ -7,7 +7,9 @@ use crate::item::{tag, Item, ItemKind};
 use crate::manifest::Manifest;
 use crate::op::{Gossip, Op, OpPlaintext, OpType, Snapshot};
 use crate::{DEVICE_ID_LEN, HASH_LEN, RECORD_ID_LEN};
+use mpm_crypto::aead::{self, NONCE_LEN};
 use mpm_crypto::keys::{DeviceKey, KeyBundle};
+use mpm_crypto::subkey;
 use std::collections::BTreeMap;
 
 /// Outcome of a best-effort foreign-log verification (`verify_foreign_prefix`):
@@ -54,6 +56,48 @@ pub struct Vault {
     /// The snapshot currently adopted as replay base — its winner frames
     /// are where covered ops' bytes live after the logs were compacted.
     adopted: Option<Snapshot>,
+    /// LWW losers worth preserving as conflict copies. Enqueued during
+    /// merge (either direction: incoming-loses or winner-displaces), then
+    /// drained by `materialize_conflicts` once the index is final —
+    /// content compare happens against the FINAL winner, so the conflict
+    /// set is replay-order-independent.
+    pending_conflicts: Vec<ConflictLoser>,
+    /// Highest origin_seq each device has stated per record. Distinguishes
+    /// "lost a concurrent race" (this device said nothing newer — real
+    /// conflict) from "superseded by its own later write" (plain history —
+    /// preserving it would materialize every old version as a conflict).
+    last_by_dev: BTreeMap<([u8; RECORD_ID_LEN], [u8; DEVICE_ID_LEN]), u64>,
+}
+
+/// A merge loser that may hold data the winner doesn't — enough of its
+/// op to rebuild the copy without keeping the frame.
+#[derive(Clone, Debug)]
+pub struct ConflictLoser {
+    pub record_id: [u8; RECORD_ID_LEN],
+    pub kind: Option<ItemKind>,
+    pub name: Vec<u8>,
+    pub created: u64,
+    pub fields_ct: Vec<u8>,
+    pub key_epoch: u32,
+    pub origin: ([u8; DEVICE_ID_LEN], u64),
+}
+
+/// Deterministic conflict-copy record id: every replica derives the same
+/// target for the same losing op, so independently materialized copies
+/// dedup into one record.
+pub fn derive_conflict_id(
+    record_id: &[u8; RECORD_ID_LEN],
+    origin_device: &[u8; DEVICE_ID_LEN],
+    origin_seq: u64,
+) -> [u8; RECORD_ID_LEN] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"mypassman/v1/conflict");
+    h.update(record_id);
+    h.update(origin_device);
+    h.update(&origin_seq.to_le_bytes());
+    let mut id = [0u8; RECORD_ID_LEN];
+    id.copy_from_slice(&h.finalize().as_bytes()[..RECORD_ID_LEN]);
+    id
 }
 
 /// Wall-clock millis — metadata only (e.g. `enrolled_at`). Op ordering
@@ -91,6 +135,8 @@ impl Vault {
             records: BTreeMap::new(),
             anchors: BTreeMap::new(),
             adopted: None,
+            pending_conflicts: Vec::new(),
+            last_by_dev: BTreeMap::new(),
         })
     }
 
@@ -111,6 +157,8 @@ impl Vault {
         self.records.clear();
         self.anchors.clear();
         self.adopted = None;
+        self.pending_conflicts.clear();
+        self.last_by_dev.clear();
     }
 
     /// The snapshot this vault's index is currently seeded from, if any.
@@ -505,6 +553,9 @@ impl Vault {
         if !matches!(pt.op_type, OpType::Upsert | OpType::Tombstone) {
             return;
         }
+        let k = (pt.record_id, pt.origin_device);
+        let last = self.last_by_dev.entry(k).or_insert(0);
+        *last = (*last).max(pt.origin_seq);
         let e = self
             .records
             .entry(pt.record_id)
@@ -521,7 +572,24 @@ impl Vault {
             });
         // Total order (hlc, origin_device, origin_seq): the merge result
         // depends only on the op SET, never on replay/scan order.
+        let genesis = ([0u8; DEVICE_ID_LEN], 0);
+        let mut displaced = None;
         if (pt.hlc, pt.origin_device, pt.origin_seq) >= (e.hlc, e.origin.0, e.origin.1) {
+            // An upsert winner displaces the previous upsert winner: that
+            // loser may carry data the new winner lacks — queue it as a
+            // conflict candidate (content compare defers to materialize).
+            if e.origin != genesis && e.origin != (pt.origin_device, pt.origin_seq) && !e.tombstoned
+            {
+                displaced = Some(ConflictLoser {
+                    record_id: e.record_id,
+                    kind: e.kind,
+                    name: e.name.clone().into_bytes(),
+                    created: e.created,
+                    fields_ct: e.fields_ct.clone(),
+                    key_epoch: e.key_epoch,
+                    origin: e.origin,
+                });
+            }
             match pt.op_type {
                 OpType::Upsert => {
                     e.kind = pt.kind;
@@ -540,7 +608,155 @@ impl Vault {
                 }
                 _ => {}
             }
+        } else if pt.op_type == OpType::Upsert {
+            // Incoming upsert loses to the standing winner (incl. a
+            // tombstone — its fields would vanish otherwise).
+            displaced = Some(ConflictLoser {
+                record_id: pt.record_id,
+                kind: pt.kind,
+                name: pt.name,
+                created: pt.created,
+                fields_ct: pt.fields_ct,
+                key_epoch: pt.key_epoch,
+                origin: (pt.origin_device, pt.origin_seq),
+            });
         }
+        if let Some(l) = displaced {
+            self.queue_conflict(l);
+        }
+    }
+
+    fn queue_conflict(&mut self, l: ConflictLoser) {
+        if !self
+            .pending_conflicts
+            .iter()
+            .any(|p| p.record_id == l.record_id && p.origin == l.origin)
+        {
+            self.pending_conflicts.push(l);
+        }
+    }
+
+    /// Conflict candidates found since last drain — callers that can
+    /// append ops should `materialize_conflicts` instead of reading this.
+    pub fn has_pending_conflicts(&self) -> bool {
+        !self.pending_conflicts.is_empty()
+    }
+
+    /// Turn one pending LWW loser into a real conflict-copy upsert — call
+    /// in a loop, persisting + committing each op before the next (head
+    /// and seq only advance on commit). Runs only after replay is
+    /// complete so the compare sees FINAL winners:
+    /// - loser fields == winner fields → silent drop (duplicate edit)
+    /// - conflict rid already exists (live or tombstoned) → already
+    ///   materialized (or deliberately deleted — stays gone)
+    /// - otherwise: `name (conflict, <device>)` sealed under the derived
+    ///   record id's k_rec, signed by THIS device — a normal op that
+    ///   syncs, survives compaction, and degrades to a regular item on
+    ///   older clients.
+    pub fn materialize_conflict(&mut self) -> Result<Option<(Op, [u8; RECORD_ID_LEN])>> {
+        while let Some(l) = self.pending_conflicts.pop() {
+            let rid2 = derive_conflict_id(&l.record_id, &l.origin.0, l.origin.1);
+            if self.records.contains_key(&rid2) {
+                continue;
+            }
+            // the losing device itself wrote a newer op for this record —
+            // superseded history, not a concurrent edit
+            if self
+                .last_by_dev
+                .get(&(l.record_id, l.origin.0))
+                .copied()
+                .unwrap_or(0)
+                > l.origin.1
+            {
+                continue;
+            }
+            if let Some(w) = self.records.get(&l.record_id) {
+                // identical name + identical decrypted fields → the "loss"
+                // was a duplicate edit, nothing to preserve. A winner that
+                // won't open counts as different — preserve, don't guess.
+                let identical = !w.tombstoned
+                    && w.name.as_bytes() == l.name.as_slice()
+                    && self
+                        .open_fields_blob(&l.record_id, w.key_epoch, &w.fields_ct)
+                        .and_then(|wi| {
+                            self.open_fields_blob(&l.record_id, l.key_epoch, &l.fields_ct)
+                                .map(|li| wi.fields == li.fields)
+                        })
+                        .unwrap_or(false);
+                if identical {
+                    continue;
+                }
+            }
+            // a loser whose inner seal won't open has nothing to preserve
+            let Ok(item) = self.open_fields_blob(&l.record_id, l.key_epoch, &l.fields_ct) else {
+                continue;
+            };
+            let dev_label = self
+                .manifest
+                .device(&l.origin.0)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| l.origin.0[..4].iter().map(|b| format!("{b:02x}")).collect());
+            let name = format!(
+                "{} (conflict, {})",
+                String::from_utf8_lossy(&l.name),
+                dev_label
+            );
+            let epoch = self.write_epoch()?;
+            let fields_ct = OpPlaintext::seal_fields(
+                self.bundle.dek(),
+                &self.manifest.vault_id,
+                epoch,
+                &rid2,
+                &item,
+            )?;
+            let pt = OpPlaintext {
+                prev_op_hash: self.head,
+                hlc: self.next_hlc(),
+                op_type: OpType::Upsert,
+                record_id: rid2,
+                kind: l.kind,
+                schema_v: 1,
+                created: l.created,
+                name: name.into_bytes(),
+                fields_ct,
+                gossip: self.gossip(),
+                snapshot: None,
+                origin_device: self.device.id,
+                origin_seq: self.next_seq,
+                key_epoch: epoch,
+            };
+            let op = Op::seal(
+                &pt,
+                self.next_seq,
+                self.bundle.dek(),
+                &self.manifest.vault_id,
+                self.manifest.format_v,
+                epoch,
+                &self.device,
+            )?;
+            return Ok(Some((op, rid2)));
+        }
+        Ok(None)
+    }
+
+    fn open_fields_blob(
+        &self,
+        record_id: &[u8; RECORD_ID_LEN],
+        key_epoch: u32,
+        blob: &[u8],
+    ) -> Result<Item> {
+        if blob.len() < NONCE_LEN + aead::TAG_LEN {
+            return Err(CoreError::Tlv("fields_ct short"));
+        }
+        let (nonce, ct) = blob.split_at(NONCE_LEN);
+        let k_rec = subkey::derive_record_key(self.bundle.dek(), record_id);
+        let pt = aead::open(
+            &k_rec,
+            nonce.try_into().unwrap(),
+            &crate::aad::record_fields(&self.manifest.vault_id, record_id, key_epoch),
+            ct,
+        )?;
+        Item::decode(&pt)
     }
 
     /// Current gossip observation of every known device log — embedded in

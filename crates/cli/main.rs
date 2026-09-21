@@ -566,22 +566,45 @@ pub(crate) fn replay_state(vault: &mut Vault, dir: &Path) -> Result<Replay, Stri
     if let Some(snap) = &base {
         let seed_pts = vault.adopt_snapshot(snap).map_err(|e| e.to_string())?;
         all_pts.extend(seed_pts);
+        // Janitorial: physically drop covered prefixes whenever the lock
+        // is obtainable. Replay does NOT depend on this (covered ops are
+        // skipped in-memory below) — it only reclaims disk. An earlier
+        // adoption that died before its drop is finished here.
+        if let Ok(_lock) = mpm_store::lock_vault(dir) {
+            for g in &snap.covered {
+                let _ = mpm_store::drop_covered_prefix(dir, &g.device_id, g.seq);
+            }
+            let _ = mpm_store::save_base_vector(dir, &snap.covered);
+        }
     }
 
     let mut tips: std::collections::BTreeMap<[u8; 16], (u64, [u8; HASH_LEN])> =
         std::collections::BTreeMap::new();
     let mut candidates: Vec<([u8; 16], mpm_core::op::Op)> = Vec::new();
 
-    // ── own log (anchored iff its on-disk prefix was actually dropped) ──
+    // ── own log: covered ops are seeded by the snapshot — replay only
+    // the suffix past the anchor. Whether the physical prefix was dropped
+    // yet is irrelevant: a covered op on disk is skipped, and the first
+    // op past the anchor still chain-verifies (its prev_op_hash IS the
+    // covered head). A gap between anchor and suffix is a real break.
     let own = *vault.device_id();
     let lr = mpm_store::read_ops(dir, &own).map_err(|e| e.to_string())?;
-    if let Some((aseq, _)) = vault.anchor(&own) {
-        let starts_past = lr.ops.first().map(|o| o.seq == aseq + 1).unwrap_or(true);
-        if starts_past {
+    let own_ops: Vec<&mpm_core::Op> = match vault.anchor(&own) {
+        Some((aseq, _)) => {
+            let kept: Vec<&mpm_core::Op> = lr.ops.iter().filter(|o| o.seq > aseq).collect();
+            let contiguous = kept.first().map(|o| o.seq == aseq + 1).unwrap_or(true);
+            if !contiguous {
+                return Err(format!(
+                    "op log has a gap between covered seq {aseq} and on-disk seq {}",
+                    kept.first().map(|o| o.seq).unwrap_or(0)
+                ));
+            }
             vault.apply_own_anchor();
+            kept
         }
-    }
-    for op in &lr.ops {
+        None => lr.ops.iter().collect(),
+    };
+    for op in own_ops {
         let pt = vault.apply_own_op(op).map_err(|e| e.to_string())?;
         if pt.snapshot.is_some() {
             candidates.push((own, op.clone()));
@@ -605,11 +628,17 @@ pub(crate) fn replay_state(vault: &mut Vault, dir: &Path) -> Result<Replay, Stri
                 mpm_store::hex(&dev_id)
             );
         }
-        let (first_seq, prev) = match vault.anchor(&dev_id) {
-            Some((s, h)) if lr.ops.first().map(|o| o.seq == s + 1).unwrap_or(true) => (s + 1, h),
-            _ => (1, [0u8; HASH_LEN]),
+        // Covered foreign ops are skipped in-memory exactly like the own
+        // log's — the suffix still verifies against the adopted anchor.
+        let kept: Vec<mpm_core::Op> = match vault.anchor(&dev_id) {
+            Some((s, _)) => lr.ops.iter().filter(|o| o.seq > s).cloned().collect(),
+            None => lr.ops.clone(),
         };
-        let r = vault.verify_foreign_prefix(&dev_id, &lr.ops, first_seq, prev);
+        let (first_seq, prev) = match vault.anchor(&dev_id) {
+            Some((s, h)) => (s + 1, h),
+            None => (1, [0u8; HASH_LEN]),
+        };
+        let r = vault.verify_foreign_prefix(&dev_id, &kept, first_seq, prev);
         if let Some((seq, e)) = &r.failed_at {
             let why: String = match e {
                 CoreError::NotEnrolled => "unknown or fully revoked device".into(),
@@ -664,7 +693,52 @@ pub(crate) fn replay_state(vault: &mut Vault, dir: &Path) -> Result<Replay, Stri
         break;
     }
 
+    flush_conflicts(vault, dir);
+
     Ok(Replay { tips, pts: all_pts })
+}
+
+/// Write pending LWW losers as real conflict-copy ops on the local log —
+/// one append+commit per candidate so each op chains off the last. Under
+/// the vault lock when available; a contended lock (daemon holding the
+/// vault) just defers materialization — the candidates re-derive on the
+/// next replay and dedup by deterministic record id.
+pub(crate) fn flush_conflicts(vault: &mut Vault, dir: &Path) {
+    if !vault.has_pending_conflicts() {
+        return;
+    }
+    // No lock → another writer owns the vault (e.g. the daemon, which
+    // materializes on its own refresh). Candidates re-derive next replay.
+    let Ok(_lock) = mpm_store::lock_vault(dir) else {
+        return;
+    };
+    flush_conflicts_locked(vault, dir);
+}
+
+/// The flush itself — caller guarantees no concurrent writer (holds the
+/// vault lock, or owns the vault outright like the daemon does).
+pub(crate) fn flush_conflicts_locked(vault: &mut Vault, dir: &Path) {
+    let own = *vault.device_id();
+    loop {
+        let (op, rid) = match vault.materialize_conflict() {
+            Ok(Some(x)) => x,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("warning: conflict materialize failed: {e}");
+                return;
+            }
+        };
+        if let Err(e) = mpm_store::append_op(dir, &own, &op)
+            .and_then(|_| vault.commit(&op).map_err(|e| e.into()))
+        {
+            eprintln!("warning: conflict op write failed: {e}");
+            return;
+        }
+        eprintln!(
+            "conflict preserved: losing edit kept as record {}",
+            mpm_store::hex(&rid)
+        );
+    }
 }
 
 /// Compare the replayed log tip with our last verified checkpoint

@@ -133,6 +133,32 @@ last-writer-wins; tombstone suppresses earlier upserts. All devices
 converge to identical state for identical op sets — order-independent.
 Checkpoint ops are merge-inert (no record effect).
 
+## Conflict copies
+
+LWW suppresses losing writes — but a losing edit can carry data the
+winner lacks. Replicas therefore materialize losers as **conflict-copy
+records**: ordinary upsert ops, signed by the observing device, so they
+replicate through the normal path and survive compaction as ordinary
+winners. (Older clients simply see an extra item.)
+
+A merge loser L becomes a copy only when all of these hold:
+
+- L is an Upsert (tombstone losers carry no fields)
+- L is its device's **last** op on the record — a loser superseded by its
+  own device's later write is ordinary version history, not a conflict
+- L's decrypted fields or name differ from the FINAL winner's (same
+  content = duplicate edit = silent drop)
+- the derived conflict record id is not already taken
+
+Conflict record id is deterministic:
+`blake3("mypassman/v1/conflict" ‖ record_id ‖ loser_device ‖ loser_seq)[:16]`
+— every replica derives the same target for the same loser, so
+independently materialized copies dedup to one record. The copy's name is
+`<name> (conflict, <device>)`; its `fields_ct` is resealed under
+`k_rec(conflict_id)` (the original stays under the old record key);
+`created` is preserved from the losing op. A user-deleted conflict copy
+stays deleted (the taken-id check counts tombstones).
+
 ## Compaction
 
 A checkpoint op asserts: "at covered vector V = {(dev, seq, head)}, the
@@ -159,14 +185,14 @@ rename + dir fsync). `base.vec` records the adopted vector — advisory
 only; it carries ids/seqs/hashes, no secrets, and cannot forge ops.
 
 Post-compaction verification anchors at the covered head instead of the
-zero hash: a log starting at `seq = covered+1` verifies iff its first
-op's `prev_op_hash` equals the covered head. A log still holding its
-genesis prefix simply replays from genesis — anchors seed state, replay
-is idempotent.
-
-The own-device anchor is applied only when the local log's first frame
-is exactly `covered+1` — a crash between adoption and prefix-drop leaves
-a full log that still verifies from genesis, never a corrupt state.
+zero hash. Replay skips any on-disk op with `seq <= covered` in-memory
+(their content is seeded by the snapshot) and verifies only the suffix:
+the first op past the anchor must be exactly `covered+1` and its
+`prev_op_hash` must equal the covered head. A log still holding covered
+prefix bytes replays identically — physical dropping is janitorial disk
+reclamation, retried on every unlock under the vault lock, never a
+correctness dependency. A gap between the anchor and the first on-disk
+suffix op is a real chain break.
 
 Sync cursors are logical `seq` numbers, never log lengths: a fully
 covered (empty) local log still pulls from `base.vec`'s covered seq and

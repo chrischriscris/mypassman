@@ -857,8 +857,11 @@ h3 { font-size: 22px; margin-top: 2em; }
   adopt one only after re-deriving the same winner set from their own verified replay,
   then drop covered log prefixes and anchor chain verification at the covered head.
   The relay stays oblivious (it keeps full history; sync cursors are logical seqs),
-  and unknown op types decode inert so older clients never wedge. Still open:
-  conflict copies, gossip vectors, restored-device handling.
+  and unknown op types decode inert so older clients never wedge. And conflict
+  copies: a losing LWW write with distinct content becomes a real
+  <code>name (conflict, device)</code> record under a deterministic record id
+  every replica derives identically — no more silent data loss on concurrent
+  edits. Still open: gossip vectors, restored-device handling.
 </footer>
 
 </main>
