@@ -88,12 +88,18 @@ fn init(dir: &std::path::Path, pw: &[u8]) -> (DeviceKey, [u8; 32], [u8; 16]) {
 
 fn reopen(dir: &std::path::Path, pw: &[u8], seed: &[u8; 32], dev_id: [u8; 16]) -> Vault {
     let m = mpm_store::load_manifest(dir).unwrap();
-    let (params, salt) = m.wrap_slots[0].kdf.unwrap();
+    let slot = m
+        .wrap_slots
+        .iter()
+        .find(|s| s.slot_type == SLOT_PASSWORD)
+        .unwrap();
+    let (params, salt) = slot.kdf.unwrap();
     let kek = kdf::derive_kek(pw, &salt, &params).unwrap();
     let bundle = KeyBundle::unwrap(
         &kek,
         &mpm_core::aad::wrap_slot(&m.vault_id, m.key_epoch, SLOT_PASSWORD),
-        &m.wrap_slots[0].blob,
+        &slot.blob,
+        m.key_epoch,
     )
     .expect("unwrap");
     let mut v = Vault::new(m, bundle, DeviceKey::from_bytes(seed, dev_id)).unwrap();
@@ -125,6 +131,7 @@ fn roundtrip_add_reopen_decrypt() {
         &kek,
         &mpm_core::aad::wrap_slot(&m.vault_id, m.key_epoch, SLOT_PASSWORD),
         &m.wrap_slots[0].blob,
+        m.key_epoch,
     )
     .unwrap();
     let mut vault = Vault::new(m, bundle, device).unwrap();
@@ -170,6 +177,7 @@ fn tombstone_hides_item() {
         &kek,
         &mpm_core::aad::wrap_slot(&m.vault_id, m.key_epoch, SLOT_PASSWORD),
         &m.wrap_slots[0].blob,
+        m.key_epoch,
     )
     .unwrap();
     let mut vault = Vault::new(m, bundle, device).unwrap();
@@ -208,6 +216,7 @@ fn tampered_op_rejected() {
         &kek,
         &mpm_core::aad::wrap_slot(&m.vault_id, m.key_epoch, SLOT_PASSWORD),
         &m.wrap_slots[0].blob,
+        m.key_epoch,
     )
     .unwrap();
     let mut vault = Vault::new(m, bundle, device).unwrap();
@@ -232,6 +241,7 @@ fn tampered_op_rejected() {
         &kek2,
         &mpm_core::aad::wrap_slot(&m2.vault_id, m2.key_epoch, SLOT_PASSWORD),
         &m2.wrap_slots[0].blob,
+        m2.key_epoch,
     )
     .unwrap();
     let mut v2 = Vault::new(m2, b2, DeviceKey::from_bytes(&seed, dev_id)).unwrap();
@@ -335,6 +345,7 @@ fn recovery_enrolls_device_when_key_absent() {
         &kek,
         &mpm_core::aad::wrap_slot(&m.vault_id, m.key_epoch, SLOT_RECOVERY),
         &slot.blob,
+        m.key_epoch,
     )
     .unwrap();
     let newdev = DeviceKey::generate();
@@ -395,6 +406,7 @@ fn recovery_code_unlocks_and_parses() {
         &kek,
         &mpm_core::aad::wrap_slot(&vid, ep, SLOT_RECOVERY),
         &slot.blob,
+        ep,
     )
     .unwrap();
     assert!(Vault::new(m, bundle, DeviceKey::from_bytes(&seed, dev_id)).is_ok());
@@ -406,7 +418,8 @@ fn recovery_code_unlocks_and_parses() {
     assert!(KeyBundle::unwrap(
         &kek_bad,
         &mpm_core::aad::wrap_slot(&vid, ep, SLOT_RECOVERY),
-        &slot.blob
+        &slot.blob,
+        ep,
     )
     .is_err());
 }
@@ -523,6 +536,7 @@ fn merge_is_order_independent_on_equal_hlc() {
             gossip: Vec::new(),
             origin_device: dev.id,
             origin_seq: 1,
+            key_epoch: 1,
         };
         mpm_core::Op::seal(
             &pt,
@@ -581,7 +595,8 @@ fn wrong_password_fails() {
     assert!(KeyBundle::unwrap(
         &kek,
         &mpm_core::aad::wrap_slot(&m.vault_id, m.key_epoch, SLOT_PASSWORD),
-        &m.wrap_slots[0].blob
+        &m.wrap_slots[0].blob,
+        m.key_epoch,
     )
     .is_err());
 }
@@ -644,6 +659,7 @@ fn revoked_device_horizon() {
             gossip: Vec::new(),
             origin_device: dev2.id,
             origin_seq: seq,
+            key_epoch: 1,
         };
         mpm_core::Op::seal(
             &pt,
@@ -744,6 +760,7 @@ fn revoked_device_no_horizon() {
         gossip: Vec::new(),
         origin_device: dev2.id,
         origin_seq: 1,
+        key_epoch: 1,
     };
     let op = mpm_core::Op::seal(
         &pt,
@@ -762,4 +779,124 @@ fn revoked_device_no_horizon() {
         r.failed_at,
         Some((1, mpm_core::CoreError::RevokedWrite(1)))
     ));
+}
+
+/// DEK rotation: ops sealed pre-rotation still open (epoch fallback via
+/// DEK history); ops sealed post-rotation are unreadable by a bundle that
+/// predates the rotation — the exclusion property `pair revoke` relies on.
+#[test]
+fn dek_rotation_epoch_fallback() {
+    let dir = tmpdir();
+    let (device, seed, _c) = init(&dir, b"pw-old");
+    let dev_id = device.id;
+    let mut v = reopen(&dir, b"pw-old", &seed, dev_id);
+
+    // an op at epoch 1
+    let mut it = Item::default();
+    it.set(tag::NAME, b"before".to_vec());
+    it.set(tag::PASSWORD, b"secret1".to_vec());
+    let (op1, rid1) = v.make_upsert(ItemKind::Login, it).unwrap();
+    mpm_store::append_op(&dir, &dev_id, &op1).unwrap();
+    v.commit(&op1).unwrap();
+
+    // capture a pre-rotation bundle by unwrapping the epoch-1 slot blob
+    let m_old = mpm_store::load_manifest(&dir).unwrap();
+    let old_blob = m_old.wrap_slots[0].blob.clone();
+    let (p, s) = m_old.wrap_slots[0].kdf.unwrap();
+    let old_kek = kdf::derive_kek(b"pw-old", &s, &p).unwrap();
+    let old_bundle = KeyBundle::unwrap(
+        &old_kek,
+        &mpm_core::aad::wrap_slot(&m_old.vault_id, 1, SLOT_PASSWORD),
+        &old_blob,
+        1,
+    )
+    .unwrap();
+    assert_eq!(old_bundle.current_epoch(), 1);
+
+    // rotate like `pair revoke` does: new DEK epoch + slots re-wrapped
+    // under the NEW password (stale KEKs would defeat the exclusion)
+    let epoch = v.rotate_keys();
+    assert_eq!(epoch, 2);
+    assert_eq!(v.manifest.key_epoch, 2);
+    let mut salt = [0u8; 32];
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut salt);
+    let new_kek = kdf::derive_kek(b"pw-new", &salt, &FAST).unwrap();
+    let blob = v
+        .bundle()
+        .wrap(
+            &new_kek,
+            &mpm_core::aad::wrap_slot(&v.manifest.vault_id, 2, SLOT_PASSWORD),
+        )
+        .unwrap();
+    v.manifest
+        .wrap_slots
+        .retain(|s| s.slot_type != SLOT_PASSWORD);
+    v.manifest.wrap_slots.push(WrapSlot {
+        slot_type: SLOT_PASSWORD,
+        kdf: Some((FAST, salt)),
+        blob,
+        extra: Vec::new(),
+    });
+    v.manifest.snapshot_epoch += 1;
+    let bytes = v.manifest.to_file(&v.bundle().owner_signing_key());
+    mpm_store::write_manifest(&dir, &bytes).unwrap();
+
+    // an op at epoch 2
+    let mut it2 = Item::default();
+    it2.set(tag::NAME, b"after".to_vec());
+    it2.set(tag::PASSWORD, b"secret2".to_vec());
+    let (op2, rid2) = v.make_upsert(ItemKind::Login, it2).unwrap();
+    mpm_store::append_op(&dir, &dev_id, &op2).unwrap();
+    v.commit(&op2).unwrap();
+
+    // the stale bundle: opens the epoch-1 op but not the epoch-2 one,
+    // and refuses to write entirely (write_epoch guard)
+    let m_new = mpm_store::load_manifest(&dir).unwrap();
+    let mut v_old = Vault::new(m_new, old_bundle, DeviceKey::from_bytes(&seed, dev_id)).unwrap();
+    v_old.apply_own_op(&op1).unwrap(); // epoch fallback finds dek@1
+    assert!(v_old.apply_own_op(&op2).is_err());
+    let mut itx = Item::default();
+    itx.set(tag::NAME, b"sneak".to_vec());
+    assert!(matches!(
+        v_old.make_upsert(ItemKind::Login, itx),
+        Err(mpm_core::CoreError::KeysRotated(2))
+    ));
+
+    // reopen with the new password: full history — both ops, both fields
+    // (reopen already replays the local log, epoch fallback included)
+    let v2 = reopen(&dir, b"pw-new", &seed, dev_id);
+    let i1 = v2.item(&rid1).unwrap();
+    let i2 = v2.item(&rid2).unwrap();
+    assert_eq!(i1.get(tag::PASSWORD).unwrap(), b"secret1");
+    assert_eq!(i2.get(tag::PASSWORD).unwrap(), b"secret2");
+
+    // and the old password no longer unwraps the rotated slot
+    let m2 = mpm_store::load_manifest(&dir).unwrap();
+    let (p2, s2) = m2.wrap_slots[0].kdf.unwrap();
+    let old_pw_kek = kdf::derive_kek(b"pw-old", &s2, &p2).unwrap();
+    assert!(KeyBundle::unwrap(
+        &old_pw_kek,
+        &mpm_core::aad::wrap_slot(&m2.vault_id, 2, SLOT_PASSWORD),
+        &m2.wrap_slots[0].blob,
+        2,
+    )
+    .is_err());
+}
+
+/// Legacy 64-byte bundles (dek||seed, pre-multi-epoch) unwrap into a
+/// single-epoch map keyed by the slot's aad epoch.
+#[test]
+fn legacy_bundle_v1_unwrap() {
+    let mut raw = [0u8; 64];
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut raw);
+    let kek = [7u8; 32];
+    let aad = [1u8; 38];
+    let nonce = mpm_crypto::aead::random_nonce();
+    let ct = mpm_crypto::aead::seal(&kek, &nonce, &aad, &raw).unwrap();
+    let mut blob = nonce.to_vec();
+    blob.extend_from_slice(&ct);
+    let b = KeyBundle::unwrap(&kek, &aad, &blob, 5).unwrap();
+    assert_eq!(b.current_epoch(), 5);
+    assert_eq!(b.dek_at(5).unwrap(), &raw[..32]);
+    assert_eq!(b.dek_at(1), None);
 }

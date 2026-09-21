@@ -32,6 +32,8 @@ pub struct RecordSummary {
     pub hlc: u64,
     pub tombstoned: bool,
     fields_ct: Vec<u8>,
+    /// key_epoch the winning op was sealed under — picks the DEK in `item()`.
+    key_epoch: u32,
     /// (device_id, seq) of the op that last won this record — the tiebreak
     /// that makes equal-HLC merges order-independent.
     origin: ([u8; DEVICE_ID_LEN], u64),
@@ -106,14 +108,7 @@ impl Vault {
             return Err(CoreError::RevokedWrite(op.seq));
         }
         let vk = entry.vk;
-        let pt = op.open(
-            &vk,
-            &self.bundle.dek,
-            &self.manifest.vault_id,
-            self.manifest.format_v,
-            self.manifest.key_epoch,
-            &self.device.id,
-        )?;
+        let pt = self.open_op(op, &vk, &self.device.id)?;
         if pt.prev_op_hash != self.head {
             return Err(CoreError::ChainBreak(op.seq));
         }
@@ -121,6 +116,61 @@ impl Vault {
         self.next_seq += 1;
         self.apply_pt(pt);
         Ok(())
+    }
+
+    /// Epoch new ops must be sealed under. If the manifest moved past the
+    /// bundle (keys rotated while this unlock was open), writing at the old
+    /// epoch would leak to anyone holding the old DEK — refuse instead.
+    fn write_epoch(&self) -> Result<u32> {
+        let e = self.manifest.key_epoch;
+        if self.bundle.current_epoch() != e || self.bundle.dek_at(e).is_none() {
+            return Err(CoreError::KeysRotated(e));
+        }
+        Ok(e)
+    }
+
+    /// Open an op trying each DEK epoch — logs span a rotation boundary:
+    /// ops written pre-rotation open under the old epoch, new ones under the
+    /// current. `hint` is the last epoch that worked for this log (ops are
+    /// appended sequentially, so the epoch flips at most once per log).
+    fn open_op_hinted(
+        &self,
+        op: &Op,
+        vk: &[u8; 32],
+        device_id: &[u8; DEVICE_ID_LEN],
+        hint: u32,
+    ) -> Result<OpPlaintext> {
+        let mut first_err = None;
+        for epoch in
+            std::iter::once(hint).chain(self.bundle.epochs_desc().filter(move |e| *e != hint))
+        {
+            let Some(dek) = self.bundle.dek_at(epoch) else {
+                continue;
+            };
+            match op.open(
+                vk,
+                dek,
+                &self.manifest.vault_id,
+                self.manifest.format_v,
+                epoch,
+                device_id,
+            ) {
+                Ok(pt) => return Ok(pt),
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        Err(first_err.unwrap_or(CoreError::Crypto(mpm_crypto::CryptoError::BadKey)))
+    }
+
+    fn open_op(
+        &self,
+        op: &Op,
+        vk: &[u8; 32],
+        device_id: &[u8; DEVICE_ID_LEN],
+    ) -> Result<OpPlaintext> {
+        self.open_op_hinted(op, vk, device_id, self.manifest.key_epoch)
     }
 
     /// Replay a FOREIGN device log (sync path): verifies each op's signature
@@ -184,6 +234,7 @@ impl Vault {
             entry.revoked_seq.unwrap_or(0)
         };
         let mut head = prev_head;
+        let mut epoch_hint = self.manifest.key_epoch;
         for (i, op) in ops.iter().enumerate() {
             let expected = first_seq + i as u64;
             let mut fail = |e: CoreError| ForeignVerify {
@@ -197,17 +248,11 @@ impl Vault {
             if op.seq > horizon {
                 return fail(CoreError::RevokedWrite(op.seq));
             }
-            match op.open(
-                &entry.vk,
-                &self.bundle.dek,
-                &self.manifest.vault_id,
-                self.manifest.format_v,
-                self.manifest.key_epoch,
-                device_id,
-            ) {
+            match self.open_op_hinted(op, &entry.vk, device_id, epoch_hint) {
                 Ok(pt) if pt.prev_op_hash == head => {
                     head = op.hash();
                     tip = (op.seq, head);
+                    epoch_hint = pt.key_epoch;
                     out.push(pt);
                 }
                 Ok(_) => return fail(CoreError::ChainBreak(op.seq)),
@@ -242,6 +287,7 @@ impl Vault {
                 hlc: 0,
                 tombstoned: false,
                 fields_ct: Vec::new(),
+                key_epoch: 0,
                 origin: ([0u8; DEVICE_ID_LEN], 0),
             });
         // Total order (hlc, origin_device, origin_seq): the merge result
@@ -254,6 +300,7 @@ impl Vault {
                     e.hlc = pt.hlc;
                     e.tombstoned = false;
                     e.fields_ct = pt.fields_ct;
+                    e.key_epoch = pt.key_epoch;
                     e.origin = (pt.origin_device, pt.origin_seq);
                 }
                 OpType::Tombstone => {
@@ -307,10 +354,11 @@ impl Vault {
         let name = item.get(tag::NAME).map(|v| v.to_vec()).unwrap_or_default();
         item.fields.remove(&tag::NAME); // name lives in the outer layer only
 
+        let epoch = self.write_epoch()?;
         let fields_ct = OpPlaintext::seal_fields(
-            &self.bundle.dek,
+            self.bundle.dek(),
             &self.manifest.vault_id,
-            self.manifest.key_epoch,
+            epoch,
             &record_id,
             &item,
         )?;
@@ -334,20 +382,22 @@ impl Vault {
             gossip: self.gossip(),
             origin_device: self.device.id,
             origin_seq: self.next_seq,
+            key_epoch: epoch,
         };
         Op::seal(
             &pt,
             self.next_seq,
-            &self.bundle.dek,
+            self.bundle.dek(),
             &self.manifest.vault_id,
             self.manifest.format_v,
-            self.manifest.key_epoch,
+            epoch,
             &self.device,
         )
     }
 
     /// Seal + sign a tombstone op for `record_id`.
     pub fn make_tombstone(&mut self, record_id: &[u8; RECORD_ID_LEN]) -> Result<Op> {
+        let epoch = self.write_epoch()?;
         let pt = OpPlaintext {
             prev_op_hash: self.head,
             hlc: self.next_hlc(),
@@ -361,14 +411,15 @@ impl Vault {
             gossip: self.gossip(),
             origin_device: self.device.id,
             origin_seq: self.next_seq,
+            key_epoch: epoch,
         };
         Op::seal(
             &pt,
             self.next_seq,
-            &self.bundle.dek,
+            self.bundle.dek(),
             &self.manifest.vault_id,
             self.manifest.format_v,
-            self.manifest.key_epoch,
+            epoch,
             &self.device,
         )
     }
@@ -398,12 +449,13 @@ impl Vault {
             gossip: Vec::new(),
             origin_device: [0u8; 16],
             origin_seq: 0,
+            key_epoch: rec.key_epoch,
         };
-        pt.open_fields(
-            &self.bundle.dek,
-            &self.manifest.vault_id,
-            self.manifest.key_epoch,
-        )
+        let dek = self
+            .bundle
+            .dek_at(rec.key_epoch)
+            .ok_or(CoreError::Crypto(mpm_crypto::CryptoError::BadKey))?;
+        pt.open_fields(dek, &self.manifest.vault_id)
     }
 
     pub fn records(&self) -> impl Iterator<Item = &RecordSummary> {
@@ -450,7 +502,17 @@ impl Vault {
     }
 
     pub fn dek(&self) -> &[u8; 32] {
-        &self.bundle.dek
+        self.bundle.dek()
+    }
+
+    /// Rotate the DEK: fresh epoch key, manifest.key_epoch follows in
+    /// lockstep. Caller re-wraps every slot and re-signs — ops already
+    /// sealed stay readable via DEK history. Pair with a password change
+    /// or a revoked device can just re-derive the same KEK.
+    pub fn rotate_keys(&mut self) -> u32 {
+        let epoch = self.bundle.rotate();
+        self.manifest.key_epoch = epoch;
+        epoch
     }
 
     pub fn bundle(&self) -> &KeyBundle {

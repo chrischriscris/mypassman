@@ -87,6 +87,11 @@ enum Cmd {
     },
     /// Show enrolled devices
     Devices,
+    /// Change the master password — re-wraps the vault keys under a new
+    /// password-derived KEK. The DEK itself does not rotate (that happens
+    /// on `pair revoke`); copies of this manifest already exfiltrated stay
+    /// openable by the old password — only future access needs the new one.
+    Passwd,
     /// Recovery kit management
     Recovery {
         #[command(subcommand)]
@@ -268,9 +273,16 @@ enum PairCmd {
     /// On the new device: exchange the invite for tokens after approval
     Finish,
     /// Revoke an enrolled device (id prefix) — owner re-signs the manifest
-    /// with the device inactive and the server burns its tokens. The device
-    /// keeps whatever it already saw; revocation stops future access.
-    Revoke { device: String },
+    /// with the device inactive and the server burns its tokens. Rotates the
+    /// vault DEK + master password by default: the device keeps what it saw
+    /// but can't read anything sealed after revocation.
+    Revoke {
+        device: String,
+        /// Skip key rotation (tidy an old offline device, etc.) — the
+        /// revoked device could still decrypt any ciphertext it obtains.
+        #[arg(long)]
+        keep_keys: bool,
+    },
 }
 
 fn vault_dir(cli: &Cli) -> PathBuf {
@@ -356,7 +368,7 @@ fn prompt_secret(what: &str) -> Zeroizing<String> {
 /// Vault-unlock secret: TTY prompt → $MPM_PASSWORD (scripting) → stdin.
 /// The env var is consumed (removed) so it can't leak into item fields or
 /// child processes spawned later in this process's lifetime.
-fn read_password(prompt: &str) -> Zeroizing<String> {
+pub(crate) fn read_password(prompt: &str) -> Zeroizing<String> {
     if let Ok(p) = std::env::var("MPM_PASSWORD") {
         std::env::remove_var("MPM_PASSWORD");
         return Zeroizing::new(p);
@@ -418,6 +430,7 @@ fn unlock(dir: &Path, recovery_mode: bool) -> Result<Vault, String> {
                             SLOT_BIOMETRIC,
                         ),
                         &slot.blob,
+                        manifest.key_epoch,
                     ) {
                         bundle = Some(b);
                         break;
@@ -460,6 +473,7 @@ fn unlock(dir: &Path, recovery_mode: bool) -> Result<Vault, String> {
                 &kek,
                 &mpm_core::aad::wrap_slot(&manifest.vault_id, manifest.key_epoch, slot_type),
                 &slot.blob,
+                manifest.key_epoch,
             ) {
                 bundle = Some(b);
                 break;
@@ -1354,12 +1368,12 @@ fn cmd_history(dir: &Path, rec: bool, name: &str, json: bool) -> Result<(), Stri
             });
             continue;
         }
+        let dek = vault
+            .bundle()
+            .dek_at(p.key_epoch)
+            .ok_or("no DEK for record epoch — vault key set is stale".to_string())?;
         let item = p
-            .open_fields(
-                vault.dek(),
-                &vault.manifest.vault_id,
-                vault.manifest.key_epoch,
-            )
+            .open_fields(dek, &vault.manifest.vault_id)
             .map_err(|e| e.to_string())?;
         let mut changed: Vec<String> = Vec::new();
         if let Some((_, pname)) = &prev {
@@ -1468,6 +1482,51 @@ fn fmt_hlc(ms: u64) -> String {
         tod % 3600 / 60,
         tod % 60
     )
+}
+
+fn cmd_passwd(dir: &Path, rec: bool) -> Result<(), String> {
+    let mut vault = unlock(dir, rec)?;
+    let p1 = read_password("new master password: ");
+    let p2 = read_password("confirm new password: ");
+    if *p1 != *p2 {
+        return Err("passwords don't match".into());
+    }
+    if p1.is_empty() {
+        return Err("empty password".into());
+    }
+    let params = KdfParams::default();
+    let mut salt = [0u8; 32];
+    rand_core_fill(&mut salt);
+    let kek = kdf::derive_kek(p1.as_bytes(), &salt, &params).map_err(|e| e.to_string())?;
+    let blob = vault
+        .bundle()
+        .wrap(
+            &kek,
+            &mpm_core::aad::wrap_slot(
+                &vault.manifest.vault_id,
+                vault.manifest.key_epoch,
+                SLOT_PASSWORD,
+            ),
+        )
+        .map_err(|e| e.to_string())?;
+    vault
+        .manifest
+        .wrap_slots
+        .retain(|s| s.slot_type != SLOT_PASSWORD);
+    vault.manifest.wrap_slots.push(WrapSlot {
+        slot_type: SLOT_PASSWORD,
+        kdf: Some((params, salt)),
+        blob,
+        extra: Vec::new(),
+    });
+    vault.manifest.snapshot_epoch += 1;
+    let bytes = vault.manifest.to_file(&vault.bundle().owner_signing_key());
+    mpm_store::write_manifest(dir, &bytes).map_err(|e| e.to_string())?;
+    eprintln!("master password changed");
+    eprintln!("note: sync propagates the new manifest; other devices unlock with the new password");
+    eprintln!("note: manifest copies already out there still open with the OLD password —");
+    eprintln!("      if the old password may be compromised, `pair revoke` rotates the DEK too");
+    Ok(())
 }
 
 fn cmd_recovery_rotate(dir: &Path, rec: bool) -> Result<(), String> {
@@ -2054,7 +2113,7 @@ fn clip_clear_supported() -> bool {
     }
 }
 
-fn rand_core_fill(b: &mut [u8]) {
+pub(crate) fn rand_core_fill(b: &mut [u8]) {
     rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, b);
 }
 
@@ -2725,6 +2784,7 @@ fn main() {
         Cmd::Rm { name } => cmd_rm(&dir, rec, name),
         Cmd::History { name, json } => cmd_history(&dir, rec, name, *json),
         Cmd::Devices => cmd_devices(&dir, cli.recovery),
+        Cmd::Passwd => cmd_passwd(&dir, rec),
         Cmd::Recovery { sub } => match sub {
             RecoveryCmd::Rotate => cmd_recovery_rotate(&dir, rec),
         },
@@ -2790,7 +2850,9 @@ fn main() {
             PairCmd::Decline { device } => sync::cmd_pair_decline(&dir, device),
             PairCmd::Join { url, invite, name } => sync::cmd_pair_join(&dir, url, invite, name),
             PairCmd::Finish => sync::cmd_pair_finish(&dir),
-            PairCmd::Revoke { device } => sync::cmd_pair_revoke(&dir, rec, device),
+            PairCmd::Revoke { device, keep_keys } => {
+                sync::cmd_pair_revoke(&dir, rec, device, *keep_keys)
+            }
         },
     };
 

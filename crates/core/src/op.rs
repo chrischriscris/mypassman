@@ -99,21 +99,18 @@ pub struct OpPlaintext {
     pub name: Vec<u8>,      // index-visible display name (UTF-8)
     pub fields_ct: Vec<u8>, // nonce||inner_ct; empty for tombstone/meta
     pub gossip: Vec<Gossip>,
-    /// Merge metadata — which device log + seq produced this op. Not part
-    /// of the encoded plaintext (already bound by AAD + device signature);
-    /// filled by `Op::open`, used for the deterministic merge order.
+    /// Merge metadata — which device log + seq produced this op, and the
+    /// key_epoch the op was sealed under. Not part of the encoded plaintext
+    /// (already bound by AAD + device signature); filled by `Op::open` —
+    /// `key_epoch` picks the right DEK for `open_fields` after a rotation.
     pub origin_device: [u8; DEVICE_ID_LEN],
     pub origin_seq: u64,
+    pub key_epoch: u32,
 }
 
 impl OpPlaintext {
     /// Decrypt the inner fields layer — the only place field plaintext exists.
-    pub fn open_fields(
-        &self,
-        dek: &[u8; 32],
-        vault_id: &[u8; VAULT_ID_LEN],
-        key_epoch: u32,
-    ) -> Result<Item> {
+    pub fn open_fields(&self, dek: &[u8; 32], vault_id: &[u8; VAULT_ID_LEN]) -> Result<Item> {
         if self.fields_ct.len() < NONCE_LEN + aead::TAG_LEN {
             return Err(CoreError::Tlv("fields_ct short"));
         }
@@ -122,7 +119,7 @@ impl OpPlaintext {
         let pt = zeroize::Zeroizing::new(aead::open(
             &k_rec,
             nonce.try_into().unwrap(),
-            &aad::record_fields(vault_id, &self.record_id, key_epoch),
+            &aad::record_fields(vault_id, &self.record_id, self.key_epoch),
             ct,
         )?);
         Item::decode(&pt)
@@ -217,6 +214,7 @@ impl OpPlaintext {
             gossip,
             origin_device: [0u8; 16],
             origin_seq: 0,
+            key_epoch: 0,
         })
     }
 }
@@ -307,6 +305,7 @@ impl Op {
         let mut pt = OpPlaintext::decode(&pt)?;
         pt.origin_device = *device_id;
         pt.origin_seq = self.seq;
+        pt.key_epoch = key_epoch;
         Ok(pt)
     }
 

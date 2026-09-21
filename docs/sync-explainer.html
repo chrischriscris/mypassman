@@ -747,8 +747,12 @@ h3 { font-size: 22px; margin-top: 2em; }
       history survives its own revocation; anything it writes after is refused on push,
       dropped at pull, and rejected at merge — including on the revoked device itself once
       it learns the new manifest. The relay burns its tokens, so its next call gets a 401.
-      The honest limit stands: it keeps whatever ciphertext it already pulled, so rotate any
-      secrets it saw.
+      And by default the DEK itself rotates: a fresh <code>key_epoch</code> is minted and every
+      wrap slot is re-wrapped under a NEW master password — necessary, because the revoked
+      device knew the old one and could otherwise unwrap the rotated bundle. Its DEK history
+      ends at the rotation: ops already written stay readable everywhere (you can't unread
+      what it saw), but anything sealed at the new epoch is unreachable even if the ciphertext
+      lands in its hands. <code>--keep-keys</code> skips this when secrecy isn't the point.
     </p>
   </div>
 </section>
@@ -845,9 +849,11 @@ h3 { font-size: 22px; margin-top: 2em; }
   sync serialization, bounded responses and no redirects. Since the second: revocation
   horizons (a revoked device's trusted ops survive), manifest-revision bumps on every
   owner write, owner/epoch pinning on adoption, foreign-log quarantine, torn-tail healing,
-  atomic sync-config writes, HTTPS enforcement, and zeroized key paths. Still open:
-  compaction/snapshots, conflict copies, gossip vectors, restored-device handling,
-  DEK rotation on revoke.
+  atomic sync-config writes, HTTPS enforcement, and zeroized key paths. Since the third:
+  multi-epoch key bundles — <code>pair revoke</code> rotates the DEK (with a new master
+  password, or it would be theater), so a revoked device can never read post-revocation
+  ciphertext. Still open: compaction/snapshots, conflict copies, gossip vectors,
+  restored-device handling.
 </footer>
 
 </main>
@@ -880,8 +886,8 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':
       <p>Sixty-four bytes of owner signature, then a TLV body. The signature is made with the owner signing key, which rides inside every wrap slot, so only someone who has unlocked the vault can produce a valid manifest.</p>
       <dl class="kv">
         <dt>vault_id</dt><dd>16 random bytes. Names the vault everywhere, including which Durable Object holds it.</dd>
-        <dt>wrap slots</dt><dd>The data key and owner key, wrapped once per unlock method: password, Touch ID, recovery kit.</dd>
-        <dt>key_epoch</dt><dd>The data-key generation — bumps when the DEK rotates (revocation does NOT rotate it today: the revoked device keeps the DEK). Ops are bound to it.</dd>
+        <dt>wrap slots</dt><dd>The key bundle — DEK history map + owner signing key — wrapped once per unlock method: password, Touch ID, recovery kit.</dd>
+        <dt>key_epoch</dt><dd>The data-key generation — bumps when the DEK rotates (revocation rotates it by default). Ops bind it in their AAD; decoders fall back through DEK history, so pre-rotation ops stay readable.</dd>
         <dt>snapshot_epoch</dt><dd>The manifest revision — bumped on every owner-signed write and pinned by the relay, so a replayed older manifest can never win a reconcile.</dd>
         <dt>device registry</dt><dd>One entry per device: id, ed25519 public key, name, active flag — plus a revocation horizon once revoked, so the device's trusted-era ops still merge. This is the whole access list.</dd>
         <dt>owner_vk</dt><dd>The public half of the owner key, so the signature can be checked without unlocking.</dd>

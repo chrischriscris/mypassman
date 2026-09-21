@@ -32,6 +32,17 @@ push, and at merge. The device keeps whatever ciphertext it already saw
 writes fail once it learns the new manifest; a fully cut-off device only
 learns via the 401s.
 
+By default revoke also **rotates the DEK**: a fresh `key_epoch` is minted,
+every wrap slot is re-wrapped, and — because the shared master password is
+itself compromised knowledge — the password slots move to a NEW master
+password. Ops sealed before the rotation remain readable via DEK history
+(the revoked device already saw that data; you can't unread it), but
+anything sealed at the new epoch is cryptographically unreachable for the
+revoked device even if it obtains the ciphertext — the difference between
+"revoked = can't sync" and "revoked = can't read new secrets".
+`--keep-keys` skips rotation for cases where secrecy doesn't matter
+(tidying an old offline device).
+
 **Foreign-log corruption quarantines, it doesn't wedge.** A device log
 that fails verification (bad sig, chain break, undecryptable op — e.g. a
 compromised-but-enrolled device pushing signed garbage) is skipped from
@@ -88,7 +99,7 @@ service**. It cannot silently modify vault history.
 | stolen sync token (write, device-bound) | replay own device ops, push own signed ops | push as another device, mint tokens, touch manifest |
 | stolen setup key | create empty vaults on the deployment | touch any existing vault |
 | stolen invite code (in TTL) | insert self into pending | finish without owner's manifest signature |
-| revoked device | keep old ciphertext | pull/push anything new |
+| revoked device | keep old ciphertext | pull/push anything new; after revoke's key rotation, decrypt post-rotation ops too |
 
 ## Auditing notes
 

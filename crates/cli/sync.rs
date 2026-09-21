@@ -1029,6 +1029,7 @@ pub fn cmd_pair_join(dir: &Path, url: &str, invite: &str, name: &str) -> Result<
                 &kek,
                 &mpm_core::aad::wrap_slot(&vault_id, m.key_epoch, slot.slot_type),
                 &slot.blob,
+                m.key_epoch,
             ) {
                 if bundle.owner_verifying_key() == m.owner_vk {
                     ok = true;
@@ -1136,7 +1137,7 @@ pub fn cmd_pair_finish(dir: &Path) -> Result<(), String> {
 /// inactive in the manifest (re-signed + pushed with CAS), then the server
 /// burns its tokens. Revocation is forward-looking: the device keeps
 /// whatever ciphertext it already pulled.
-pub fn cmd_pair_revoke(dir: &Path, rec: bool, prefix: &str) -> Result<(), String> {
+pub fn cmd_pair_revoke(dir: &Path, rec: bool, prefix: &str, keep_keys: bool) -> Result<(), String> {
     let m = mpm_store::load_manifest(dir).map_err(|e| e.to_string())?;
     let cfg = load_cfg(&m.vault_id)?.ok_or("no sync config")?;
     let admin = cfg
@@ -1215,6 +1216,135 @@ pub fn cmd_pair_revoke(dir: &Path, rec: bool, prefix: &str) -> Result<(), String
             d.revoked_seq = Some(horizon);
         }
     }
+    // Key rotation (default; --keep-keys skips): mint a new DEK epoch and
+    // re-wrap every slot. The master password must change too — the revoked
+    // device knew it and could otherwise just re-derive the same KEK and
+    // unwrap the rotated bundle. Ops already written stay readable via DEK
+    // history; anything sealed post-rotation is unreachable for the revoked
+    // device even if it obtains the ciphertext.
+    if !keep_keys {
+        let epoch = vault.rotate_keys();
+        eprintln!("rotating vault keys → key_epoch {epoch}");
+        let vid = vault.manifest.vault_id;
+        let mut pw_kek: Option<(mpm_crypto::kdf::KdfParams, [u8; 32], [u8; 32])> = None;
+        let mut slots = Vec::with_capacity(vault.manifest.wrap_slots.len());
+        for slot in &vault.manifest.wrap_slots {
+            match slot.slot_type {
+                mpm_core::manifest::SLOT_PASSWORD => {
+                    if pw_kek.is_none() {
+                        let p1 = crate::read_password("new master password: ");
+                        let p2 = crate::read_password("confirm new password: ");
+                        if *p1 != *p2 {
+                            return Err("passwords don't match".into());
+                        }
+                        let mut salt = [0u8; 32];
+                        crate::rand_core_fill(&mut salt);
+                        let kek = mpm_crypto::kdf::derive_kek(
+                            p1.as_bytes(),
+                            &salt,
+                            &slot.kdf.map(|(p, _)| p).unwrap_or_default(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        pw_kek = Some((slot.kdf.map(|(p, _)| p).unwrap_or_default(), salt, kek));
+                    }
+                    let (params, salt, kek) = pw_kek.as_ref().unwrap();
+                    let blob = vault
+                        .bundle()
+                        .wrap(
+                            kek,
+                            &mpm_core::aad::wrap_slot(
+                                &vid,
+                                epoch,
+                                mpm_core::manifest::SLOT_PASSWORD,
+                            ),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    slots.push(mpm_core::manifest::WrapSlot {
+                        slot_type: mpm_core::manifest::SLOT_PASSWORD,
+                        kdf: Some((*params, *salt)),
+                        blob,
+                        extra: Vec::new(),
+                    });
+                }
+                mpm_core::manifest::SLOT_RECOVERY => {
+                    // needs the physical kit — offer to retire it instead
+                    let code = crate::read_password(
+                        "recovery code to carry over (blank retires the kit): ",
+                    );
+                    if code.trim().is_empty() {
+                        eprintln!(
+                            "warning: recovery slot dropped — run `mypassman recovery` to mint a fresh kit"
+                        );
+                        continue;
+                    }
+                    let raw = mpm_core::recovery::parse_code(code.trim())
+                        .map_err(|_| "malformed recovery code".to_string())?;
+                    let mut salt = [0u8; 32];
+                    crate::rand_core_fill(&mut salt);
+                    let params = slot.kdf.map(|(p, _)| p).unwrap_or_default();
+                    let kek = mpm_crypto::kdf::derive_kek(&raw, &salt, &params)
+                        .map_err(|e| e.to_string())?;
+                    let blob = vault
+                        .bundle()
+                        .wrap(
+                            &kek,
+                            &mpm_core::aad::wrap_slot(
+                                &vid,
+                                epoch,
+                                mpm_core::manifest::SLOT_RECOVERY,
+                            ),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    slots.push(mpm_core::manifest::WrapSlot {
+                        slot_type: mpm_core::manifest::SLOT_RECOVERY,
+                        kdf: Some((params, salt)),
+                        blob,
+                        extra: Vec::new(),
+                    });
+                }
+                #[cfg(target_os = "macos")]
+                mpm_core::manifest::SLOT_BIOMETRIC => {
+                    // the keychain KEK lives on THIS machine — re-wrap if
+                    // present, else the slot is useless post-rotation anyway
+                    match crate::bio::load(&vid) {
+                        Some(kek) => {
+                            let blob = vault
+                                .bundle()
+                                .wrap(
+                                    &kek,
+                                    &mpm_core::aad::wrap_slot(
+                                        &vid,
+                                        epoch,
+                                        mpm_core::manifest::SLOT_BIOMETRIC,
+                                    ),
+                                )
+                                .map_err(|e| e.to_string())?;
+                            slots.push(mpm_core::manifest::WrapSlot {
+                                slot_type: mpm_core::manifest::SLOT_BIOMETRIC,
+                                kdf: None,
+                                blob,
+                                extra: Vec::new(),
+                            });
+                        }
+                        None => eprintln!(
+                            "warning: no keychain key here — biometric slot dropped;                              re-run `mypassman bio on` on each device"
+                        ),
+                    }
+                }
+                _ => {
+                    eprintln!(
+                        "warning: unknown slot type {} dropped during rotation",
+                        slot.slot_type
+                    );
+                }
+            }
+        }
+        vault.manifest.wrap_slots = slots;
+        eprintln!(
+            "master password rotated — other devices must unlock with the new              password on next sync; their pre-rotation data stays intact"
+        );
+    }
+
     // bump the manifest revision — every owner-signed write does, so a
     // replayed pre-revoke manifest can never win a reconcile
     vault.manifest.snapshot_epoch += 1;
