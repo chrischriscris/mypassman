@@ -482,6 +482,7 @@ fn unlock(dir: &Path, recovery_mode: bool) -> Result<Vault, String> {
                 revoked_seq: None,
                 extra: Vec::new(),
             });
+            manifest.snapshot_epoch += 1;
             let owner_sk = bundle.owner_signing_key();
             let bytes = manifest.to_file(&owner_sk);
             mpm_store::write_manifest(dir, &bytes).map_err(|e| e.to_string())?;
@@ -1498,6 +1499,7 @@ fn cmd_recovery_rotate(dir: &Path, rec: bool) -> Result<(), String> {
             .map_err(|e| e.to_string())?,
         extra: Vec::new(),
     });
+    vault.manifest.snapshot_epoch += 1;
     let owner_sk = vault.bundle().owner_signing_key();
     let bytes = vault.manifest.to_file(&owner_sk);
     mpm_store::write_manifest(dir, &bytes).map_err(|e| e.to_string())?;
@@ -2668,6 +2670,7 @@ fn cmd_bio_enroll(dir: &Path, rec: bool) -> Result<(), String> {
             .map_err(|e| e.to_string())?,
         extra: Vec::new(),
     });
+    vault.manifest.snapshot_epoch += 1;
     let owner_sk = vault.bundle().owner_signing_key();
     let bytes = vault.manifest.to_file(&owner_sk);
     mpm_store::write_manifest(dir, &bytes).map_err(|e| e.to_string())?;
@@ -2685,6 +2688,7 @@ fn cmd_bio_off(dir: &Path, rec: bool) -> Result<(), String> {
         .manifest
         .wrap_slots
         .retain(|s| s.slot_type != SLOT_BIOMETRIC);
+    vault.manifest.snapshot_epoch += 1;
     let owner_sk = vault.bundle().owner_signing_key();
     let bytes = vault.manifest.to_file(&owner_sk);
     mpm_store::write_manifest(dir, &bytes).map_err(|e| e.to_string())?;
