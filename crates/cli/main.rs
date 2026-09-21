@@ -255,6 +255,12 @@ enum PairCmd {
     },
     /// On the new device: exchange the invite for tokens after approval
     Finish,
+    /// Revoke an enrolled device (id prefix) — owner re-signs the manifest
+    /// with the device inactive and the server burns its tokens. The device
+    /// keeps whatever it already saw; revocation stops future access.
+    Revoke { device: String },
+    /// List enrolled devices and their status
+    Devices,
 }
 
 fn vault_dir(cli: &Cli) -> PathBuf {
@@ -2530,6 +2536,8 @@ fn main() {
             PairCmd::Decline { device } => sync::cmd_pair_decline(&dir, device),
             PairCmd::Join { url, invite, name } => sync::cmd_pair_join(&dir, url, invite, name),
             PairCmd::Finish => sync::cmd_pair_finish(&dir),
+            PairCmd::Revoke { device } => sync::cmd_pair_revoke(&dir, rec, device),
+            PairCmd::Devices => sync::cmd_pair_devices(&dir),
         },
     };
 

@@ -1,0 +1,8 @@
+target
+.git
+syncd-data
+syncd/node_modules
+syncd/.wrangler
+docs
+integrations
+*.md

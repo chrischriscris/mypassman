@@ -1,0 +1,743 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mypassman · how sync works</title>
+<style>
+  :root {
+    --bg: #090b10;
+    --ink: #eef2f8;
+    --dim: #93a0b4;
+    --faint: #5b6577;
+    --card: rgba(255,255,255,.035);
+    --edge: rgba(255,255,255,.09);
+    --a: #22d3ee;  /* device A — cyan   */
+    --b: #fbbf24;  /* device B — amber  */
+    --s: #a78bfa;  /* syncd   — violet  */
+    --ok: #34d399;
+    --bad: #fb7185;
+    --mono: ui-monospace, "SF Mono", Menlo, monospace;
+    --ease: cubic-bezier(.22,1,.36,1);
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font: 16px/1.6 -apple-system, "SF Pro Text", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  code, .mono { font-family: var(--mono); font-size: .85em; }
+  code { background: rgba(255,255,255,.06); padding: .15em .45em; border-radius: 5px; }
+  button { font: inherit; cursor: pointer; }
+
+  /* ambient */
+  .glow { position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background:
+      radial-gradient(700px 420px at 15% -5%, #22d3ee14, transparent 60%),
+      radial-gradient(700px 420px at 85% 10%, #a78bfa12, transparent 60%),
+      radial-gradient(600px 500px at 50% 110%, #fbbf240a, transparent 60%);
+  }
+
+  /* progress nav */
+  .pnav {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 50;
+    display: flex; gap: 4px; justify-content: center; padding: 14px;
+    background: linear-gradient(#090b10f2, #090b1000);
+  }
+  .pnav .dot {
+    width: 26px; height: 4px; border-radius: 2px; border: 0; padding: 0;
+    background: rgba(255,255,255,.14); transition: all .35s var(--ease);
+  }
+  .pnav .dot.on { background: var(--a); width: 44px; }
+  .pnav .dot.seen { background: rgba(255,255,255,.4); }
+
+  /* chapters */
+  main { position: relative; z-index: 1; }
+  .ch { min-height: 100vh; display: flex; flex-direction: column; justify-content: center;
+    align-items: center; padding: 90px 24px 60px; }
+  .ch-in { width: min(980px, 100%); }
+  .kick { font: 600 12px/1 var(--mono); letter-spacing: .22em; text-transform: uppercase;
+    color: var(--a); margin-bottom: 18px; }
+  h1 { font-size: clamp(42px, 7vw, 76px); font-weight: 800; letter-spacing: -.03em; line-height: 1.02; }
+  h2 { font-size: clamp(30px, 4.5vw, 46px); font-weight: 750; letter-spacing: -.025em; line-height: 1.08; margin-bottom: 18px; }
+  .lede { font-size: 18px; color: var(--dim); max-width: 62ch; }
+  .lede strong { color: var(--ink); }
+  .body { color: var(--dim); max-width: 66ch; margin-top: 14px; }
+  .body strong { color: var(--ink); }
+
+  .card {
+    background: var(--card); border: 1px solid var(--edge); border-radius: 16px;
+    padding: 22px; backdrop-filter: blur(8px);
+  }
+  .row { display: flex; gap: 16px; }
+  .row > * { flex: 1; }
+  @media (max-width: 760px) { .row { flex-direction: column; } }
+
+  .nextbtn {
+    margin-top: 34px; align-self: center;
+    background: rgba(255,255,255,.06); color: var(--ink); border: 1px solid var(--edge);
+    border-radius: 999px; padding: 11px 26px; font-weight: 600; font-size: 14px;
+    transition: all .25s var(--ease);
+  }
+  .nextbtn:hover { background: var(--a); color: #06262b; border-color: var(--a); transform: translateY(-1px); }
+
+  /* animated reveal */
+  .rv { opacity: 0; transform: translateY(26px); transition: opacity .7s var(--ease), transform .7s var(--ease); }
+  .ch.vis .rv { opacity: 1; transform: none; }
+  .rv.d1 { transition-delay: .12s } .rv.d2 { transition-delay: .24s } .rv.d3 { transition-delay: .36s } .rv.d4 { transition-delay: .48s }
+
+  /* ═══ vault tree ═══ */
+  .tree { font-family: var(--mono); font-size: 14.5px; line-height: 1.9; color: var(--dim); }
+  .tree b { color: var(--ink); font-weight: 600; }
+  .tree .hl { color: var(--a); }
+  .tree .note { color: var(--faint); }
+
+  /* ═══ op frame builder ═══ */
+  .frame { display: flex; gap: 6px; margin: 26px 0 8px; min-height: 86px; }
+  .seg {
+    border-radius: 10px; border: 1px solid var(--edge); padding: 12px 14px;
+    display: flex; flex-direction: column; justify-content: center;
+    opacity: 0; transform: translateY(14px) scale(.96);
+    transition: all .55s var(--ease); position: relative;
+  }
+  .seg.in { opacity: 1; transform: none; }
+  .seg .nm { font: 700 11px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+  .seg .vl { font: 12px/1.4 var(--mono); color: var(--dim); margin-top: 6px; word-break: break-all; }
+  .seg.seq  { background: #fbbf2418; border-color: #fbbf2450; flex: 0 0 74px; }
+  .seg.seq .nm { color: var(--b); }
+  .seg.non  { background: #22d3ee14; border-color: #22d3ee45; flex: 0 0 96px; }
+  .seg.non .nm { color: var(--a); }
+  .seg.sig  { background: #34d39914; border-color: #34d39945; flex: 0 0 110px; }
+  .seg.sig .nm { color: var(--ok); }
+  .seg.ct   { background: #a78bfa14; border-color: #a78bfa45; flex: 1; }
+  .seg.ct .nm { color: var(--s); }
+  .cap { font-size: 13px; color: var(--faint); min-height: 20px; }
+
+  /* ═══ chain ═══ */
+  .chainv { display: flex; align-items: center; gap: 0; margin: 30px 0 10px; flex-wrap: wrap; }
+  .opchip {
+    background: var(--card); border: 1px solid var(--edge); border-radius: 12px;
+    padding: 12px 16px; font-family: var(--mono); font-size: 13px;
+    transition: all .4s var(--ease);
+  }
+  .opchip .s { color: var(--b); font-weight: 700; }
+  .opchip .pv { display: block; font-size: 11px; color: var(--faint); margin-top: 3px; }
+  .opchip .pv b { color: var(--a); font-weight: 500; }
+  .opchip:hover { border-color: var(--a); transform: translateY(-3px); }
+  .carr { color: var(--faint); padding: 0 8px; font-size: 18px; }
+
+  /* ═══ live simulator ═══ */
+  .sim { display: grid; grid-template-columns: 1fr 1.15fr 1fr; gap: 14px; margin-top: 24px; }
+  @media (max-width: 820px) { .sim { grid-template-columns: 1fr; } }
+  .col { border-radius: 16px; border: 1px solid var(--edge); background: var(--card); padding: 16px; min-height: 330px; position: relative; }
+  .col h4 { font-size: 14px; display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .col .role { font-size: 11.5px; color: var(--faint); margin-bottom: 12px; }
+  .col.a { border-top: 3px solid var(--a); }
+  .col.b { border-top: 3px solid var(--b); }
+  .col.s { border-top: 3px solid var(--s); }
+  .pill { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .pill.a { background: var(--a); box-shadow: 0 0 10px var(--a); }
+  .pill.b { background: var(--b); box-shadow: 0 0 10px var(--b); }
+  .pill.s { background: var(--s); box-shadow: 0 0 10px var(--s); }
+
+  .logbox, .vaultbox { margin-top: 10px; }
+  .logbox .lb, .vaultbox .lb { font: 600 10.5px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--faint); margin-bottom: 6px; }
+  .oprow {
+    font: 12px/1.5 var(--mono); background: rgba(255,255,255,.045); border: 1px solid var(--edge);
+    border-radius: 8px; padding: 5px 10px; margin: 4px 0;
+    display: flex; justify-content: space-between; gap: 8px;
+    animation: pop .4s var(--ease);
+  }
+  .oprow .d { font-weight: 700; }
+  .oprow .d.a { color: var(--a); } .oprow .d.b { color: var(--b); }
+  .itemrow {
+    font-size: 13px; background: rgba(52,211,153,.08); border: 1px solid rgba(52,211,153,.25);
+    color: var(--ink); border-radius: 8px; padding: 6px 10px; margin: 4px 0;
+    animation: pop .45s var(--ease);
+  }
+  .itemrow .k { color: var(--ok); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; margin-right: 8px; font-family: var(--mono); }
+  @keyframes pop { from { opacity: 0; transform: translateY(8px) scale(.95); } }
+  .empty { color: var(--faint); font-size: 12.5px; font-style: italic; padding: 4px 0; }
+
+  .headstat { font: 12px var(--mono); color: var(--dim); }
+  .headstat b { color: var(--ink); font-size: 15px; }
+
+  .simbtn {
+    background: rgba(255,255,255,.07); color: var(--ink); border: 1px solid var(--edge);
+    border-radius: 9px; padding: 8px 13px; font-size: 13px; font-weight: 600; margin: 4px 4px 0 0;
+    transition: all .2s var(--ease);
+  }
+  .simbtn:hover { transform: translateY(-1px); }
+  .simbtn.a:hover { background: var(--a); color: #06262b; }
+  .simbtn.b:hover { background: var(--b); color: #292004; }
+  .simbtn.s:hover { background: var(--s); color: #1e1245; }
+  .simbtn:disabled { opacity: .35; cursor: default; transform: none; }
+
+  /* flying op packet */
+  .pkt {
+    position: absolute; z-index: 30; pointer-events: none;
+    font: 700 11px var(--mono); padding: 5px 10px; border-radius: 8px;
+    transition: all .8s var(--ease); box-shadow: 0 4px 20px rgba(0,0,0,.5);
+    white-space: nowrap;
+  }
+  .pkt.a { background: var(--a); color: #06262b; }
+  .pkt.b { background: var(--b); color: #292004; }
+
+  .simlog { margin-top: 14px; font: 12.5px/1.7 var(--mono); color: var(--dim); min-height: 44px; }
+  .simlog .t { color: var(--faint); }
+  .simlog .hl { color: var(--ok); }
+
+  /* ═══ pairing sequence ═══ */
+  .pstage { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 18px; position: relative; margin-top: 20px; }
+  .actor { text-align: center; }
+  .actor .box { border-radius: 14px; border: 1px solid var(--edge); background: var(--card); padding: 14px; min-height: 74px; }
+  .actor .nm { font-weight: 700; font-size: 14px; }
+  .actor .st { font: 11.5px var(--mono); color: var(--dim); margin-top: 6px; min-height: 34px; }
+  .actor .st b { font-weight: 600; }
+  .actor .st .have { color: var(--ok); }
+  .actor .st .want { color: var(--faint); }
+  .actor.b .nm { color: var(--b); } .actor.s .nm { color: var(--s); } .actor.a .nm { color: var(--a); }
+  .pmsg { margin: 18px 0 0; }
+  .pline {
+    display: flex; align-items: center; gap: 12px; padding: 9px 14px;
+    border-radius: 10px; margin: 5px 0; border: 1px solid transparent;
+    font-size: 14px; color: var(--faint); transition: all .45s var(--ease);
+  }
+  .pline .n { font: 700 11px var(--mono); color: var(--faint); width: 20px; }
+  .pline.on { color: var(--ink); background: var(--card); border-color: var(--edge); }
+  .pline.on .n { color: var(--a); }
+  .pline.done { color: var(--dim); }
+  .pline.done .n { color: var(--ok); }
+  .pline .who { font-weight: 700; min-width: 88px; font-size: 13px; }
+  .pline .who.b { color: var(--b); } .pline .who.a { color: var(--a); } .pline .who.s { color: var(--s); }
+
+  /* ═══ views toggle ═══ */
+  .vtoggle { display: inline-flex; background: var(--card); border: 1px solid var(--edge); border-radius: 999px; padding: 4px; margin: 18px 0; }
+  .vtoggle button { border: 0; background: transparent; color: var(--dim); padding: 8px 20px; border-radius: 999px; font-weight: 600; font-size: 13.5px; transition: all .25s var(--ease); }
+  .vtoggle button.on { background: var(--ink); color: var(--bg); }
+  .view { display: none; }
+  .view.on { display: block; animation: fade .3s var(--ease); }
+  @keyframes fade { from { opacity: 0; } }
+  .view .row pre {
+    font: 12px/1.7 var(--mono); color: var(--dim); white-space: pre-wrap; word-break: break-all;
+  }
+  .view pre .enc { color: var(--s); }
+  .view pre .meta { color: var(--b); }
+
+  /* checklist */
+  .todo li { list-style: none; padding: 8px 0 8px 30px; position: relative; color: var(--dim); }
+  .todo li::before { content: "◻"; position: absolute; left: 0; color: var(--faint); }
+  .todo li.done::before { content: "◼"; color: var(--ok); }
+  .todo li.done { color: var(--ink); }
+  .todo { padding-left: 0; }
+  ul { padding-left: 22px; }
+  li { margin: 5px 0; }
+</style>
+</head>
+<body>
+<div class="glow"></div>
+<nav class="pnav" id="pnav"></nav>
+<main id="main">
+
+<!-- ═══ 0 · hero ═══ -->
+<section class="ch" data-ch>
+  <div class="ch-in" style="text-align:center">
+    <div class="kick rv">mypassman · M3</div>
+    <h1 class="rv d1">Your vault,<br>everywhere.<br><span style="color:var(--dim);font-weight:600">Without trusting anyone.</span></h1>
+    <p class="lede rv d3" style="margin:26px auto 0">How a password manager syncs between your devices through a server that
+    <strong>can verify but never read</strong> — a guided tour of the pieces we just built.</p>
+    <button class="nextbtn rv d4" data-next>begin ↓</button>
+  </div>
+</section>
+
+<!-- ═══ 1 · the problem ═══ -->
+<section class="ch" data-ch>
+  <div class="ch-in">
+    <div class="kick rv">the itch</div>
+    <h2 class="rv d1">Two laptops. One vault.<br>A server in between.</h2>
+    <p class="body rv d2">You add a login on your work machine. Tonight, on the couch machine, it's just… there.
+    The naive way is a cloud that holds your database. But then the cloud <strong>holds your database</strong>.</p>
+    <div class="row rv d3" style="margin-top:26px">
+      <div class="card"><b style="color:var(--bad)">✗ trust-based</b><p style="font-size:14px;margin-top:8px">Server stores your vault, encrypted or not — a breach, an insider, a subpoena, and the question is always "how much did they get?"</p></div>
+      <div class="card"><b style="color:var(--ok)">✓ zero-knowledge</b><p style="font-size:14px;margin-top:8px">Server stores only ciphertext it can <em>verify</em> — who wrote it, that it wasn't forged, that it fits the chain — and can never read.</p></div>
+    </div>
+    <p class="body rv d4">mypassman's sync is the second kind. The trick that makes it work: <strong>every change is already a signed, encrypted frame</strong>. Sync just moves frames.</p>
+    <button class="nextbtn rv d4" data-next>what gets moved →</button>
+  </div>
+</section>
+
+<!-- ═══ 2 · the vault ═══ -->
+<section class="ch" data-ch>
+  <div class="ch-in">
+    <div class="kick rv">the shape</div>
+    <h2 class="rv d1">A vault is a folder,<br>not a file.</h2>
+    <div class="row" style="margin-top:10px;align-items:flex-start">
+      <div class="card rv d2">
+        <div class="tree">~/.mypassman/vault/<br>
+├── <b class="hl">MANIFEST</b> <span class="note">← who owns this, who's allowed in</span><br>
+├── <b>ops/</b><br>
+│&nbsp;&nbsp; ├── <b class="hl">7fd5aa1f….log</b> <span class="note">← laptop A's changes</span><br>
+│&nbsp;&nbsp; └── <b class="hl">1a25c173….log</b> <span class="note">← laptop B's changes</span><br>
+└── snapshots/ <span class="note">(compaction, later)</span></div>
+      </div>
+      <div class="rv d3">
+        <p class="body" style="margin-top:0">One append-only log <strong>per device</strong>. Nobody ever writes to anyone else's — so two devices can edit offline with zero coordination, then exchange logs and converge.</p>
+        <p class="body">Sync is just: <strong>give the server my new lines, take their new lines.</strong></p>
+        <p class="body" style="font-size:13.5px;color:var(--faint)">Device signing keys live <em>outside</em> the vault dir (<code>~/Library/…/mypassman/devices/</code>) — they never travel.</p>
+      </div>
+    </div>
+    <button class="nextbtn rv d4" data-next>inside one op →</button>
+  </div>
+</section>
+
+<!-- ═══ 3 · an op is born ═══ -->
+<section class="ch" data-ch>
+  <div class="ch-in">
+    <div class="kick rv">the unit</div>
+    <h2 class="rv d1">Every change becomes<br>a signed, sealed frame.</h2>
+    <p class="body rv d2">Watch one assemble — click <b style="color:var(--a)">add "github login" on device A</b>:</p>
+    <div class="rv d3">
+      <button class="simbtn a" id="birthBtn">+ add item on A</button>
+      <span class="cap mono" id="birthCap" style="margin-left:12px"></span>
+      <div class="frame" id="frame">
+        <div class="seg seq"><span class="nm">seq</span><span class="vl" id="vSeq"></span></div>
+        <div class="seg non"><span class="nm">nonce</span><span class="vl" id="vNon"></span></div>
+        <div class="seg sig"><span class="nm">ed25519 sig</span><span class="vl" id="vSig"></span></div>
+        <div class="seg ct"><span class="nm">ciphertext</span><span class="vl" id="vCt"></span></div>
+      </div>
+      <div class="cap" id="frameCap"></div>
+    </div>
+    <p class="body rv d4" style="margin-top:22px">The signature covers <code>seq · nonce · ciphertext</code> — <strong>verifiable without the key</strong>. Inside the ciphertext: the item, and the hash of the previous op — the chain link.</p>
+    <button class="nextbtn rv d4" data-next>the chain →</button>
+  </div>
+</section>
+
+<!-- ═══ 4 · chain ═══ -->
+<section class="ch" data-ch>
+  <div class="ch-in">
+    <div class="kick rv">integrity</div>
+    <h2 class="rv d1">Each op locks onto the last.</h2>
+    <p class="body rv d2">Inside every ciphertext sits <code>prev_op_hash</code>. Cut the log, reorder it, swap an op — the chain breaks and the vault <strong>refuses</strong>, loudly. Each device's chain is its own seq space: A counts 1,2,3… and so does B.</p>
+    <div class="card rv d3">
+      <div style="font:600 11px var(--mono);color:var(--faint);letter-spacing:.1em;margin-bottom:4px">DEVICE A'S LOG</div>
+      <div class="chainv">
+        <div class="opchip"><span class="s">seq 1</span><span class="pv">prev <b>0x000000</b></span></div><div class="carr">→</div>
+        <div class="opchip"><span class="s">seq 2</span><span class="pv">prev <b>9f2e1a</b></span></div><div class="carr">→</div>
+        <div class="opchip"><span class="s">seq 3</span><span class="pv">prev <b>41c8d0</b></span></div><div class="carr">→</div>
+        <div class="opchip" style="border-color:var(--a)"><span class="s">seq 4</span><span class="pv">prev <b>b77e33</b> · head</span></div>
+      </div>
+      <div style="font:600 11px var(--mono);color:var(--faint);letter-spacing:.1em;margin:14px 0 4px">DEVICE B'S LOG — independent</div>
+      <div class="chainv">
+        <div class="opchip"><span class="s" style="color:var(--b)">seq 1</span><span class="pv">prev <b>0x000000</b></span></div><div class="carr">→</div>
+        <div class="opchip"><span class="s" style="color:var(--b)">seq 2</span><span class="pv">prev <b>5aa1f9</b> · head</span></div>
+      </div>
+    </div>
+    <p class="body rv d4">When both logs live in one vault, merge is <strong>per-record, last-writer-wins by hybrid clock</strong> — every device that sees the same ops lands on the same state, in any order.</p>
+    <button class="nextbtn rv d4" data-next>the relay →</button>
+  </div>
+</section>
+
+<!-- ═══ 5 · syncd ═══ -->
+<section class="ch" data-ch>
+  <div class="ch-in">
+    <div class="kick rv">the relay</div>
+    <h2 class="rv d1">syncd: a suspicious bouncer<br>for ciphertext.</h2>
+    <p class="body rv d2">A Cloudflare Worker routes <code>/v/&lt;vault&gt;/…</code> to a <strong>Durable Object</strong> — a tiny single-threaded actor with its own SQLite, one per vault. Free-tier self-hostable.</p>
+    <div class="row rv d3" style="margin-top:8px">
+      <div class="card"><b style="color:var(--ok)">it enforces</b>
+        <ul style="font-size:14px;margin-top:8px">
+          <li>op signature valid <em>for that device</em> (from the manifest)</li>
+          <li>seq continues the chain — no gaps, no forks</li>
+          <li>manifest swap is compare-and-swap on sha256</li>
+          <li>epochs never go backwards</li>
+        </ul>
+      </div>
+      <div class="card"><b style="color:var(--bad)">it can't</b>
+        <ul style="font-size:14px;margin-top:8px">
+          <li>read a single byte of an item — no key, ever</li>
+          <li>add a device — that needs the owner's signature</li>
+          <li>forge ops — a write token only extends <em>its own</em> chain</li>
+        </ul>
+      </div>
+    </div>
+    <div class="card rv d4 mono" style="font-size:13px;margin-top:14px;color:var(--dim)">
+      tokens (stored as sha256): <b style="color:var(--a)">admin</b> — bootstrap machine only, approves devices ·
+      <b style="color:var(--ok)">write</b> — append ops, bound to one device ·
+      <b style="color:var(--dim)">read</b> — fetch manifest/ops/state
+    </div>
+    <button class="nextbtn rv d4" data-next>see it move →</button>
+  </div>
+</section>
+
+<!-- ═══ 6 · LIVE SIMULATOR ═══ -->
+<section class="ch" data-ch>
+  <div class="ch-in">
+    <div class="kick rv">live demo</div>
+    <h2 class="rv d1">Play with it.<br>Break it if you can.</h2>
+    <p class="body rv d2">A toy version of the real protocol. Add items while "offline", then sync. Ops only appear where they've actually been delivered.</p>
+    <div class="sim rv d3" id="sim">
+      <div class="col a" id="colA">
+        <h4><span class="pill a"></span>laptop A <span class="headstat" style="margin-left:auto">log: <b id="hA">0</b> ops</span></h4>
+        <div class="role">has admin + its own r/w tokens</div>
+        <div class="logbox"><div class="lb">ops/…A.log</div><div id="logA"><div class="empty">empty</div></div></div>
+        <div class="vaultbox"><div class="lb">unlocked view</div><div id="viewA"><div class="empty">—</div></div></div>
+        <div style="margin-top:10px">
+          <button class="simbtn a" id="addA">+ add item</button>
+          <button class="simbtn a" id="syncA">⇅ mypassman sync</button>
+        </div>
+      </div>
+      <div class="col s" id="colS">
+        <h4><span class="pill s"></span>syncd <span class="headstat" style="margin-left:auto">durable object</span></h4>
+        <div class="role">verifies sigs, stores frames it can't read</div>
+        <div class="logbox"><div class="lb">stored heads</div>
+          <div class="headstat">A → <b id="srvA">0</b> &nbsp;·&nbsp; B → <b id="srvB">0</b></div>
+          <div id="logS" style="margin-top:8px"><div class="empty">no ops stored</div></div>
+        </div>
+      </div>
+      <div class="col b" id="colB">
+        <h4><span class="pill b"></span>laptop B <span class="headstat" style="margin-left:auto">log: <b id="hB">0</b> ops</span></h4>
+        <div class="role">paired device — own r/w tokens</div>
+        <div class="logbox"><div class="lb">ops/…B.log (+ pulled A.log)</div><div id="logB"><div class="empty">empty</div></div></div>
+        <div class="vaultbox"><div class="lb">unlocked view</div><div id="viewB"><div class="empty">—</div></div></div>
+        <div style="margin-top:10px">
+          <button class="simbtn b" id="addB">+ add item</button>
+          <button class="simbtn b" id="syncB">⇅ mypassman sync</button>
+        </div>
+      </div>
+    </div>
+    <div class="simlog rv d4 mono" id="simLog"><span class="t">// try: add on A → sync A → sync B → item appears on B</span></div>
+    <button class="nextbtn rv d4" data-next>how B got in →</button>
+  </div>
+</section>
+
+<!-- ═══ 7 · pairing ═══ -->
+<section class="ch" data-ch>
+  <div class="ch-in">
+    <div class="kick rv">enrollment</div>
+    <h2 class="rv d1">A new device earns its seat.<br>By signature, not by promise.</h2>
+    <div class="row rv d2" style="align-items:flex-start">
+      <div style="flex:1.5">
+        <div class="pstage">
+          <div class="actor b"><div class="box"><div class="nm">new device</div><div class="st" id="stB"><span class="want">no vault yet</span></div></div></div>
+          <div class="actor s"><div class="box"><div class="nm">syncd</div><div class="st" id="stS"><span class="want">manifest · ops · pending[]</span></div></div></div>
+          <div class="actor a"><div class="box"><div class="nm">owner A</div><div class="st" id="stA"><span class="have">admin token · owner key</span></div></div></div>
+        </div>
+        <div class="pmsg" id="plines"></div>
+        <button class="simbtn s" id="pairPlay" style="margin-top:10px">▶ play enrollment</button>
+      </div>
+      <div class="card rv d3" style="flex:1">
+        <b>The one idea that matters</b>
+        <p style="font-size:14.5px;margin-top:10px">The server keeps a <code>pending</code> queue — but approval isn't a row there. Approval is <strong>A re-signing the manifest with B inside it</strong>.</p>
+        <p style="font-size:14.5px">When B calls <code>finish</code>, the server looks at the <em>manifest</em> — a thing it cannot forge — and only then mints B's tokens. A stolen invite code buys you a queue position and nothing else.</p>
+      </div>
+    </div>
+    <button class="nextbtn rv d4" data-next>the daemon →</button>
+  </div>
+</section>
+
+<!-- ═══ 8 · daemon ═══ -->
+<section class="ch" data-ch>
+  <div class="ch-in">
+    <div class="kick rv">live merge</div>
+    <h2 class="rv d1">The daemon notices<br>what sync dropped off.</h2>
+    <p class="body rv d2">Your unlock daemon holds the vault in memory. A <code>sync</code> appends foreign ops to disk <em>while it sleeps between requests</em>. So before answering <em>any</em> request — a Raycast list, a <code>get</code> — it:</p>
+    <div class="card rv d3 mono" style="font-size:13.5px;line-height:1.9;margin-top:14px">
+      <b>refresh()</b> — own log: new ops? apply. shrank/diverged? scream.<br>
+      <b>refresh_foreign()</b> — for each other device's log:<br>
+      &nbsp;&nbsp;· reload MANIFEST if devices changed (approvals land here)<br>
+      &nbsp;&nbsp;· verify only the <b style="color:var(--a)">new suffix</b>: sig + seq + chain<br>
+      &nbsp;&nbsp;· merge → records update by max-HLC
+    </div>
+    <p class="body rv d4">Net effect from the couch: <code>sync</code> on a cron, and the vault you open is always current — <strong>no re-unlock, no restart</strong>.</p>
+    <button class="nextbtn rv d4" data-next>who sees what →</button>
+  </div>
+</section>
+
+<!-- ═══ 9 · who sees what ═══ -->
+<section class="ch" data-ch>
+  <div class="ch-in">
+    <div class="kick rv">the deal</div>
+    <h2 class="rv d1">Same wire. Two views.</h2>
+    <div class="vtoggle rv d2">
+      <button class="on" data-v="dev">your device's view</button>
+      <button data-v="srv">the server's view</button>
+    </div>
+    <div class="view on rv d3" id="v-dev">
+      <div class="card"><pre><span class="meta">op seq=7 dev=A</span>
+  plaintext (after unwrap): upsert login "github" {username: me, password: •••}
+  prev_op_hash: b77e33… · hlc: 1789949021500
+  sig: <span class="meta">valid under device A vk ✓</span></pre></div>
+    </div>
+    <div class="view rv d3" id="v-srv">
+      <div class="card"><pre><span class="meta">op seq=7 dev=A · 612 bytes · arrived 18:02:41Z</span>
+  nonce: 8f3a…c1
+  ct:    <span class="enc">e2 9f 41 7b 0a d3 55 18 9c 02 f7 b1 4e 88 3d 66 a0 12 …</span>
+  sig:   <span class="meta">valid under device A vk ✓</span>   <span class="enc">← all it will ever know</span></pre></div>
+    </div>
+    <p class="body rv d4">Metadata leaks — device ids, op counts, timing. Content doesn't. A hostile server's best moves are <em>withholding</em> (availability) and <em>reordering</em> — both detected, never silently accepted.</p>
+    <button class="nextbtn rv d4" data-next>what's left →</button>
+  </div>
+</section>
+
+<!-- ═══ 10 · remaining ═══ -->
+<section class="ch" data-ch>
+  <div class="ch-in">
+    <div class="kick rv">M3 — honest state</div>
+    <h2 class="rv d1">Working today / still owed.</h2>
+    <div class="row rv d2" style="margin-top:8px">
+      <div class="card">
+        <ul class="todo">
+          <li class="done">per-vault Durable Object relay on Cloudflare free tier</li>
+          <li class="done"><code>mypassman sync</code> — pull/push/manifest CAS</li>
+          <li class="done"><code>mypassman pair</code> — invite→join→approve→finish</li>
+          <li class="done">daemon live-merge — pulled ops appear without re-unlock</li>
+          <li class="done">sig/seq/equivocation checks server-side</li>
+        </ul>
+      </div>
+      <div class="card">
+        <ul class="todo">
+          <li>compaction + snapshots (endpoints ready, client never writes)</li>
+          <li>conflict UI — merges are silent last-writer-wins</li>
+          <li>gossip-vector verification</li>
+          <li>restored-from-backup device healing</li>
+          <li>the nasty test matrix: skewed clocks, torn writes, races</li>
+        </ul>
+      </div>
+    </div>
+    <p class="body rv d3" style="margin-top:20px">Deploy: <code>wrangler secret put SETUP_KEY && wrangler deploy</code>, then <code>mypassman sync init &lt;url&gt; --setup-key …</code>. Full flow in <code>syncd/README.md</code>.</p>
+  </div>
+</section>
+
+</main>
+
+<script>
+/* ── chapter nav ─────────────────────────────────────────── */
+const chs = [...document.querySelectorAll('[data-ch]')];
+const nav = document.getElementById('pnav');
+chs.forEach((c, i) => {
+  const d = document.createElement('button');
+  d.className = 'dot'; d.title = 'section ' + (i + 1);
+  d.onclick = () => c.scrollIntoView({ behavior: 'smooth' });
+  nav.appendChild(d);
+});
+const seen = new Set();
+const io = new IntersectionObserver((es) => {
+  es.forEach(e => {
+    const i = chs.indexOf(e.target);
+    if (e.isIntersecting) {
+      e.target.classList.add('vis'); seen.add(i);
+      [...nav.children].forEach((d, j) => {
+        d.classList.toggle('on', j === i);
+        d.classList.toggle('seen', seen.has(j) && j !== i);
+      });
+    }
+  });
+}, { threshold: .35 });
+chs.forEach(c => io.observe(c));
+document.querySelectorAll('[data-next]').forEach(b => {
+  b.onclick = () => {
+    const i = chs.indexOf(b.closest('[data-ch]'));
+    chs[i + 1]?.scrollIntoView({ behavior: 'smooth' });
+  };
+});
+const hx = n => [...crypto.getRandomValues(new Uint8Array(n))].map(b => b.toString(16).padStart(2, '0')).join('');
+
+/* ── op frame birth ──────────────────────────────────────── */
+const birthSeqs = [
+  ['seq', '5'], ['non', hx(6)], ['sig', hx(8) + '…'], ['ct', hx(10) + '… (' + (180 + Math.floor(Math.random() * 300)) + ' bytes)'],
+];
+const caps = [
+  'my position in A\'s chain',
+  'fresh randomness — never reused',
+  'A\'s device key signs seq·nonce·ct',
+  'the item, sealed — includes prev_op_hash',
+];
+let birthed = false;
+document.getElementById('birthBtn').onclick = () => {
+  document.querySelectorAll('#frame .seg').forEach(s => s.classList.remove('in'));
+  document.getElementById('frameCap').textContent = '';
+  const vals = { seq: String(5 + Math.floor(Math.random() * 4)), non: hx(6), sig: hx(8) + '…', ct: hx(14) + '…  (' + (180 + Math.floor(Math.random() * 300)) + ' bytes ciphertext)' };
+  document.getElementById('vSeq').textContent = vals.seq;
+  document.getElementById('vNon').textContent = vals.non;
+  document.getElementById('vSig').textContent = vals.sig;
+  document.getElementById('vCt').textContent = vals.ct;
+  const segs = document.querySelectorAll('#frame .seg');
+  segs.forEach((s, i) => setTimeout(() => {
+    s.classList.add('in');
+    document.getElementById('birthCap').textContent = ['seq — ' + caps[0], 'nonce — ' + caps[1], 'sig — ' + caps[2], 'ct — ' + caps[3]][i];
+  }, 350 + i * 480));
+  setTimeout(() => {
+    document.getElementById('frameCap').textContent = '→ appended to ops/A.log · durably fsynced · ready to push';
+  }, 350 + segs.length * 480);
+};
+
+/* ── live simulator ──────────────────────────────────────── */
+const items = ['github', 'bank of mom', 'aws root', 'ssh deploy', 'figma', 'wifi gate', 'stripe', 'notion', 'postgres prod', 'doorman pin'];
+let itemIdx = 0;
+const st = {
+  A: { ops: [], view: [] },          // ops in A's own log
+  B: { ops: [], pulledA: [], view: [] }, // B's own ops + pulled A frames
+  srv: { A: 0, B: 0 },               // remote heads = stored op count per device
+};
+const $ = id => document.getElementById(id);
+const devCol = { A: '#22d3ee', B: '#fbbf24' };
+
+function renderSim() {
+  // heads
+  $('hA').textContent = st.A.ops.length;
+  $('hB').textContent = st.B.ops.length;
+  $('srvA').textContent = st.srv.A;
+  $('srvB').textContent = st.srv.B;
+  // logs
+  $('logA').innerHTML = st.A.ops.length
+    ? st.A.ops.map(o => `<div class="oprow"><span><span class="d a">A</span> seq ${o.seq}</span><span style="color:var(--faint)">${o.item} · ${o.h}</span></div>`).join('')
+    : '<div class="empty">empty</div>';
+  const blog = [...st.B.pulledA.map(o => `<div class="oprow" style="opacity:.85"><span><span class="d a">A</span> seq ${o.seq}</span><span style="color:var(--faint)">${o.item} · pulled</span></div>`),
+                ...st.B.ops.map(o => `<div class="oprow"><span><span class="d b">B</span> seq ${o.seq}</span><span style="color:var(--faint)">${o.item} · ${o.h}</span></div>`)];
+  $('logB').innerHTML = blog.length ? blog.join('') : '<div class="empty">empty</div>';
+  // server store
+  const srows = [...Array(st.srv.A)].map((_, i) => `<div class="oprow"><span><span class="d a">A</span> seq ${i + 1}</span><span class="mono" style="color:var(--s)">ct ${hx(4)}…</span></div>`)
+    .concat([...Array(st.srv.B)].map((_, i) => `<div class="oprow"><span><span class="d b">B</span> seq ${i + 1}</span><span class="mono" style="color:var(--s)">ct ${hx(4)}…</span></div>`));
+  $('logS').innerHTML = srows.length ? srows.join('') : '<div class="empty">no ops stored</div>';
+  // views — merge: union of items both devices' logs (only ops THIS device holds)
+  const mkView = (own, pulled) => {
+    const items = [...pulled.map(o => o.item), ...own.map(o => o.item)];
+    return items.length ? [...new Set(items)].map(n => `<div class="itemrow"><span class="k">item</span>${n}</div>`).join('') : '<div class="empty">—</div>';
+  };
+  $('viewA').innerHTML = mkView(st.A.ops, st.A.pulledB || []);
+  $('viewB').innerHTML = mkView(st.B.ops, st.B.pulledA);
+}
+st.A.pulledB = [];
+st.B.pulledA = [];
+
+function fly(fromEl, toEl, label, cls, done) {
+  const sim = $('sim'), a = fromEl.getBoundingClientRect(), b = toEl.getBoundingClientRect(), r = sim.getBoundingClientRect();
+  const p = document.createElement('div');
+  p.className = 'pkt ' + cls;
+  p.textContent = label;
+  p.style.left = (a.left - r.left + 30) + 'px';
+  p.style.top = (a.top - r.top + 40) + 'px';
+  sim.appendChild(p);
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    p.style.left = (b.left - r.left + b.width / 2 - 40) + 'px';
+    p.style.top = (b.top - r.top + 50) + 'px';
+  }));
+  setTimeout(() => { p.style.opacity = '0'; setTimeout(() => p.remove(), 300); done && done(); }, 850);
+}
+
+function slog(html) {
+  const l = $('simLog');
+  l.innerHTML = `<span class="t">$ </span>` + html;
+}
+
+$('addA').onclick = () => {
+  const item = items[itemIdx++ % items.length];
+  const op = { seq: st.A.ops.length + 1, item, h: hx(3) };
+  st.A.ops.push(op);
+  fly($('addA'), $('logA'), `op A:${op.seq}`, 'a');
+  slog(`A appended <b>op ${op.seq}</b> ("${item}") — local only until you sync`);
+  renderSim();
+};
+$('addB').onclick = () => {
+  const item = items[itemIdx++ % items.length];
+  const op = { seq: st.B.ops.length + 1, item, h: hx(3) };
+  st.B.ops.push(op);
+  fly($('addB'), $('logB'), `op B:${op.seq}`, 'b');
+  slog(`B appended <b>op ${op.seq}</b> ("${item}") — local only until you sync`);
+  renderSim();
+};
+$('syncA').onclick = async () => {
+  const pushed = st.A.ops.length - st.srv.A;
+  if (pushed > 0) {
+    fly($('colA'), $('colS'), `push ${pushed} op${pushed > 1 ? 's' : ''}`, 'a');
+    await new Promise(r => setTimeout(r, 850));
+    st.srv.A = st.A.ops.length;
+    renderSim();
+    slog(`A pushed ${pushed} op(s) — server verified sigs, heads A→${st.srv.A}`);
+  }
+  const pulled = st.srv.B - st.A.pulledB.length;
+  if (pulled > 0) {
+    fly($('colS'), $('colA'), `pull ${pulled} op${pulled > 1 ? 's' : ''}`, 'b');
+    await new Promise(r => setTimeout(r, 850));
+    st.A.pulledB = st.B.ops.slice(0, st.srv.B);
+    renderSim();
+    slog(`A pulled B's ops — verified + merged. <span class="hl">new items visible</span>`);
+  }
+  if (!pushed && !pulled) slog('A: nothing to do — heads already match');
+  renderSim();
+};
+$('syncB').onclick = async () => {
+  const pushed = st.B.ops.length - st.srv.B;
+  if (pushed > 0) {
+    fly($('colB'), $('colS'), `push ${pushed} op${pushed > 1 ? 's' : ''}`, 'b');
+    await new Promise(r => setTimeout(r, 850));
+    st.srv.B = st.B.ops.length;
+    renderSim();
+    slog(`B pushed ${pushed} op(s) — verified + stored`);
+  }
+  const pulled = st.srv.A - st.B.pulledA.length;
+  if (pulled > 0) {
+    fly($('colS'), $('colB'), `pull ${pulled} op${pulled > 1 ? 's' : ''}`, 'a');
+    await new Promise(r => setTimeout(r, 850));
+    st.B.pulledA = st.A.ops.slice(0, st.srv.A);
+    renderSim();
+    slog(`B pulled A's ops — <span class="hl">"${st.B.pulledA.at(-1).item}" appeared in B's vault</span>`);
+  }
+  if (!pushed && !pulled) slog('B: nothing to do — heads already match');
+  renderSim();
+};
+renderSim();
+
+/* ── pairing sequence ────────────────────────────────────── */
+const steps = [
+  { w: 'a', t: 'A runs `pair invite` → server mints a 15-min code', sA: 'sent invite', sS: 'invites[] +1' },
+  { w: 'b', t: 'B runs `pair join <url> <vault_id.code>` — sends {id, pubkey, name}', sB: 'keypair generated', sS: 'pending[] +1' },
+  { w: 's', t: 'server: code valid → queue B in pending, hand back the manifest', sB: 'has manifest + cfg(invite)' },
+  { w: 'b', t: 'B proves the password unwraps a slot (owner_vk matches) — still can\'t write ops', sB: 'password verified ✓' },
+  { w: 'a', t: 'A: `pair pending` shows B → `pair approve` re-signs manifest with B inside, pushes (CAS)', sA: 'signed manifest +B', sS: 'manifest now lists B ✓' },
+  { w: 'b', t: 'B: `pair finish` — server sees B in the manifest → mints device-bound read+write tokens, burns invite', sB: 'read+write tokens ✓' },
+  { w: 'b', t: 'B: first `sync` pulls every op → unlocks the full vault', sB: 'full vault, enrolled', sS: 'invite burned' },
+];
+const pl = document.getElementById('plines');
+steps.forEach((s, i) => {
+  const d = document.createElement('div');
+  d.className = 'pline';
+  d.innerHTML = `<span class="n">${i + 1}</span><span class="who ${s.w}">${{ a: 'owner A', b: 'device B', s: 'syncd' }[s.w]}</span><span>${s.t}</span>`;
+  pl.appendChild(d);
+});
+let pi = -1, playing = false;
+document.getElementById('pairPlay').onclick = () => {
+  if (playing) return;
+  playing = true; pi = -1;
+  pl.querySelectorAll('.pline').forEach(x => x.classList.remove('on', 'done'));
+  $('stA').innerHTML = '<span class="have">admin token · owner key</span>';
+  $('stB').innerHTML = '<span class="want">no vault yet</span>';
+  $('stS').innerHTML = '<span class="want">manifest · ops</span>';
+  const tick = () => {
+    pi++;
+    if (pi >= steps.length) { playing = false; return; }
+    pl.children[pi].classList.add('on');
+    if (pi > 0) pl.children[pi - 1].classList.replace('on', 'done');
+    const s = steps[pi];
+    if (s.sA) $('stA').innerHTML = `<span class="have">${s.sA}</span>`;
+    if (s.sB) $('stB').innerHTML = `<span class="have">${s.sB}</span>`;
+    if (s.sS) $('stS').innerHTML = `<span class="have">${s.sS}</span>`;
+    setTimeout(tick, 1900);
+  };
+  tick();
+};
+
+/* ── views toggle ────────────────────────────────────────── */
+document.querySelectorAll('.vtoggle button').forEach(b => {
+  b.onclick = () => {
+    document.querySelectorAll('.vtoggle button').forEach(x => x.classList.remove('on'));
+    b.classList.add('on');
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('on'));
+    $('v-' + b.dataset.v).classList.add('on');
+  };
+});
+</script>
+</body>
+</html>

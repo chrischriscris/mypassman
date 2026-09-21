@@ -857,3 +857,104 @@ pub fn cmd_pair_finish(dir: &Path) -> Result<(), String> {
     eprintln!("enrollment complete");
     Ok(())
 }
+
+/// `mypassman pair devices` — the manifest's device registry.
+pub fn cmd_pair_devices(dir: &Path) -> Result<(), String> {
+    let m = mpm_store::load_manifest(dir).map_err(|e| e.to_string())?;
+    let me = mpm_store::load_device_key(&m.vault_id).ok().map(|d| d.id);
+    eprintln!("{:<34} {:<24} {:<8} {}", "DEVICE", "NAME", "STATUS", "");
+    for d in &m.devices {
+        let id = mpm_store::hex(&d.id);
+        eprintln!(
+            "{:<34} {:<24} {:<8} {}",
+            id,
+            d.name,
+            if d.active { "active" } else { "revoked" },
+            if Some(d.id) == me { "(this device)" } else { "" }
+        );
+    }
+    Ok(())
+}
+
+/// `mypassman pair revoke <device-prefix>` — the owner marks the device
+/// inactive in the manifest (re-signed + pushed with CAS), then the server
+/// burns its tokens. Revocation is forward-looking: the device keeps
+/// whatever ciphertext it already pulled.
+pub fn cmd_pair_revoke(dir: &Path, rec: bool, prefix: &str) -> Result<(), String> {
+    let m = mpm_store::load_manifest(dir).map_err(|e| e.to_string())?;
+    let cfg = load_cfg(&m.vault_id)?.ok_or("no sync config")?;
+    let admin = cfg
+        .admin
+        .as_deref()
+        .ok_or("no admin credential on this device")?
+        .to_string();
+    let me = mpm_store::load_device_key(&m.vault_id)
+        .map(|d| d.id)
+        .map_err(|_| "no device key — is this vault unlocked here?".to_string())?;
+
+    let matches: Vec<_> = m
+        .devices
+        .iter()
+        .filter(|d| mpm_store::hex(&d.id).starts_with(prefix))
+        .collect();
+    let dev = match matches.len() {
+        0 => return Err(format!("no device matching '{prefix}'")),
+        1 => matches[0],
+        _ => return Err(format!("'{prefix}' is ambiguous — more characters")),
+    };
+    if dev.id == me {
+        return Err("refusing to revoke this device — run it from another enrolled device".into());
+    }
+    if !dev.active {
+        return Err(format!("'{}' is already revoked", dev.name));
+    }
+    let dev_hex = mpm_store::hex(&dev.id);
+    let dev_name = dev.name.clone();
+
+    // owner-signed manifest update — revoke IS a signature, not a flag
+    let mut vault = crate::unlock(dir, rec)?;
+    for d in &mut vault.manifest.devices {
+        if mpm_store::hex(&d.id) == dev_hex {
+            d.active = false;
+        }
+    }
+    let bytes = vault.manifest.to_file(&vault.bundle().owner_signing_key());
+    mpm_store::write_manifest(dir, &bytes).map_err(|e| e.to_string())?;
+
+    // CAS-push the manifest, then burn the device's tokens server-side
+    let r = http(
+        "GET",
+        &api(&cfg, &m.vault_id, "manifest"),
+        Some(&admin),
+        None,
+        &[],
+    )?;
+    check(r.status, &r.body)?;
+    let remote_bytes = unhex(&jstr(&json(&r.body)?, "manifest")?)?;
+    let r = http(
+        "PUT",
+        &api(&cfg, &m.vault_id, "manifest"),
+        Some(&admin),
+        Some(
+            serde_json::json!({
+                "manifest": mpm_store::hex(&bytes),
+                "base_hash": sha256_hex(&remote_bytes),
+            })
+            .to_string()
+            .as_bytes(),
+        ),
+        &[("content-type", "application/json")],
+    )?;
+    check(r.status, &r.body)?;
+    let r = http(
+        "POST",
+        &api(&cfg, &m.vault_id, "revoke"),
+        Some(&admin),
+        Some(serde_json::json!({"device": dev_hex}).to_string().as_bytes()),
+        &[("content-type", "application/json")],
+    )?;
+    check(r.status, &r.body)?;
+    eprintln!("revoked '{dev_name}' ({dev_hex})");
+    eprintln!("note: it keeps whatever it already synced — rotate exposed secrets if needed");
+    Ok(())
+}
