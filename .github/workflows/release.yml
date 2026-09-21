@@ -12,48 +12,63 @@ jobs:
     strategy:
       matrix:
         include:
-          # CLI (macOS only today — daemon/Touch ID/Raycast are macOS)
+          # macOS: one universal binary per crate (Intel runner pool is
+          # too slow to rely on — lipo both arches on the arm64 runner)
           - os: macos-14
-            target: aarch64-apple-darwin
             bin: mypassman
-          - os: macos-13
-            target: x86_64-apple-darwin
-            bin: mypassman
-          # syncd everywhere it might self-host
+            universal: true
+            art: universal-apple-darwin
+          - os: macos-14
+            bin: mpm-syncd
+            universal: true
+            art: universal-apple-darwin
+          # linux syncd for self-hosting
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             bin: mpm-syncd
+            art: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             bin: mpm-syncd
             cross: true
-          - os: macos-14
-            target: aarch64-apple-darwin
-            bin: mpm-syncd
+            art: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.universal && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: install cross-linker (linux arm64)
         if: matrix.cross
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: build (universal macOS)
+        if: matrix.universal
+        run: |
+          cargo build --release -p ${{ matrix.bin }} --target aarch64-apple-darwin
+          cargo build --release -p ${{ matrix.bin }} --target x86_64-apple-darwin
       - name: build
+        if: ${{ !matrix.universal }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release -p ${{ matrix.bin }} --target ${{ matrix.target }}
       - name: package
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/${{ matrix.bin }}
-          tar -C dist -czf dist/${{ matrix.bin }}-${{ github.ref_name }}-${{ matrix.target }}.tar.gz ${{ matrix.bin }}
+          if [ "${{ matrix.universal }}" = "true" ]; then
+            lipo -create \
+              target/aarch64-apple-darwin/release/${{ matrix.bin }} \
+              target/x86_64-apple-darwin/release/${{ matrix.bin }} \
+              -output dist/${{ matrix.bin }}
+          else
+            cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/${{ matrix.bin }}
+          fi
+          tar -C dist -czf dist/${{ matrix.bin }}-${{ github.ref_name }}-${{ matrix.art }}.tar.gz ${{ matrix.bin }}
           shasum -a 256 dist/*.tar.gz >> dist/SHA256SUMS
           rm dist/${{ matrix.bin }}
       - uses: actions/upload-artifact@v4
         with:
-          name: bins-${{ matrix.bin }}-${{ matrix.target }}
+          name: bins-${{ matrix.bin }}-${{ matrix.art }}
           path: dist/
 
   publish:
