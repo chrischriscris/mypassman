@@ -1,0 +1,75 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # CLI (macOS only today — daemon/Touch ID/Raycast are macOS)
+          - os: macos-14
+            target: aarch64-apple-darwin
+            bins: [mypassman]
+          - os: macos-13
+            target: x86_64-apple-darwin
+            bins: [mypassman]
+          # syncd everywhere it might self-host
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bins: [mpm-syncd]
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            bins: [mpm-syncd]
+            cross: true
+          - os: macos-14
+            target: aarch64-apple-darwin
+            bins: [mpm-syncd]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: install cross-linker (linux arm64)
+        if: matrix.cross
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          for b in ${{ matrix.bins }}; do
+            cargo build --release -p $b --target ${{ matrix.target }}
+          done
+      - name: package
+        run: |
+          mkdir -p dist
+          for b in ${{ matrix.bins }}; do
+            cp target/${{ matrix.target }}/release/$b dist/$b
+            tar -C dist -czf dist/$b-${{ github.ref_name }}-${{ matrix.target }}.tar.gz $b
+            shasum -a 256 dist/$b-*.tar.gz >> dist/SHA256SUMS
+            rm dist/$b
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bins-${{ matrix.target }}
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bins-*
+          merge-multiple: true
+      - name: create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create ${{ github.ref_name }} --title "${{ github.ref_name }}" --notes "See README.md — unsigned binaries, sha256 sums in SHA256SUMS. Verify before trusting." *.tar.gz SHA256SUMS || gh release upload ${{ github.ref_name }} *.tar.gz SHA256SUMS --clobber

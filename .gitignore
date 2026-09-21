@@ -3,3 +3,4 @@ Cargo.lock.bak
 integrations/raycast-extension/node_modules/
 integrations/raycast-extension/dist/
 integrations/raycast-extension/target/
+.DS_Store

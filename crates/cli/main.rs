@@ -77,6 +77,14 @@ enum Cmd {
     },
     /// Tombstone an item
     Rm { name: String },
+    /// Show an item's version history (replays the op log; never prints
+    /// secret values — only which fields changed)
+    History {
+        name: String,
+        /// Emit a JSON array of versions — for integrations
+        #[arg(long)]
+        json: bool,
+    },
     /// Show enrolled devices
     Devices,
     /// Recovery kit management
@@ -259,8 +267,6 @@ enum PairCmd {
     /// with the device inactive and the server burns its tokens. The device
     /// keeps whatever it already saw; revocation stops future access.
     Revoke { device: String },
-    /// List enrolled devices and their status
-    Devices,
 }
 
 fn vault_dir(cli: &Cli) -> PathBuf {
@@ -1218,6 +1224,227 @@ fn cmd_rm(dir: &Path, rec: bool, name: &str) -> Result<(), String> {
         mpm_store::hex(&rid)
     );
     Ok(())
+}
+
+/// `history <name>` — per-record version list rebuilt by replaying every
+/// verified op (own + foreign logs) in merge order. Field values never
+/// print; rows show which field KEYS changed between versions.
+fn cmd_history(dir: &Path, rec: bool, name: &str, json: bool) -> Result<(), String> {
+    let vault = unlock(dir, rec)?;
+
+    // unlock() already verified every log once; re-verifying per device
+    // recovers the plaintexts history needs. verify_foreign_log covers
+    // our own log too — this device is in the manifest registry.
+    let mut pts: Vec<mpm_core::OpPlaintext> = Vec::new();
+    for dev in mpm_store::list_device_logs(dir).map_err(|e| e.to_string())? {
+        let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
+        pts.extend(
+            vault
+                .verify_foreign_log(&dev, &lr.ops)
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    // the merge's total order — the same key apply_pt compares on
+    pts.sort_by_key(|p| (p.hlc, p.origin_device, p.origin_seq));
+
+    // latest name + liveness per record. Names ride on upsert ops; a
+    // tombstone keeps the last name so history still finds deleted items
+    // (vault.find can't — its index hides tombstoned names).
+    let mut recs: BTreeMap<[u8; 16], (String, bool)> = BTreeMap::new();
+    for p in &pts {
+        let e = recs.entry(p.record_id).or_default();
+        match p.op_type {
+            mpm_core::OpType::Upsert => {
+                e.0 = String::from_utf8_lossy(&p.name).into_owned();
+                e.1 = false;
+            }
+            mpm_core::OpType::Tombstone => e.1 = true,
+            mpm_core::OpType::Meta => {}
+        }
+    }
+
+    // resolve like find(): exact name → record-id hex prefix → unique
+    // substring — but over ALL records, tombstoned included
+    let mut cands: Vec<[u8; 16]> = recs
+        .iter()
+        .filter(|(_, (n, _))| n.eq_ignore_ascii_case(name))
+        .map(|(r, _)| *r)
+        .collect();
+    if !name.is_empty() && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let low = name.to_lowercase();
+        for r in recs.keys() {
+            if mpm_store::hex(r).starts_with(&low) && !cands.contains(r) {
+                cands.push(*r);
+            }
+        }
+    }
+    if cands.is_empty() {
+        let needle = name.to_lowercase();
+        cands = recs
+            .iter()
+            .filter(|(_, (n, _))| n.to_lowercase().contains(&needle))
+            .map(|(r, _)| *r)
+            .collect();
+    }
+    let rid = match cands.len() {
+        0 => return Err(format!("'{name}': not found")),
+        1 => cands[0],
+        n => {
+            eprintln!("'{name}': ambiguous — {n} records match, pass an id prefix:");
+            for r in &cands {
+                let (rn, dead) = &recs[r];
+                eprintln!(
+                    "  {} {:<40} {}",
+                    &mpm_store::hex(r)[..8],
+                    disp(rn),
+                    if *dead { "(deleted)" } else { "" }
+                );
+            }
+            return Err("use a record id prefix".into());
+        }
+    };
+
+    let dev_name = |d: &[u8; 16]| -> String {
+        vault
+            .manifest
+            .device(d)
+            .map(|e| disp(&e.name))
+            .unwrap_or_else(|| mpm_store::hex(&d[..8]))
+    };
+
+    // decrypt each upsert in order; diff field keys vs the previous upsert
+    struct Row {
+        op: mpm_core::OpType,
+        hlc: u64,
+        dev: [u8; 16],
+        changed: Vec<String>,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    let mut prev: Option<(Item, Vec<u8>)> = None; // last upsert's (item, name)
+    for p in pts.iter().filter(|p| p.record_id == rid) {
+        if p.op_type != mpm_core::OpType::Upsert {
+            rows.push(Row {
+                op: p.op_type,
+                hlc: p.hlc,
+                dev: p.origin_device,
+                changed: Vec::new(),
+            });
+            continue;
+        }
+        let item = p
+            .open_fields(
+                vault.dek(),
+                &vault.manifest.vault_id,
+                vault.manifest.key_epoch,
+            )
+            .map_err(|e| e.to_string())?;
+        let mut changed: Vec<String> = Vec::new();
+        if let Some((_, pname)) = &prev {
+            if pname.as_slice() != p.name.as_slice() {
+                changed.push("name".into());
+            }
+        }
+        let mut tags: std::collections::BTreeSet<u8> = item.fields.keys().copied().collect();
+        if let Some((pi, _)) = &prev {
+            tags.extend(pi.fields.keys().copied());
+        }
+        for t in tags {
+            let pv = prev.as_ref().and_then(|(pi, _)| pi.fields.get(&t));
+            if pv != item.fields.get(&t) {
+                changed.push(tag_name(t));
+            }
+        }
+        rows.push(Row {
+            op: p.op_type,
+            hlc: p.hlc,
+            dev: p.origin_device,
+            changed,
+        });
+        prev = Some((item, p.name.clone()));
+    }
+
+    let op_name = |op: mpm_core::OpType| match op {
+        mpm_core::OpType::Upsert => "upsert",
+        mpm_core::OpType::Tombstone => "tombstone",
+        mpm_core::OpType::Meta => "meta",
+    };
+    if json {
+        let mut objs = Vec::new();
+        for (i, r) in rows.iter().enumerate().rev() {
+            let ch: Vec<String> = r
+                .changed
+                .iter()
+                .map(|c| format!("\"{}\"", json_esc(c)))
+                .collect();
+            objs.push(format!(
+                "{{\"v\":{},\"ts\":\"{}\",\"hlc\":{},\"device\":\"{}\",\"device_id\":\"{}\",\"op\":\"{}\",\"changed\":[{}]}}",
+                i + 1,
+                fmt_hlc(r.hlc),
+                r.hlc,
+                json_esc(&dev_name(&r.dev)),
+                mpm_store::hex(&r.dev),
+                op_name(r.op),
+                ch.join(",")
+            ));
+        }
+        println!("[{}]", objs.join(","));
+        return Ok(());
+    }
+    let title = if recs[&rid].0.is_empty() {
+        name.to_string()
+    } else {
+        recs[&rid].0.clone()
+    };
+    eprintln!(
+        "{} ({}) — {} version(s), newest first",
+        disp(&title),
+        &mpm_store::hex(&rid)[..8],
+        rows.len()
+    );
+    eprintln!(
+        "{:<3} {:<20} {:<16} FIELDS CHANGED",
+        "#", "HLC/ts", "DEVICE"
+    );
+    for (i, r) in rows.iter().enumerate().rev() {
+        let label = match r.op {
+            mpm_core::OpType::Tombstone => "(deleted)".to_string(),
+            mpm_core::OpType::Meta => "(meta)".to_string(),
+            mpm_core::OpType::Upsert if i == 0 => "(created)".to_string(),
+            mpm_core::OpType::Upsert if r.changed.is_empty() => "(unchanged)".to_string(),
+            mpm_core::OpType::Upsert => r.changed.join(", "),
+        };
+        eprintln!(
+            "{:<3} {:<20} {:<16} {}",
+            i + 1,
+            fmt_hlc(r.hlc),
+            dev_name(&r.dev),
+            label
+        );
+    }
+    Ok(())
+}
+
+/// hlc millis → "YYYY-MM-DD HH:MM:SSZ" (UTC; civil-from-days, no chrono dep)
+fn fmt_hlc(ms: u64) -> String {
+    let secs = ms / 1000;
+    let days = (secs / 86_400) as i64;
+    let tod = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}Z",
+        tod / 3600,
+        tod % 3600 / 60,
+        tod % 60
+    )
 }
 
 fn cmd_recovery_rotate(dir: &Path, rec: bool) -> Result<(), String> {
@@ -2470,6 +2697,7 @@ fn main() {
             .and_then(|out| cmd_get(&dir, rec, name, *show, &out)),
         Cmd::List { json } => cmd_list(&dir, rec, *json),
         Cmd::Rm { name } => cmd_rm(&dir, rec, name),
+        Cmd::History { name, json } => cmd_history(&dir, rec, name, *json),
         Cmd::Devices => cmd_devices(&dir, cli.recovery),
         Cmd::Recovery { sub } => match sub {
             RecoveryCmd::Rotate => cmd_recovery_rotate(&dir, rec),
@@ -2537,7 +2765,6 @@ fn main() {
             PairCmd::Join { url, invite, name } => sync::cmd_pair_join(&dir, url, invite, name),
             PairCmd::Finish => sync::cmd_pair_finish(&dir),
             PairCmd::Revoke { device } => sync::cmd_pair_revoke(&dir, rec, device),
-            PairCmd::Devices => sync::cmd_pair_devices(&dir),
         },
     };
 

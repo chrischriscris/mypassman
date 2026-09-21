@@ -233,7 +233,7 @@ fn check(status: u16, body: &[u8]) -> Result<(), String> {
 
 fn unhex(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
-    if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("bad hex".into());
     }
     Ok((0..s.len())
@@ -360,7 +360,7 @@ pub fn cmd_sync(dir: &Path) -> Result<(), String> {
     let mut pulled = 0u64;
     for (dev_hex, head) in &heads {
         let dev = unhex16(dev_hex)?;
-        if &dev == &me {
+        if dev == me {
             continue;
         }
         let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
@@ -858,24 +858,6 @@ pub fn cmd_pair_finish(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// `mypassman pair devices` — the manifest's device registry.
-pub fn cmd_pair_devices(dir: &Path) -> Result<(), String> {
-    let m = mpm_store::load_manifest(dir).map_err(|e| e.to_string())?;
-    let me = mpm_store::load_device_key(&m.vault_id).ok().map(|d| d.id);
-    eprintln!("{:<34} {:<24} {:<8} {}", "DEVICE", "NAME", "STATUS", "");
-    for d in &m.devices {
-        let id = mpm_store::hex(&d.id);
-        eprintln!(
-            "{:<34} {:<24} {:<8} {}",
-            id,
-            d.name,
-            if d.active { "active" } else { "revoked" },
-            if Some(d.id) == me { "(this device)" } else { "" }
-        );
-    }
-    Ok(())
-}
-
 /// `mypassman pair revoke <device-prefix>` — the owner marks the device
 /// inactive in the manifest (re-signed + pushed with CAS), then the server
 /// burns its tokens. Revocation is forward-looking: the device keeps
@@ -950,7 +932,11 @@ pub fn cmd_pair_revoke(dir: &Path, rec: bool, prefix: &str) -> Result<(), String
         "POST",
         &api(&cfg, &m.vault_id, "revoke"),
         Some(&admin),
-        Some(serde_json::json!({"device": dev_hex}).to_string().as_bytes()),
+        Some(
+            serde_json::json!({"device": dev_hex})
+                .to_string()
+                .as_bytes(),
+        ),
         &[("content-type", "application/json")],
     )?;
     check(r.status, &r.body)?;

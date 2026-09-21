@@ -4,6 +4,10 @@ Cloudflare Worker + one Durable Object per vault (SQLite-backed). Stores only
 what it can verify: the owner-signed manifest and device-signed op frames.
 No plaintext, no passwords, no keys.
 
+> **Self-host alternative:** `crates/syncd` builds `mpm-syncd`, a single Rust
+> binary (or ~100MB Docker image) exposing the identical wire protocol on
+> SQLite — no Cloudflare account needed. See `../docs/SELFHOST.md`.
+
 ## Deploy
 
 ```sh
