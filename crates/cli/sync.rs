@@ -66,6 +66,7 @@ fn load_cfg(vault_id: &[u8; 16]) -> Result<Option<SyncCfg>, String> {
     if cfg.url.is_empty() {
         return Err(format!("{}: missing url", path.display()));
     }
+    check_url_scheme(&cfg.url)?;
     Ok(Some(cfg))
 }
 
@@ -91,6 +92,10 @@ fn save_cfg(vault_id: &[u8; 16], cfg: &SyncCfg) -> Result<(), String> {
             buf.push_str(&format!("{k}={v}\n"));
         }
     }
+    // Atomic write — tmp+rename. A crash mid-truncate would leave an empty
+    // conf; in `pair finish` the invite is already burned by then, so the
+    // tokens would be unrecoverable.
+    let tmp = path.with_extension("tmp");
     // 0600 at creation — a token must never exist at 0644, even briefly
     #[cfg(unix)]
     {
@@ -100,16 +105,47 @@ fn save_cfg(vault_id: &[u8; 16], cfg: &SyncCfg) -> Result<(), String> {
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(&path)
+            .open(&tmp)
             .map_err(|e| e.to_string())?;
         f.write_all(buf.as_bytes()).map_err(|e| e.to_string())?;
         f.sync_all().map_err(|e| e.to_string())?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(&path, buf).map_err(|e| e.to_string())?;
+        std::fs::write(&tmp, &buf).map_err(|e| e.to_string())?;
     }
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Sync endpoints carry bearer tokens — refuse cleartext HTTP except to
+/// loopback (dev servers) or when MPM_SYNC_INSECURE=1 is set explicitly.
+fn check_url_scheme(url: &str) -> Result<(), String> {
+    if url.starts_with("https://") {
+        return Ok(());
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        let host = rest
+            .split(['/', ':'])
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c| c == '[' || c == ']');
+        let loopback = host == "localhost"
+            || host == "::1"
+            || host.strip_prefix("127.").is_some_and(|t| {
+                t.split('.').all(|o| o.parse::<u8>().is_ok()) && t.split('.').count() == 3
+            });
+        if loopback || std::env::var("MPM_SYNC_INSECURE").as_deref() == Ok("1") {
+            return Ok(());
+        }
+        return Err(format!(
+            "refusing plain-http sync endpoint {url:?} — bearer tokens would travel \
+             cleartext. Use https:// (or MPM_SYNC_INSECURE=1 for a trusted LAN)"
+        ));
+    }
+    Err(format!(
+        "sync url {url:?} must start with https:// or http://"
+    ))
 }
 
 /// Max bytes any single response may occupy — 64 MiB. The wire protocol
@@ -289,6 +325,7 @@ pub fn cmd_sync_init(dir: &Path, url: &str, setup_key: &str) -> Result<(), Strin
     if load_cfg(&m.vault_id)?.is_some() {
         return Err("already configured — edit the .conf or delete it to re-init".into());
     }
+    check_url_scheme(url)?;
     let url = url.trim_end_matches('/');
     let r = http(
         "POST",
@@ -364,6 +401,14 @@ pub fn cmd_sync(dir: &Path) -> Result<(), String> {
         None,
         &[],
     )?;
+    if r.status == 401 || r.status == 403 {
+        // the device's tokens are burned — most likely a revocation this
+        // device can't learn about any other way
+        return Err(format!(
+            "{} — this device may have been revoked (`pair approve`/`revoke` happen owner-side)",
+            check(r.status, &r.body).unwrap_err()
+        ));
+    }
     check(r.status, &r.body)?;
     let state = json(&r.body)?;
     let heads: Vec<(String, u64)> = state
@@ -383,24 +428,41 @@ pub fn cmd_sync(dir: &Path) -> Result<(), String> {
             continue;
         }
         // Verify against the LOCAL manifest registry: an unknown device
-        // (e.g. enrolled elsewhere, remote manifest not yet adopted) or a
-        // revoked one is skipped — its ops can never merge anyway. The
-        // manifest reconcile below catches us up for the next sync.
+        // (e.g. enrolled elsewhere, remote manifest not yet adopted) is
+        // skipped — its ops can never merge anyway. A revoked device is
+        // still pulled UP TO its revocation horizon: ops it wrote while
+        // trusted belong in every replica. The manifest reconcile below
+        // catches us up for the next sync.
         let Some(entry) = m.device(&dev) else {
             eprintln!("note: skipping {dev_hex} — not in local device registry");
             continue;
         };
-        if !entry.active {
-            eprintln!("note: skipping {dev_hex} — device is revoked");
+        let horizon = if entry.active {
+            u64::MAX
+        } else {
+            match entry.revoked_seq {
+                Some(h) => h,
+                None => {
+                    eprintln!("note: skipping {dev_hex} — device is revoked");
+                    continue;
+                }
+            }
+        };
+        let head = (*head).min(horizon);
+        if head == 0 {
             continue;
         }
         let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
-        if lr.torn_tail {
-            eprintln!("warning: foreign log {dev_hex} has a torn tail — not appending past it");
-            continue;
-        }
         let mut count = lr.ops.len() as u64;
-        while count < *head {
+        if lr.torn_tail {
+            // Heal it: the tail bytes never decoded, so they are by
+            // definition unverified — truncate to the verified prefix and
+            // pull the rest fresh from the relay.
+            let keep: u64 = lr.ops.iter().map(|o| o.encode().len() as u64).sum();
+            eprintln!("note: truncating torn tail of foreign log {dev_hex} — will re-pull");
+            mpm_store::truncate_log(dir, &dev, keep).map_err(|e| e.to_string())?;
+        }
+        while count < head {
             let r = http(
                 "GET",
                 &api(
@@ -420,20 +482,25 @@ pub fn cmd_sync(dir: &Path) -> Result<(), String> {
             // each device signature BEFORE the bytes touch the log — a
             // hostile relay could otherwise poison it with data that only
             // fails at unlock. Fail closed: a bad frame aborts the sync.
-            let n = verify_frames(&r.body, &dev, count + 1, &entry.vk)?;
-            mpm_store::append_frames(dir, &dev, &r.body).map_err(|e| e.to_string())?;
-            pulled += n as u64;
-            count += n as u64;
+            let (n, nbytes) = verify_frames(&r.body, &dev, count + 1, &entry.vk, horizon)?;
+            if nbytes > 0 {
+                // append only the verified prefix — the page may carry
+                // post-horizon frames we must never persist
+                mpm_store::append_frames(dir, &dev, &r.body[..nbytes])
+                    .map_err(|e| e.to_string())?;
+                pulled += n as u64;
+                count += n as u64;
+            }
             let more = r
                 .headers
                 .iter()
                 .any(|(k, v)| k.eq_ignore_ascii_case("x-more") && v == "1");
-            if !more {
+            if n == 0 || !more {
                 break;
             }
         }
-        if count < *head {
-            eprintln!("warning: pulled {dev_hex} to seq {count} but remote head is {head}");
+        if count < head {
+            eprintln!("warning: pulled {dev_hex} to seq {count} but head is {head}");
         }
     }
 
@@ -490,42 +557,64 @@ pub fn cmd_sync(dir: &Path) -> Result<(), String> {
     let local_bytes = std::fs::read(dir.join(mpm_store::MANIFEST)).map_err(|e| e.to_string())?;
     let mut manifest_note = "unchanged".to_string();
     if remote_bytes != local_bytes {
-        let remote_wins = if remote_m.snapshot_epoch > m.snapshot_epoch {
-            true
-        } else if m.snapshot_epoch > remote_m.snapshot_epoch {
-            false
-        } else {
-            // same epochs, bytes differ → registry changed. More devices =
-            // the newer view in practice; equal counts → prefer the server.
-            remote_m.devices.len() >= m.devices.len()
-        };
-        if remote_wins {
-            mpm_store::write_manifest(dir, &remote_bytes).map_err(|e| e.to_string())?;
-            manifest_note = format!("adopted remote (epoch {})", remote_m.snapshot_epoch);
-        } else if let Some(admin) = &cfg.admin {
-            let r = http(
-                "PUT",
-                &api(&cfg, &m.vault_id, "manifest"),
-                Some(admin),
-                Some(
-                    serde_json::json!({
-                        "manifest": mpm_store::hex(&local_bytes),
-                        "base_hash": sha256_hex(&remote_bytes),
-                    })
-                    .to_string()
-                    .as_bytes(),
-                ),
-                &[("content-type", "application/json")],
-            )?;
-            match check(r.status, &r.body) {
-                Ok(()) => manifest_note = "pushed local".into(),
-                Err(e) if r.status == 409 => {
-                    manifest_note = format!("push raced ({e}) — rerun sync");
+        // Pin the trust anchors before ANY adoption: owner_vk never
+        // rotates, key_epoch only moves forward. A replayed or forged
+        // manifest fails here instead of bricking the local copy.
+        if remote_m.owner_vk != m.owner_vk {
+            return Err("refusing remote manifest: owner key changed".into());
+        }
+        if remote_m.key_epoch < m.key_epoch {
+            return Err("refusing remote manifest: key_epoch regressed".into());
+        }
+        use std::cmp::Ordering;
+        match remote_m.snapshot_epoch.cmp(&m.snapshot_epoch) {
+            Ordering::Greater => {
+                mpm_store::write_manifest(dir, &remote_bytes).map_err(|e| e.to_string())?;
+                manifest_note = format!("adopted remote (epoch {})", remote_m.snapshot_epoch);
+                if remote_m.device(&me).map(|d| !d.active).unwrap_or(true) {
+                    eprintln!("warning: this device is revoked in the new manifest");
                 }
-                Err(e) => return Err(e),
             }
-        } else {
-            manifest_note = "local manifest ahead but no admin credential — pushed nothing".into();
+            Ordering::Equal => {
+                // Epochs bump on every owner-signed write, so equal epochs
+                // with different bytes means two owner devices wrote
+                // concurrently and ours lost the CAS race. The remote copy
+                // is a real owner-signed manifest — adopt it; our unpushed
+                // change must be redone.
+                mpm_store::write_manifest(dir, &remote_bytes).map_err(|e| e.to_string())?;
+                manifest_note = format!(
+                    "adopted remote (epoch {}) — a local registry change lost a race; redo it",
+                    remote_m.snapshot_epoch
+                );
+            }
+            Ordering::Less => {
+                if let Some(admin) = &cfg.admin {
+                    let r = http(
+                        "PUT",
+                        &api(&cfg, &m.vault_id, "manifest"),
+                        Some(admin),
+                        Some(
+                            serde_json::json!({
+                                "manifest": mpm_store::hex(&local_bytes),
+                                "base_hash": sha256_hex(&remote_bytes),
+                            })
+                            .to_string()
+                            .as_bytes(),
+                        ),
+                        &[("content-type", "application/json")],
+                    )?;
+                    match check(r.status, &r.body) {
+                        Ok(()) => manifest_note = "pushed local".into(),
+                        Err(e) if r.status == 409 => {
+                            manifest_note = format!("push raced ({e}) — rerun sync");
+                        }
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    manifest_note =
+                        "local manifest ahead but no admin credential — pushed nothing".into();
+                }
+            }
         }
     }
 
@@ -537,15 +626,22 @@ pub fn cmd_sync(dir: &Path) -> Result<(), String> {
 /// registry BEFORE it lands in the local log: whole frames only (a
 /// partial tail means corruption), strict seq continuity from
 /// `first_seq`, and a valid device signature (verifiable without the
-/// vault DEK — the sig covers seq·nonce·ct). Returns the frame count.
+/// vault DEK — the sig covers seq·nonce·ct). Ops past `horizon` (a revoked
+/// device's trust boundary) end the page early — validly signed but
+/// untrusted, never appended. Returns `(frames, bytes)` verified.
 fn verify_frames(
     buf: &[u8],
     device: &[u8; 16],
     first_seq: u64,
     device_vk: &[u8; 32],
-) -> Result<usize, String> {
+    horizon: u64,
+) -> Result<(usize, usize), String> {
     let (mut pos, mut n) = (0usize, 0usize);
     while pos < buf.len() {
+        // the server caps pages at 256 — a larger page is off-contract
+        if n >= 256 {
+            return Err("pulled page exceeded the 256-frame cap".into());
+        }
         let (op, end) = Op::decode(&buf[pos..]).map_err(|e| e.to_string())?;
         let want = first_seq + n as u64;
         if op.seq != want {
@@ -555,12 +651,33 @@ fn verify_frames(
                 op.seq
             ));
         }
+        if op.seq > horizon {
+            break; // post-revocation ops: signed but untrusted — drop, don't fail
+        }
         op.verify_sig(device_vk)
             .map_err(|_| format!("bad signature on pulled op seq {}", op.seq))?;
         pos += end;
         n += 1;
     }
-    Ok(n)
+    Ok((n, pos))
+}
+
+/// GET the relay's current manifest bytes — the CAS base every
+/// owner-signed update must be built on.
+fn fetch_remote_manifest(
+    cfg: &SyncCfg,
+    vault_id: &[u8; 16],
+    token: &str,
+) -> Result<Vec<u8>, String> {
+    let r = http(
+        "GET",
+        &api(cfg, vault_id, "manifest"),
+        Some(token),
+        None,
+        &[],
+    )?;
+    check(r.status, &r.body)?;
+    unhex(&jstr(&json(&r.body)?, "manifest")?)
 }
 
 /// Serialize `sync` runs per vault: the daemon's background timer and a
@@ -572,6 +689,19 @@ fn sync_lock(vault_id: &[u8; 16]) -> Result<std::fs::File, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    #[cfg(unix)]
+    let f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| e.to_string())?
+    };
+    #[cfg(not(unix))]
     let f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -674,7 +804,7 @@ pub fn cmd_pair_pending(dir: &Path) -> Result<(), String> {
             jstr(p, "device")?,
             jstr(p, "name")?,
             jstr(p, "vk")?
-                .get(..12)
+                .get(..16)
                 .map(str::to_string)
                 .unwrap_or_else(|| "?".into()),
             jnum(p, "created")?
@@ -721,6 +851,21 @@ pub fn cmd_pair_approve(dir: &Path, rec: bool, prefix: &str) -> Result<(), Strin
     let dev_id = unhex16(&jstr(p, "device")?)?;
     let dev_vk = unhex32(&jstr(p, "vk")?)?;
     let dev_name = jstr(p, "name")?;
+    if m.device(&dev_id).is_some() {
+        return Err(format!(
+            "device {} is already enrolled — refusing a duplicate registry entry",
+            mpm_store::hex(&dev_id)
+        ));
+    }
+
+    // Stale-base check BEFORE mutating: our modification must be built on
+    // exactly what the relay holds, or the CAS below would silently
+    // overwrite another owner's concurrent change.
+    let local_bytes = std::fs::read(dir.join(mpm_store::MANIFEST)).map_err(|e| e.to_string())?;
+    let remote_bytes = fetch_remote_manifest(&cfg, &m.vault_id, &admin)?;
+    if remote_bytes != local_bytes {
+        return Err("local manifest is out of date — run `mypassman sync` first".into());
+    }
 
     // owner-signed manifest update — this IS the approval
     let mut vault = crate::unlock(dir, rec)?;
@@ -730,21 +875,15 @@ pub fn cmd_pair_approve(dir: &Path, rec: bool, prefix: &str) -> Result<(), Strin
         name: dev_name.clone(),
         active: true,
         enrolled_at: mpm_core::vault::now_hlc(),
+        revoked_seq: None,
         extra: Vec::new(),
     });
+    // snapshot_epoch is the manifest revision — every owner-signed write
+    // bumps it, so a replayed older manifest can never win a reconcile
+    vault.manifest.snapshot_epoch += 1;
     let bytes = vault.manifest.to_file(&vault.bundle().owner_signing_key());
     mpm_store::write_manifest(dir, &bytes).map_err(|e| e.to_string())?;
 
-    // push CAS on the remote manifest we just read
-    let r = http(
-        "GET",
-        &api(&cfg, &m.vault_id, "manifest"),
-        Some(&admin),
-        None,
-        &[],
-    )?;
-    check(r.status, &r.body)?;
-    let remote_bytes = unhex(&jstr(&json(&r.body)?, "manifest")?)?;
     let r = http(
         "PUT",
         &api(&cfg, &m.vault_id, "manifest"),
@@ -819,6 +958,7 @@ pub fn cmd_pair_join(dir: &Path, url: &str, invite: &str, name: &str) -> Result<
     if dir.join(mpm_store::MANIFEST).exists() {
         return Err("vault already exists here — pair join is for a fresh directory".into());
     }
+    check_url_scheme(url)?;
     let Some((vault_hex, code)) = invite.split_once('.') else {
         return Err("invite should look like <vault_id>.<code>".into());
     };
@@ -849,27 +989,18 @@ pub fn cmd_pair_join(dir: &Path, url: &str, invite: &str, name: &str) -> Result<
         return Err("server returned a manifest for a different vault".into());
     }
 
-    mpm_store::init_dir(dir).map_err(|e| e.to_string())?;
-    mpm_store::write_manifest(dir, &manifest_bytes).map_err(|e| e.to_string())?;
-    mpm_store::save_device_key(&vault_id, &dev).map_err(|e| e.to_string())?;
-    save_cfg(
-        &vault_id,
-        &SyncCfg {
-            url: url.into(),
-            invite: Some(code.to_string()),
-            ..Default::default()
-        },
-    )?;
-
-    // prove the password now rather than at finish: unwrap the password
-    // slot and anchor owner_vk to the bundle it yields. The device itself
-    // stays unenrolled until the owner approves.
+    // Prove the password BEFORE writing anything: unwrap a password slot
+    // and anchor owner_vk to the bundle it yields. A wrong password or a
+    // hostile manifest leaves the directory untouched. Cap the slots we
+    // try — each attempt is an Argon2 run with server-chosen params.
     let pw = crate::read_password("master password: ");
     let mut ok = false;
-    for slot in &m.wrap_slots {
-        if slot.slot_type != mpm_core::manifest::SLOT_PASSWORD {
-            continue;
-        }
+    for slot in m
+        .wrap_slots
+        .iter()
+        .filter(|s| s.slot_type == mpm_core::manifest::SLOT_PASSWORD)
+        .take(8)
+    {
         let Some((params, salt)) = &slot.kdf else {
             continue;
         };
@@ -879,6 +1010,7 @@ pub fn cmd_pair_join(dir: &Path, url: &str, invite: &str, name: &str) -> Result<
         if let Ok(kek) =
             mpm_crypto::kdf::derive_kek(pw.as_bytes(), salt, params).map_err(|e| e.to_string())
         {
+            let kek = zeroize::Zeroizing::new(kek);
             if let Ok(bundle) = mpm_crypto::keys::KeyBundle::unwrap(
                 &kek,
                 &mpm_core::aad::wrap_slot(&vault_id, m.key_epoch, slot.slot_type),
@@ -892,15 +1024,25 @@ pub fn cmd_pair_join(dir: &Path, url: &str, invite: &str, name: &str) -> Result<
         }
     }
     if !ok {
-        return Err("master password didn't unwrap this vault — vault written, \
-             fix the password before `pair finish`"
-            .into());
+        return Err("master password didn't unwrap this vault".into());
     }
+
+    mpm_store::init_dir(dir).map_err(|e| e.to_string())?;
+    mpm_store::write_manifest(dir, &manifest_bytes).map_err(|e| e.to_string())?;
+    mpm_store::save_device_key(&vault_id, &dev).map_err(|e| e.to_string())?;
+    save_cfg(
+        &vault_id,
+        &SyncCfg {
+            url: url.into(),
+            invite: Some(code.to_string()),
+            ..Default::default()
+        },
+    )?;
 
     eprintln!("requested as '{name}' ({})", mpm_store::hex(&dev.id));
     eprintln!(
         "my vk fingerprint: {}",
-        &mpm_store::hex(&dev.verifying_key())[..12]
+        &mpm_store::hex(&dev.verifying_key())[..16]
     );
     eprintln!(
         "waiting for the owner: `mypassman pair pending` / `pair approve {}`",
@@ -916,31 +1058,41 @@ pub fn cmd_pair_finish(dir: &Path) -> Result<(), String> {
     let m = mpm_store::load_manifest(dir).map_err(|e| e.to_string())?;
     let mut cfg =
         load_cfg(&m.vault_id)?.ok_or("no sync config — run `mypassman pair join` first")?;
-    let invite = cfg
-        .invite
-        .clone()
-        .ok_or("no pending enrollment — already finished or never joined")?;
     let me = mpm_store::load_device_key(&m.vault_id)
         .map_err(|e| e.to_string())?
         .id;
 
-    let r = http(
-        "POST",
-        &api(&cfg, &m.vault_id, "enroll/finish"),
-        Some(&invite),
-        Some(
-            serde_json::json!({"device": mpm_store::hex(&me)})
-                .to_string()
-                .as_bytes(),
-        ),
-        &[("content-type", "application/json")],
-    )?;
-    check(r.status, &r.body)?;
-    let v = json(&r.body)?;
-    cfg.read = Some(jstr(&v, "read")?);
-    cfg.write = Some(jstr(&v, "write")?);
-    cfg.invite = None;
-    let manifest_bytes = unhex(&jstr(&v, "manifest")?)?;
+    let manifest_bytes = if let Some(invite) = cfg.invite.clone() {
+        let r = http(
+            "POST",
+            &api(&cfg, &m.vault_id, "enroll/finish"),
+            Some(&invite),
+            Some(
+                serde_json::json!({"device": mpm_store::hex(&me)})
+                    .to_string()
+                    .as_bytes(),
+            ),
+            &[("content-type", "application/json")],
+        )?;
+        check(r.status, &r.body)?;
+        let v = json(&r.body)?;
+        cfg.read = Some(jstr(&v, "read")?);
+        cfg.write = Some(jstr(&v, "write")?);
+        cfg.invite = None;
+        // Persist the minted tokens FIRST — the invite is already burned
+        // server-side, so losing them here would leave no way to re-finish.
+        save_cfg(&m.vault_id, &cfg)?;
+        unhex(&jstr(&v, "manifest")?)?
+    } else if cfg.read.is_some() && cfg.write.is_some() {
+        // A previous finish died after minting tokens but before writing
+        // the manifest — recover by adopting the relay's current copy.
+        eprintln!("tokens already minted — recovering manifest from relay");
+        let rtok = cfg.read.clone().unwrap();
+        fetch_remote_manifest(&cfg, &m.vault_id, &rtok)?
+    } else {
+        return Err("no pending enrollment — already finished or never joined".into());
+    };
+
     let rm = Manifest::from_file(&manifest_bytes).map_err(|e| e.to_string())?;
     if rm.vault_id != m.vault_id {
         return Err("server returned a manifest for a different vault".into());
@@ -960,7 +1112,6 @@ pub fn cmd_pair_finish(dir: &Path) -> Result<(), String> {
         }
     }
     mpm_store::write_manifest(dir, &manifest_bytes).map_err(|e| e.to_string())?;
-    save_cfg(&m.vault_id, &cfg)?;
     eprintln!("paired — pulling ops");
     cmd_sync(dir)?;
     eprintln!("enrollment complete");
@@ -1002,26 +1153,61 @@ pub fn cmd_pair_revoke(dir: &Path, rec: bool, prefix: &str) -> Result<(), String
     let dev_hex = mpm_store::hex(&dev.id);
     let dev_name = dev.name.clone();
 
+    // Stale-base check: the revoke must be built on the manifest the relay
+    // actually holds, or the CAS below silently drops a concurrent change.
+    let local_bytes = std::fs::read(dir.join(mpm_store::MANIFEST)).map_err(|e| e.to_string())?;
+    let remote_bytes = fetch_remote_manifest(&cfg, &m.vault_id, &admin)?;
+    if remote_bytes != local_bytes {
+        return Err("local manifest is out of date — run `mypassman sync` first".into());
+    }
+
+    // Revocation horizon = the device's head on the relay: every op it
+    // wrote while still trusted keeps merging on all replicas, so a lost
+    // phone's history survives its own revocation. Ops beyond the horizon
+    // (post-revocation writes) are rejected everywhere. Falls back to the
+    // local log length if the relay has no head for the device.
+    let horizon = {
+        let r = http(
+            "GET",
+            &api(&cfg, &m.vault_id, "state"),
+            Some(&admin),
+            None,
+            &[],
+        )?;
+        check(r.status, &r.body)?;
+        json(&r.body)?
+            .get("heads")
+            .and_then(|h| h.as_array())
+            .and_then(|hs| {
+                hs.iter().find_map(|h| {
+                    (h.get("device")?.as_str()? == dev_hex)
+                        .then(|| h.get("head")?.as_u64())
+                        .flatten()
+                })
+            })
+            .or_else(|| {
+                mpm_store::read_ops(dir, &dev.id)
+                    .ok()
+                    .map(|lr| lr.ops.len() as u64)
+            })
+            .unwrap_or(0)
+    };
+
     // owner-signed manifest update — revoke IS a signature, not a flag
     let mut vault = crate::unlock(dir, rec)?;
     for d in &mut vault.manifest.devices {
         if mpm_store::hex(&d.id) == dev_hex {
             d.active = false;
+            d.revoked_seq = Some(horizon);
         }
     }
+    // bump the manifest revision — every owner-signed write does, so a
+    // replayed pre-revoke manifest can never win a reconcile
+    vault.manifest.snapshot_epoch += 1;
     let bytes = vault.manifest.to_file(&vault.bundle().owner_signing_key());
     mpm_store::write_manifest(dir, &bytes).map_err(|e| e.to_string())?;
 
     // CAS-push the manifest, then burn the device's tokens server-side
-    let r = http(
-        "GET",
-        &api(&cfg, &m.vault_id, "manifest"),
-        Some(&admin),
-        None,
-        &[],
-    )?;
-    check(r.status, &r.body)?;
-    let remote_bytes = unhex(&jstr(&json(&r.body)?, "manifest")?)?;
     let r = http(
         "PUT",
         &api(&cfg, &m.vault_id, "manifest"),

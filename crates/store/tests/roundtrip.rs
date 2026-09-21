@@ -77,6 +77,7 @@ fn init(dir: &std::path::Path, pw: &[u8]) -> (DeviceKey, [u8; 32], [u8; 16]) {
         name: "test".into(),
         active: true,
         enrolled_at: 0,
+        revoked_seq: None,
         extra: Vec::new(),
     });
     let sk = bundle.owner_signing_key();
@@ -344,6 +345,7 @@ fn recovery_enrolls_device_when_key_absent() {
         name: "recovery".into(),
         active: true,
         enrolled_at: 0,
+        revoked_seq: None,
         extra: Vec::new(),
     });
     let sk = bundle.owner_signing_key();
@@ -482,6 +484,7 @@ fn merge_is_order_independent_on_equal_hlc() {
             name: "second".into(),
             active: true,
             enrolled_at: 0,
+            revoked_seq: None,
             extra: Vec::new(),
         });
         let sk = v.bundle().owner_signing_key();
@@ -581,4 +584,182 @@ fn wrong_password_fails() {
         &m.wrap_slots[0].blob
     )
     .is_err());
+}
+
+/// Revocation horizon: ops a device wrote while trusted (seq <= revoked_seq)
+/// keep merging after revocation; post-horizon ops are refused — and the
+/// verified prefix still applies instead of wedging the log.
+#[test]
+fn revoked_device_horizon() {
+    let dir = tmpdir();
+    let pw = b"pw";
+    let (device, seed, _c) = init(&dir, pw);
+    let dev_id = device.id;
+    let mut v = reopen(&dir, pw, &seed, dev_id);
+
+    // enroll a second device (owner-signed, like `pair approve`)
+    let dev2 = DeviceKey::generate();
+    let dev2_id = dev2.id;
+    {
+        let mut m = v.manifest.clone();
+        m.devices.push(mpm_core::DeviceEntry {
+            id: dev2.id,
+            vk: dev2.verifying_key(),
+            name: "doomed".into(),
+            active: true,
+            enrolled_at: 0,
+            revoked_seq: None,
+            extra: Vec::new(),
+        });
+        let sk = v.bundle().owner_signing_key();
+        let bytes = m.to_file(&sk);
+        mpm_store::write_manifest(&dir, &bytes).unwrap();
+        v.manifest = mpm_core::Manifest::from_file(&bytes).unwrap();
+    }
+
+    // dev2 writes three chained ops
+    let mkop = |v: &Vault, seq: u64, prev: [u8; 32], name: &str| {
+        let mut rid = [0u8; 16];
+        rid[0] = seq as u8;
+        let mut it = Item::default();
+        it.set(tag::NAME, name.as_bytes().to_vec());
+        let fields_ct = mpm_core::OpPlaintext::seal_fields(
+            v.dek(),
+            &v.manifest.vault_id,
+            v.manifest.key_epoch,
+            &rid,
+            &it,
+        )
+        .unwrap();
+        let pt = mpm_core::OpPlaintext {
+            prev_op_hash: prev,
+            hlc: seq * 100,
+            op_type: mpm_core::OpType::Upsert,
+            record_id: rid,
+            kind: Some(ItemKind::Login),
+            schema_v: 1,
+            created: seq * 100,
+            name: name.as_bytes().to_vec(),
+            fields_ct,
+            gossip: Vec::new(),
+            origin_device: dev2.id,
+            origin_seq: seq,
+        };
+        mpm_core::Op::seal(
+            &pt,
+            seq,
+            v.dek(),
+            &v.manifest.vault_id,
+            v.manifest.format_v,
+            v.manifest.key_epoch,
+            &dev2,
+        )
+        .unwrap()
+    };
+    let op1 = mkop(&v, 1, [0u8; 32], "one");
+    let op2 = mkop(&v, 2, op1.hash(), "two");
+    let op3 = mkop(&v, 3, op2.hash(), "three");
+
+    // revoke dev2 with horizon=1 — the relay held only seq 1 when the
+    // owner revoked (op2/op3 were validly signed but post-revocation)
+    {
+        let mut m = v.manifest.clone();
+        for d in &mut m.devices {
+            if d.id == dev2_id {
+                d.active = false;
+                d.revoked_seq = Some(1);
+            }
+        }
+        let sk = v.bundle().owner_signing_key();
+        let bytes = m.to_file(&sk);
+        mpm_store::write_manifest(&dir, &bytes).unwrap();
+    }
+    let mut v = reopen(&dir, pw, &seed, dev_id);
+
+    // prefix verify: op1 merges, op2 trips the horizon, op3 never seen
+    let r = v.verify_foreign_prefix(&dev2_id, &[op1.clone(), op2.clone(), op3], 1, [0u8; 32]);
+    assert_eq!(r.pts.len(), 1, "only the pre-horizon op may merge");
+    assert!(matches!(
+        r.failed_at,
+        Some((2, mpm_core::CoreError::RevokedWrite(2)))
+    ));
+    v.apply_foreign(r.pts);
+    assert!(matches!(v.find("one"), mpm_core::FindResult::One(_)));
+    assert!(matches!(v.find("two"), mpm_core::FindResult::None));
+
+    // strict variant still errors on the post-horizon op
+    assert!(v.verify_foreign_log(&dev2_id, &[op1, op2]).is_err());
+}
+
+/// A revoked device with no recorded horizon (revoked by an older client)
+/// contributes nothing — strict, rather than silently trusting its tail.
+#[test]
+fn revoked_device_no_horizon() {
+    let dir = tmpdir();
+    let pw = b"pw";
+    let (device, seed, _c) = init(&dir, pw);
+    let dev_id = device.id;
+    let mut v = reopen(&dir, pw, &seed, dev_id);
+
+    let dev2 = DeviceKey::generate();
+    let dev2_id = dev2.id;
+    {
+        let mut m = v.manifest.clone();
+        m.devices.push(mpm_core::DeviceEntry {
+            id: dev2.id,
+            vk: dev2.verifying_key(),
+            name: "legacy-revoked".into(),
+            active: false,
+            enrolled_at: 0,
+            revoked_seq: None, // revoked before horizons existed
+            extra: Vec::new(),
+        });
+        let sk = v.bundle().owner_signing_key();
+        let bytes = m.to_file(&sk);
+        mpm_store::write_manifest(&dir, &bytes).unwrap();
+        v.manifest = mpm_core::Manifest::from_file(&bytes).unwrap();
+    }
+    let mut rid = [0u8; 16];
+    rid[0] = 7;
+    let mut it = Item::default();
+    it.set(tag::NAME, b"sneak".to_vec());
+    let fields_ct = mpm_core::OpPlaintext::seal_fields(
+        v.dek(),
+        &v.manifest.vault_id,
+        v.manifest.key_epoch,
+        &rid,
+        &it,
+    )
+    .unwrap();
+    let pt = mpm_core::OpPlaintext {
+        prev_op_hash: [0u8; 32],
+        hlc: 1,
+        op_type: mpm_core::OpType::Upsert,
+        record_id: rid,
+        kind: Some(ItemKind::Login),
+        schema_v: 1,
+        created: 1,
+        name: b"sneak".to_vec(),
+        fields_ct,
+        gossip: Vec::new(),
+        origin_device: dev2.id,
+        origin_seq: 1,
+    };
+    let op = mpm_core::Op::seal(
+        &pt,
+        1,
+        v.dek(),
+        &v.manifest.vault_id,
+        v.manifest.format_v,
+        v.manifest.key_epoch,
+        &dev2,
+    )
+    .unwrap();
+
+    let r = v.verify_foreign_prefix(&dev2_id, &[op], 1, [0u8; 32]);
+    assert!(r.pts.is_empty());
+    assert!(matches!(
+        r.failed_at,
+        Some((1, mpm_core::CoreError::RevokedWrite(1)))
+    ));
 }

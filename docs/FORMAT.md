@@ -53,7 +53,7 @@ TLV field: `tag(u8) || len(u32) || value`.
 | 0x04 | kdf | m_kib u32, t u32, p u32, salt 32 |
 | 0x05 | wrap_slot | nested TLV (below) — repeatable |
 | 0x06 | key_epoch | u32 |
-| 0x07 | snapshot_epoch | u64 |
+| 0x07 | snapshot_epoch | u64 — the manifest revision; bumped on EVERY owner-signed write (device add/revoke, wrap-slot change), so a replayed older manifest always loses |
 | 0x08 | device | nested TLV (below) — repeatable |
 | 0x09 | purged_before_epoch | u64 |
 | 0x0A | owner_vk | ed25519 verifying key, 32 bytes |
@@ -78,6 +78,7 @@ Device entry (0x08):
 | 0x03 | name | utf-8 |
 | 0x04 | status | u8: 1=active, 2=revoked |
 | 0x05 | enrolled_at | u64 (hlc) |
+| 0x06 | revoked_seq | u64, optional — revocation horizon: when status=2, ops with `seq <= revoked_seq` still verify and merge (they were written while the device was trusted); later seqs are rejected. Absent on an inactive device means "revoked before horizons" — nothing merges |
 
 `owner_sig` = ed25519 sign(owner_sk, body). Readers MUST verify before
 trusting any field. Unknown tags are retained and re-encoded so

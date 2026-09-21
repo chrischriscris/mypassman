@@ -186,7 +186,20 @@ pub fn run(dir: &Path, rec: bool, idle_ttl: u64) -> Result<(), String> {
         }
         std::fs::remove_file(&path).map_err(|e| e.to_string())?; // stale
     }
+    // foreign log tips recorded BEFORE unlock: ops appended between this
+    // read and unlock's replay get re-verified as a harmless idempotent
+    // suffix — recording tips after unlock would instead mark frames seen
+    // that were never applied
+    let mut foreign: HashMap<[u8; 16], (u64, [u8; 32])> = HashMap::new();
+    let mut quarantined: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
+    for dev in mpm_store::list_device_logs(dir).map_err(|e| e.to_string())? {
+        let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
+        if let Some(tip) = lr.ops.last() {
+            foreign.insert(dev, (lr.ops.len() as u64, tip.hash()));
+        }
+    }
     let mut vault = unlock(dir, rec)?;
+    foreign.remove(vault.device_id()); // own log is tracked by `known`, not `foreign`
     let listener =
         UnixListener::bind(&path).map_err(|e| format!("bind {}: {e}", path.display()))?;
     #[cfg(unix)]
@@ -203,23 +216,11 @@ pub fn run(dir: &Path, rec: bool, idle_ttl: u64) -> Result<(), String> {
     // not a fresh read (an op appended between unlock and a re-read would
     // be counted-but-never-applied → our next append forks the chain)
     let mut known = vault.head().0 as usize;
-    // foreign logs replayed at unlock: remember each tip so per-request
-    // refresh verifies only the suffix a sync pull appended
-    let mut foreign: HashMap<[u8; 16], (u64, [u8; 32])> = HashMap::new();
-    for dev in mpm_store::list_device_logs(dir).map_err(|e| e.to_string())? {
-        if &dev == vault.device_id() {
-            continue;
-        }
-        let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
-        if let Some(tip) = lr.ops.last() {
-            foreign.insert(dev, (lr.ops.len() as u64, tip.hash()));
-        }
-    }
     // background sync: opportunistic ciphertext exchange — never needs the
     // unlocked vault (sync transports ciphertext only), so it runs while we
     // serve. Pulled foreign ops land on disk and merge into the index on
     // the next request via refresh_foreign. MPM_SYNC_EVERY=0 disables.
-    {
+    if sync_interval() > 0 {
         let dir = dir.to_path_buf();
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_secs(sync_interval()));
@@ -253,8 +254,9 @@ pub fn run(dir: &Path, rec: bool, idle_ttl: u64) -> Result<(), String> {
                 if s.read_exact(&mut op).is_err() {
                     continue;
                 }
+                // OP_PUT payloads carry item plaintext — wipe on drop
                 let payload = match read_msg(&mut s) {
-                    Ok(p) => p,
+                    Ok(p) => zeroize::Zeroizing::new(p),
                     Err(_) => continue,
                 };
                 if op[0] == OP_LOCK {
@@ -279,8 +281,15 @@ pub fn run(dir: &Path, rec: bool, idle_ttl: u64) -> Result<(), String> {
                         continue;
                     }
                 };
-                let (status, resp) =
-                    handle(op[0], &payload, &mut vault, dir, &mut known, &mut foreign);
+                let (status, resp) = handle(
+                    op[0],
+                    payload.as_slice(),
+                    &mut vault,
+                    dir,
+                    &mut known,
+                    &mut foreign,
+                    &mut quarantined,
+                );
                 let _ = write_msg(&mut s, status, &resp);
                 if op[0] != OP_PING {
                     last = Instant::now(); // only real ops reset idle
@@ -333,6 +342,7 @@ fn refresh_foreign(
     vault: &mut Vault,
     dir: &Path,
     foreign: &mut HashMap<[u8; 16], (u64, [u8; 32])>,
+    quarantined: &mut std::collections::HashSet<[u8; 16]>,
 ) -> Result<(), String> {
     let devs = mpm_store::list_device_logs(dir).map_err(|e| e.to_string())?;
     if devs.iter().all(|d| d == vault.device_id()) {
@@ -344,14 +354,8 @@ fn refresh_foreign(
     // revocation — must verify against the CURRENT registry.
     reload_manifest(vault, dir)?;
     for dev in devs {
-        if &dev == vault.device_id() {
+        if &dev == vault.device_id() || quarantined.contains(&dev) {
             continue;
-        }
-        // revoked/unknown devices: verify_foreign_from fails NotEnrolled —
-        // skip the log rather than fail every request until restart
-        match vault.manifest.device(&dev) {
-            Some(e) if e.active => {}
-            _ => continue,
         }
         let (cnt, head) = foreign.get(&dev).copied().unwrap_or((0, [0u8; 32]));
         let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
@@ -365,11 +369,22 @@ fn refresh_foreign(
         if n == cnt {
             continue;
         }
-        let pts = vault
-            .verify_foreign_from(&dev, &lr.ops[cnt as usize..], cnt + 1, head)
-            .map_err(|e| e.to_string())?;
-        vault.apply_foreign(pts);
-        foreign.insert(dev, (n, lr.ops.last().unwrap().hash()));
+        // prefix verify: a revoked device still contributes ops up to its
+        // revocation horizon; a failure quarantines the log (warn once)
+        // rather than erroring every request until restart
+        let r = vault.verify_foreign_prefix(&dev, &lr.ops[cnt as usize..], cnt + 1, head);
+        vault.apply_foreign(r.pts);
+        foreign.insert(dev, r.tip);
+        if let Some((seq, e)) = r.failed_at {
+            // warn once — a quarantined log keeps tripping the same frame
+            if quarantined.insert(dev) {
+                eprintln!(
+                    "daemon: quarantined log of device {} at seq {} ({e})",
+                    mpm_store::hex(&dev),
+                    seq
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -399,8 +414,9 @@ fn handle(
     dir: &Path,
     known: &mut usize,
     foreign: &mut HashMap<[u8; 16], (u64, [u8; 32])>,
+    quarantined: &mut std::collections::HashSet<[u8; 16]>,
 ) -> (u8, Vec<u8>) {
-    match serve(op, payload, vault, dir, known, foreign) {
+    match serve(op, payload, vault, dir, known, foreign, quarantined) {
         Ok(p) => (0, p),
         Err(e) => {
             let (status, msg) = if let Some(m) = e.strip_prefix("MISSING:") {
@@ -423,11 +439,12 @@ fn serve(
     dir: &Path,
     known: &mut usize,
     foreign: &mut HashMap<[u8; 16], (u64, [u8; 32])>,
+    quarantined: &mut std::collections::HashSet<[u8; 16]>,
 ) -> Result<Vec<u8>, String> {
     // catch up with any out-of-band appends before answering (the caller
     // holds the vault lock across the whole request)
     let torn = refresh(vault, dir, known).map_err(|e| format!("refresh: {e}"))?;
-    refresh_foreign(vault, dir, foreign).map_err(|e| format!("refresh: {e}"))?;
+    refresh_foreign(vault, dir, foreign, quarantined).map_err(|e| format!("refresh: {e}"))?;
     if torn && matches!(op, OP_PUT | OP_DEL) {
         // appending past the tear would orphan the new op at next unlock
         return Err(

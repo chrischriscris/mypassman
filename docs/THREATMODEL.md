@@ -21,10 +21,30 @@ existing device signs it into the manifest — the server's pending queue
 can propose, never approve. A leaked invite code alone yields a pending
 row, not access.
 
-**Revocation is forward-secure.** `pair revoke` removes the device from
-the owner-signed registry and burns its tokens; it can't push or pull
-again. (Like every password manager: it retains whatever ciphertext it
-already saw — rotate exposed secrets.)
+**Revocation is forward-secure — and non-destructive.** `pair revoke`
+records a *revocation horizon* (`revoked_seq` = the device's seq head on
+the relay at revoke time) in the owner-signed manifest and burns its
+tokens. Ops the device wrote while trusted (`seq <= revoked_seq`) keep
+merging on every replica — a lost phone's history survives its own
+revocation — while anything it writes after is rejected at ingest, on
+push, and at merge. The device keeps whatever ciphertext it already saw
+(like every password manager — rotate exposed secrets). Its own local
+writes fail once it learns the new manifest; a fully cut-off device only
+learns via the 401s.
+
+**Foreign-log corruption quarantines, it doesn't wedge.** A device log
+that fails verification (bad sig, chain break, undecryptable op — e.g. a
+compromised-but-enrolled device pushing signed garbage) is skipped from
+its first bad op with a warning; the verified prefix still merges. Unlock
+and `pair revoke` stay usable so the owner can actually evict it.
+
+**Manifest replays can't roll back.** `snapshot_epoch` is the manifest
+revision — bumped on every owner-signed write, monotone, pinned in both
+relay backends. Clients adopt a remote manifest only when its epoch is
+strictly newer AND `owner_vk`/`key_epoch` are consistent (owner_vk never
+rotates). An equal-epoch/different-bytes state means two owners wrote
+concurrently — the relay's copy wins, the loser is told to redo its
+change.
 
 ## What the relay still sees (metadata)
 

@@ -30,6 +30,8 @@ pub enum CoreError {
     NotFound,
     #[error("device not enrolled")]
     NotEnrolled,
+    #[error("device was revoked — op at seq {0} is past its revocation horizon")]
+    RevokedWrite(u64),
     #[error("export passphrase wrong or blob tampered")]
     BadExportPassphrase,
     #[error("corrupt: {0}")]

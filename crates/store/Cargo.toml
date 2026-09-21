@@ -11,6 +11,7 @@ dirs.workspace = true
 ed25519-dalek.workspace = true
 fs2.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 dirs.workspace = true

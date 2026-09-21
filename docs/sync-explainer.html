@@ -576,12 +576,20 @@ h3 { font-size: 22px; margin-top: 2em; }
   </div>
   <div class="prose">
     <p>
-      <code>syncd</code> is a Cloudflare Worker in front of one Durable Object per vault.
-      Each Durable Object owns a small SQLite database: the current manifest, the op frames
-      keyed by device and seq, hashed tokens, live invite codes, and a queue of devices
-      asking to join. Because a Durable Object is single-threaded, appending ops and
-      swapping the manifest are plain SQLite transactions. There is no coordinator to
-      build and no race to win.
+      <code>syncd</code> exists in two interchangeable bodies behind one wire protocol. The
+      Cloudflare version is a Worker in front of one Durable Object per vault — the zero-infra
+      option, deployable on the free tier. The self-host option is <code>mpm-syncd</code>, a
+      single Rust binary (axum + SQLite, one <code>.db</code> file per vault) that reuses the
+      same verification crate as the client — so the crypto can't drift. A Docker image is
+      about 100&nbsp;MB: <code>docker run -v data:/data -e MPM_SETUP_KEY=… -p 8787:8787</code>
+      is the whole VPS story. Clients can't tell which backend they are talking to.
+    </p>
+    <p>
+      Each vault's state lives in one serialized context — a single-threaded Durable Object,
+      or a per-vault mutex in the Rust version — holding a small SQLite database: the current
+      manifest, the op frames keyed by device and seq, hashed tokens, live invite codes, and a
+      queue of devices asking to join. Appending ops and swapping the manifest are plain
+      transactions. There is no coordinator to build and no race to win.
     </p>
     <p>
       It stores only what it can verify. Before an op frame is accepted the relay checks
@@ -593,10 +601,12 @@ h3 { font-size: 22px; margin-top: 2em; }
     </p>
     <p>
       Before a manifest is replaced it checks the owner signature, that the vault id is
-      unchanged, that neither epoch went backwards, and that the caller's
-      <code>base_hash</code> matches the sha256 of what is currently stored. That last
-      check is a compare-and-swap: two admins racing to add devices can't overwrite each
-      other, and the loser is told to pull and try again.
+      unchanged, that the owner key itself is unchanged — <code>owner_vk</code> is pinned at
+      bootstrap, so an admin token can't quietly swap in a manifest signed by a different key —
+      that neither epoch went backwards, and that the caller's <code>base_hash</code> matches
+      the sha256 of what is currently stored. That last check is a compare-and-swap: two
+      admins racing to add devices can't overwrite each other, and the loser is told to pull
+      and try again.
     </p>
     <h3>Three tokens and one key</h3>
     <ul>
@@ -639,7 +649,7 @@ h3 { font-size: 22px; margin-top: 2em; }
     <div class="move">
       <div>
         <h4>Pull what other devices wrote</h4>
-        <p>For each foreign device whose head is past your local copy of its log, fetch frames since your count in pages of up to 256. Frames are appended to <code>ops/&lt;device&gt;.log</code> verbatim. If a page ever ends mid-frame, the client refuses to write a torn log.</p>
+        <p>For each foreign device whose head is past your local copy of its log, fetch frames since your count in pages of up to 256. Each frame is verified <em>before</em> it touches the log — seq continuity plus the device signature against the manifest registry, no unlock needed — so a hostile relay can't poison your log with bytes that only fail later. Good frames append to <code>ops/&lt;device&gt;.log</code> verbatim; a bad one aborts the sync.</p>
         <div class="http"><span class="m">GET</span> /v/&lt;vault&gt;/ops?device=…&amp;since=N&amp;limit=256 → raw frames, x-head, x-more</div>
       </div>
     </div>
@@ -653,7 +663,7 @@ h3 { font-size: 22px; margin-top: 2em; }
     <div class="move">
       <div>
         <h4>Reconcile the manifest</h4>
-        <p>Fetch the relay's manifest. If the bytes differ from yours, the higher snapshot epoch wins. At equal epochs the version listing more devices wins, and an exact tie goes to the relay. If yours wins and you hold an admin token, push it with the relay's hash as the CAS base. A 409 means someone else got there first: run sync again.</p>
+        <p>Fetch the relay's manifest. Before anything is adopted, the client pins the trust anchors: the owner key must be identical (it never rotates) and the key epoch may not regress. Then epochs decide: strictly newer wins, older loses and is pushed back if you hold admin, and an equal epoch with different bytes means your local change lost a CAS race — the relay's copy wins and you're told to redo the change. Because every owner-signed write bumps the epoch, a replayed old manifest can never win.</p>
         <div class="http"><span class="m">GET</span> /v/&lt;vault&gt;/manifest &nbsp; <span class="m">PUT</span> /v/&lt;vault&gt;/manifest { manifest, base_hash }</div>
       </div>
     </div>
@@ -715,7 +725,30 @@ h3 { font-size: 22px; margin-top: 2em; }
       The invite is printed as <code>&lt;vault_id&gt;.&lt;code&gt;</code> because the code alone can't
       route: the vault id is what selects which Durable Object holds the vault. The code
       lives fifteen minutes, is stored hashed, and is burned the moment it is exchanged for
-      tokens.
+      tokens. <code>pair invite --qr</code> renders a terminal QR encoding an
+      <code>mpm://pair?server=…&amp;invite=…</code> deep link — on a phone, enrollment becomes
+      scan, type the vault password, done.
+    </p>
+    <p>
+      Two checks keep the ceremony honest. The new device prints its <em>vk fingerprint</em>
+      and <code>pair pending</code> shows the fingerprint of whoever actually joined — the
+      owner compares them before signing, SSH-style, because a relay could otherwise swap the
+      submitted key under a familiar name (it can't steal anything, the vault key never
+      leaves, but it could wedge the enrollment). And <code>pair finish</code> redeems the
+      invite only for the device that joined under it: the server requires a pending row whose
+      key matches the one the owner just signed, so a stolen code can't mint tokens for a
+      device that was already active.
+    </p>
+    <p>
+      The mirror image is <code>pair revoke</code>: the owner re-signs the manifest with the
+      device's <code>active</code> flag cleared and a <em>revocation horizon</em> recorded —
+      the seq head the relay held for it at that moment. Ops the device wrote while still
+      trusted (<code>seq ≤ horizon</code>) keep merging on every replica, so a lost phone's
+      history survives its own revocation; anything it writes after is refused on push,
+      dropped at pull, and rejected at merge — including on the revoked device itself once
+      it learns the new manifest. The relay burns its tokens, so its next call gets a 401.
+      The honest limit stands: it keeps whatever ciphertext it already pulled, so rotate any
+      secrets it saw.
     </p>
   </div>
 </section>
@@ -729,10 +762,13 @@ h3 { font-size: 22px; margin-top: 2em; }
   <div class="prose">
     <p>
       On a Mac the vault is usually held open by a daemon so the app and the browser
-      extension don't have to prompt for a password every time. Sync runs as a separate,
-      short-lived process that only appends bytes to files. Those two never talk. Instead,
-      the daemon treats the disk as the source of truth and re-checks it before every
-      request it answers.
+      extension don't have to prompt for a password every time. Sync itself runs as a
+      background thread inside that same daemon — every <code>MPM_SYNC_EVERY</code> seconds
+      (default a few minutes) it exchanges ciphertext without ever touching the unlocked
+      keys, since moving frames needs no decryption. A manual <code>sync</code> and the
+      daemon's timer take a per-vault lockfile so they can never interleave their appends.
+      The daemon treats the disk as the source of truth and re-checks it before every
+      request it answers — so whatever sync pulled merges on the next request, no re-unlock.
     </p>
   </div>
 
@@ -770,9 +806,11 @@ h3 { font-size: 22px; margin-top: 2em; }
     <p>
       It also reloads the manifest whenever foreign logs exist, because pairing and
       revocation arrive as a new manifest on disk. A device that was added since unlock
-      becomes trusted. A device that was revoked stops merging, even for ops already in
-      its file. The reload is refused if the vault id, owner key or key epoch changed, since
-      that would mean the DEK in memory is stale.
+      becomes trusted. A device that was revoked keeps contributing up to its revocation
+      horizon — the ops it wrote while trusted — and stops there. And a log that fails
+      verification mid-file is quarantined, not fatal: the daemon applies the good prefix,
+      warns once, and keeps serving. The reload is refused if the vault id, owner key or
+      key epoch changed, since that would mean the DEK in memory is stale.
     </p>
   </div>
 </section>
@@ -799,10 +837,17 @@ h3 { font-size: 22px; margin-top: 2em; }
 
 <footer class="foot">
   The code behind this page: <span class="mono">syncd/src/vault.ts</span> (the Durable Object),
+  <span class="mono">crates/syncd/</span> (the Rust relay — same contract),
   <span class="mono">syncd/src/wire.ts</span> (frame and manifest parsing),
   <span class="mono">crates/cli/sync.rs</span> (the client and pairing),
-  <span class="mono">crates/cli/daemon.rs</span> (live merge), and DESIGN.md section 8.
-  M3 is partial: compaction, conflict copies, gossip vectors and restored-device handling are still open.
+  <span class="mono">crates/cli/daemon.rs</span> (live merge + background sync), and docs/SYNC.md.
+  Since the first adversarial review: verify-on-pull, invite↔device binding, owner-key pinning,
+  sync serialization, bounded responses and no redirects. Since the second: revocation
+  horizons (a revoked device's trusted ops survive), manifest-revision bumps on every
+  owner write, owner/epoch pinning on adoption, foreign-log quarantine, torn-tail healing,
+  atomic sync-config writes, HTTPS enforcement, and zeroized key paths. Still open:
+  compaction/snapshots, conflict copies, gossip vectors, restored-device handling,
+  DEK rotation on revoke.
 </footer>
 
 </main>
@@ -836,9 +881,9 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':
       <dl class="kv">
         <dt>vault_id</dt><dd>16 random bytes. Names the vault everywhere, including which Durable Object holds it.</dd>
         <dt>wrap slots</dt><dd>The data key and owner key, wrapped once per unlock method: password, Touch ID, recovery kit.</dd>
-        <dt>key_epoch</dt><dd>Bumped on revocation, when the data key rotates. Ops are bound to it.</dd>
-        <dt>snapshot_epoch</dt><dd>Monotonic. The relay refuses any manifest whose epochs go backwards.</dd>
-        <dt>device registry</dt><dd>One entry per device: id, ed25519 public key, name, active flag. This is the whole access list.</dd>
+        <dt>key_epoch</dt><dd>The data-key generation — bumps when the DEK rotates (revocation does NOT rotate it today: the revoked device keeps the DEK). Ops are bound to it.</dd>
+        <dt>snapshot_epoch</dt><dd>The manifest revision — bumped on every owner-signed write and pinned by the relay, so a replayed older manifest can never win a reconcile.</dd>
+        <dt>device registry</dt><dd>One entry per device: id, ed25519 public key, name, active flag — plus a revocation horizon once revoked, so the device's trusted-era ops still merge. This is the whole access list.</dd>
         <dt>owner_vk</dt><dd>The public half of the owner key, so the signature can be checked without unlocking.</dd>
       </dl>`,
     loga: `
@@ -847,7 +892,7 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':
       <p>Frames are numbered 1, 2, 3 with no gaps, and each one seals the hash of the one before it. Truncating the tail is the only tamper that leaves the file valid, and the relay's per-device head plus the manifest's epoch are what notice that.</p>`,
     logb: `
       <h4>ops/5e9d21ab….log</h4>
-      <p>The iPhone's log, as it appears on the MacBook. It arrived via sync, appended verbatim, and the MacBook's daemon verified each frame against the iPhone's public key from the registry before merging its contents.</p>
+      <p>The iPhone's log, as it appears on the MacBook. It arrived via sync, appended verbatim — but only after each frame was decoded, seq-checked and signature-verified against the iPhone's registry key. If the iPhone is later revoked, new pulls cap at its revocation horizon: the trusted-era ops stay, anything after is dropped on the floor.</p>
       <p>Because seq spaces are per device, the iPhone could write op 1 while the MacBook wrote op 3, both offline, and nothing needed to agree in advance.</p>`,
     devkey: `
       <h4>devices/&lt;vault_id&gt;.dev</h4>
@@ -855,8 +900,8 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':
       <p>Two devices of one vault can live on one machine by pointing <code>MPM_DATA</code> at another directory, which is how the restore drills and tests run.</p>`,
     creds: `
       <h4>sync/&lt;vault_id&gt;.conf</h4>
-      <p>Plain <code>key=value</code> lines: the relay URL and whichever of admin, read and write tokens this device holds. Between <code>pair join</code> and <code>pair finish</code> it holds the invite code instead.</p>
-      <p>Same posture as the device key. A write token is strictly less powerful than the signing key it accompanies, so it earns the same protection and no more.</p>`
+      <p>Plain <code>key=value</code> lines: the relay URL and whichever of admin, read and write tokens this device holds. Between <code>pair join</code> and <code>pair finish</code> it holds the invite code instead. Written atomically (tmp + rename) so a crash can't leave it empty.</p>
+      <p>Same posture as the device key — 0600 in a 0700 dir. And because these are bearer tokens, the client refuses a plain-http relay URL outside loopback unless you explicitly opt out with <code>MPM_SYNC_INSECURE=1</code>.</p>`
   };
   const panel = $('#tree-detail');
   const show = k => { panel.innerHTML = detail[k]; $$('.tree .file').forEach(b => b.classList.toggle('on', b.dataset.t === k)); };
@@ -1100,10 +1145,10 @@ function laneBusy(id) {
     { cap: `<b>The owner asks for an invite.</b> The relay mints an eight-character code, stores only its hash with a fifteen-minute expiry, and returns it. The CLI prints it prefixed with the vault id, because the relay needs the id to find the right Durable Object.`,
       owner: { cmd: '$ mypassman pair invite', body: `invite: <span class="mono">${VID.slice(0,8)}…${VID.slice(-4)}.${CODE}</span><br>valid 900s. Carry it to the new device.` },
       relay: { http: `<span class="m">POST</span> /enroll/invite  (admin)`, checks: [{ t: 'admin scope', s: 'ok' }, { t: 'fewer than 8 live invites', s: 'ok' }], t: tables(1, 0, 3, 1) }, nw: { cmd: '', body: 'Waiting.' }, busy: '#pl-owner' },
-    { cap: `<b>The iPhone joins.</b> It generates its own device key, keeps the private half in a 0600 file outside the vault, and submits its id, public key and a name under the invite code. The relay files that in the pending queue and hands back the current manifest. The phone uses the manifest to check the master password against the wrap slot locally, so a typo surfaces now, not after approval. It is <em>not</em> enrolled.`,
+    { cap: `<b>The iPhone joins.</b> It generates its own device key, keeps the private half in a 0600 file outside the vault, and submits its id, public key and a name under the invite code. The relay files that in the pending queue — and refuses a different key under an existing id, so nobody can squat a pending slot — and hands back the current manifest. The phone proves the master password against the wrap slot <em>before writing anything</em>, so a typo or a hostile manifest leaves the directory untouched. It is <em>not</em> enrolled.`,
       owner: { cmd: '', body: 'Unaware, so far.' },
-      relay: { http: `<span class="m">POST</span> /enroll/join  (invite code)<br>{ device: 5e9d21ab…, vk: 7c…, name: "iphone" }`, checks: [{ t: 'code hash found and not expired', s: 'ok' }, { t: 'fewer than 16 pending', s: 'ok' }], t: tables(1, 1, 3, 1) },
-      nw: { cmd: `$ mypassman pair join https://… ${VID.slice(0,8)}….${CODE} --name iphone`, body: 'Device key generated. Manifest written. Password confirmed against the wrap slot.<br>Waiting for the owner to approve.' }, busy: '#pl-new' },
+      relay: { http: `<span class="m">POST</span> /enroll/join  (invite code)<br>{ device: 5e9d21ab…, vk: 7c…, name: "iphone" }`, checks: [{ t: 'code hash found and not expired', s: 'ok' }, { t: 'fewer than 16 pending', s: 'ok' }, { t: 'same device id under a different key', s: 'bad' }], t: tables(1, 1, 3, 1) },
+      nw: { cmd: `$ mypassman pair join https://… ${VID.slice(0,8)}….${CODE} --name iphone`, body: 'Device key generated. Password confirmed against the wrap slot, then manifest written.<br>Waiting for the owner to approve.' }, busy: '#pl-new' },
     { cap: `<b>The owner looks at who is knocking.</b> The queue shows the phone's name and the fingerprint of its public key. This is the moment to compare fingerprints out of band if you care to.`,
       owner: { cmd: '$ mypassman pair pending', body: `<span class="mono">5e9d21ab…  iphone  vk 7c3e…a91f  2 min ago</span>` },
       relay: { http: `<span class="m">GET</span> /enroll/pending  (admin)`, checks: [{ t: 'admin scope', s: 'ok' }], t: tables(1, 1, 3, 1) }, nw: { cmd: '', body: 'Waiting for the owner to approve.' }, busy: '#pl-owner' },
@@ -1111,7 +1156,7 @@ function laneBusy(id) {
       owner: { cmd: '', body: 'Registry: MacBook. Looking at the queue.' },
       relay: { http: `<span class="m">POST</span> /enroll/finish  (invite code)<br>→ 409 not approved yet`, checks: [{ t: 'code hash found and not expired', s: 'ok' }, { t: 'device present and active in signed manifest', s: 'bad' }], t: tables(1, 1, 3, 1) },
       nw: { cmd: '$ mypassman pair finish', body: '<span style="color:var(--reject)">not approved yet. The enrolled device must sign you into the manifest.</span>' }, busy: '#pl-relay' },
-    { cap: `<b>Approval.</b> The MacBook unlocks, appends a device entry with the phone's id and public key to the manifest, signs the whole thing with the owner key, writes it locally, then pushes it with the relay's current hash as the CAS base. The relay checks the signature and the epochs and swaps. <b>That signature is the approval.</b> The pending table was not touched.`,
+    { cap: `<b>Approval.</b> The MacBook first checks its manifest is exactly what the relay holds (a stale copy would make the CAS lie). It unlocks, appends a device entry with the phone's id and public key, bumps the manifest revision, signs the whole thing with the owner key, writes it locally, then pushes it with the relay's current hash as the CAS base. The relay checks the signature and the epochs and swaps. <b>That signature is the approval.</b> The pending table was not touched.`,
       owner: { cmd: '$ mypassman pair approve 5e9d', body: 'Unlocked. Registry: MacBook, iPhone. Manifest re-signed and pushed.<br>Tell the phone to run <span class="mono">pair finish</span>.' },
       relay: { http: `<span class="m">PUT</span> /manifest  (admin)<br>{ manifest: 40…, base_hash: 9c41…e07a }`, checks: [{ t: 'base_hash matches stored sha256', s: 'ok' }, { t: 'vault_id unchanged', s: 'ok' }, { t: 'owner signature verifies', s: 'ok' }, { t: 'key_epoch and snapshot_epoch did not decrease', s: 'ok' }], t: tables(1, 1, 3, 2) },
       nw: { cmd: '', body: 'Waiting for the owner to approve.' }, busy: '#pl-owner' },
@@ -1201,8 +1246,8 @@ function laneBusy(id) {
       body: `<p>Every op body is XChaCha20-Poly1305 ciphertext under the vault's data key, which exists only inside unlocked devices. The record fields inside are encrypted a second time with a per-record key. The manifest's wrap slots are Argon2id-wrapped, and the relay never sees a password proof.</p><p>Record ids, timestamps and op types are all inside the ciphertext, so the relay can't even tell which ops touch the same record.</p>`,
       checks: [{ t: 'plaintext anywhere in storage', s: 'bad' }], where: 'wire.ts parseOpFrames: header only. vault.ts appendOps stores f.raw.' },
     { k: 'forge', label: 'Forge an op', v: ['blocked', 'Signature fails'],
-      body: `<p>A frame must carry an ed25519 signature over its seq, nonce and ciphertext, made with the private key of a device listed in the manifest. The relay holds only public keys. Even a compromised relay with every token can't manufacture a frame that any client will accept, and clients verify independently, never trusting the relay's own check.</p><p>Bonus: the ciphertext's additional data binds the vault id, key epoch, device id and seq, so a genuine frame can't be replayed into another slot or another vault either.</p>`,
-      checks: [{ t: 'ed25519 signature verifies against registry key', s: 'bad' }], where: 'wire.ts opSigVerify · core Op::open on the client' },
+      body: `<p>A frame must carry an ed25519 signature over its seq, nonce and ciphertext, made with the private key of a device listed in the manifest. The relay holds only public keys. Even a compromised relay with every token can't manufacture a frame that any client will accept — and clients verify every pulled frame <em>before it touches their log</em>, never trusting the relay's own check.</p><p>Bonus: the ciphertext's additional data binds the vault id, key epoch, device id and seq, so a genuine frame can't be replayed into another slot or another vault either.</p>`,
+      checks: [{ t: 'ed25519 signature verifies against registry key', s: 'bad' }], where: 'vault.ts appendOps · core Op::verify_sig at ingest + Op::open at unlock' },
     { k: 'reorder', label: 'Reorder or drop ops in the middle', v: ['blocked', 'Chain breaks'],
       body: `<p>Seq numbers are checked for continuity on push, so a gap can't be stored. And each op seals the hash of its predecessor inside the ciphertext, which the client checks on every frame it merges. Swap two frames, or remove one, and the next frame's prev_op_hash no longer matches. The client stops at the break and refuses that log.</p>`,
       checks: [{ t: 'seq == head + 1 on append', s: 'ok' }, { t: 'prev_op_hash links to previous frame (client)', s: 'bad' }], where: 'vault.ts appendOps · core verify_foreign_from' },
@@ -1210,14 +1255,20 @@ function laneBusy(id) {
       body: `<p>If a push carries a seq the relay already has, the bytes must be identical, otherwise it is refused as equivocation. A relay that itself serves different bytes to different devices is caught the same way: the two devices' copies of that log diverge at a seq, and their prev_op_hash chains stop agreeing at the next frame.</p>`,
       checks: [{ t: 'same seq, identical bytes: idempotent replay', s: 'ok' }, { t: 'same seq, different bytes', s: 'bad' }], where: 'vault.ts appendOps eqBytes' },
     { k: 'rollback', label: 'Roll back the manifest', v: ['blocked', 'Epochs only go up'],
-      body: `<p>The relay refuses any manifest whose key epoch or snapshot epoch is lower than the one stored, and every replacement needs the current sha256 as a CAS base. A compromised relay could of course serve an older manifest it kept. The client compares epochs before adopting anything, keeps its own copy when it is ahead, and treats local retention as authoritative. The epoch is also printed in the recovery kit and UI so a human can spot a stale server.</p>`,
-      checks: [{ t: 'owner signature verifies', s: 'ok' }, { t: 'key_epoch or snapshot_epoch decreased', s: 'bad' }, { t: 'base_hash matches stored sha256', s: 'ok' }], where: 'vault.ts putManifest · sync.rs manifest reconcile' },
+      body: `<p>Two layers. At the relay, a replacement manifest needs the current sha256 as CAS base and neither epoch may regress — so a push of an old copy just fails. At the client, the rules are stricter than the relay's: the owner key must be byte-identical (it never rotates), the key epoch may not regress, and the manifest revision — bumped on every owner-signed write — must be strictly newer to adopt. A replayed pre-revocation manifest has a lower revision: the client keeps its own and pushes it back. An equal revision with different bytes means two owners wrote concurrently — the relay's copy wins, loudly, and the loser is told to redo its change.</p>`,
+      checks: [{ t: 'owner signature verifies', s: 'ok' }, { t: 'owner_vk changed or key_epoch regressed', s: 'bad' }, { t: 'manifest revision must strictly increase to adopt', s: 'ok' }, { t: 'base_hash matches stored sha256', s: 'ok' }], where: 'vault.ts putManifest · sync.rs manifest reconcile' },
     { k: 'enroll', label: 'Enroll a device of its own', v: ['blocked', 'Needs the owner key'],
       body: `<p>Membership is the device registry inside the owner-signed manifest. The relay can add rows to its pending table all day, but a device only becomes trusted when a manifest carrying its public key is signed by the owner key, which rides inside the wrap slots and is only ever unwrapped on an unlocked device. Clients verify every foreign frame against <em>their</em> copy of the registry, not the relay's word.</p>`,
       checks: [{ t: 'device in owner-signed manifest', s: 'bad' }], where: 'vault.ts enrollFinish · core verify_foreign_from NotEnrolled' },
     { k: 'meta', label: 'Watch the traffic', v: ['leaks', 'Metadata, yes'],
       body: `<p>This is what the relay does learn. Which device ids exist, how many ops each has written, how large each frame is, and when syncs happen. From timing it can guess when you are at your laptop versus your phone. It can't tell what changed, which record, or even whether two ops touch the same record.</p><p>Tokens are stored hashed, so a database dump doesn't yield working credentials either.</p>`,
       checks: [{ t: 'device ids and per-device op counts', s: 'ok' }, { t: 'frame sizes and sync timing', s: 'ok' }, { t: 'record ids, op types, contents', s: 'bad' }], where: 'inherent to a relay' },
+    { k: 'poison', label: 'Slip garbage into a pulled page', v: ['blocked', 'Rejected at ingest'],
+      body: `<p>The nastiest move a hostile relay has: not forging ops — it can't — but answering a pull with corrupt bytes, knowing your client used to append them blind and only fail at the next unlock. Now every pulled frame is decoded, seq-checked and signature-verified against the local manifest <em>before</em> a byte is appended; the page is refused whole and the sync aborts. The local log stays exactly as verified.</p>`,
+      checks: [{ t: 'unknown/revoked device id: skipped', s: 'ok' }, { t: 'seq gap or bad signature in a page', s: 'bad' }], where: 'sync.rs verify_frames — sig-only check needs no DEK' },
+    { k: 'poisonlog', label: 'Corrupt a foreign log mid-file', v: ['limit', 'Quarantined, not fatal'],
+      body: `<p>A compromised <em>enrolled</em> device — or disk rot — can produce a frame that is validly signed but fails deeper verification (chain break, undecryptable body). The blunt answer would be to refuse the whole vault. Instead the log is quarantined from its first bad op: the verified prefix still merges, the warning names the device, and unlock keeps working — which matters, because the owner can only run <code>pair revoke</code> from a vault that opens.</p>`,
+      checks: [{ t: 'verified prefix merges', s: 'ok' }, { t: 'log quarantined at first bad op', s: 'ok' }, { t: 'unlock or revoke blocked', s: 'bad' }], where: 'vault.rs verify_foreign_prefix · main.rs unlock · daemon.rs refresh_foreign' },
     { k: 'withhold', label: 'Withhold new ops', v: ['limit', 'Delay is possible'],
       body: `<p>A relay can refuse to serve, or serve an old but valid head. That is a denial of service, and it is a fundamental limit of any single relay. What the design does is make it detectable: per-device heads are signed into snapshots, epochs are monotonic and pinned client-side, and gossip vectors between devices are on the M3 list so two devices that meet directly can tell that the relay is holding back.</p>`,
       checks: [{ t: 'prevented', s: 'bad' }, { t: 'detectable via epochs and device liveness', s: 'ok' }], where: 'DESIGN.md: rollback and starvation detection' },

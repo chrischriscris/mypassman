@@ -8,7 +8,10 @@ the identical API. Either may be replaced; the contract is this document.
 
 ## Framing
 
-- Base URL: anything (`https://sync.example.com`, `http://pi.local:8787`)
+- Base URL: `https://` for anything reachable over a network — bearer
+  tokens ride every request and must not travel cleartext. The CLI client
+  refuses `http://` unless the host is loopback or `MPM_SYNC_INSECURE=1`
+  is set (use that only on a LAN you control).
 - All vault routes: `/v/<vault_id>/<route>` — `vault_id` = 32 lowercase
   hex chars (16 bytes). Unknown shape → 404.
 - Auth: `Authorization: Bearer <token>` on every route except

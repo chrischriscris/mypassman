@@ -6,7 +6,7 @@ use mpm_core::item::{tag, Item, ItemKind};
 #[cfg(target_os = "macos")]
 use mpm_core::manifest::SLOT_BIOMETRIC;
 use mpm_core::manifest::{WrapSlot, SLOT_PASSWORD, SLOT_RECOVERY};
-use mpm_core::{gen, recovery, Manifest, Vault};
+use mpm_core::{gen, recovery, CoreError, Manifest, Vault, HASH_LEN};
 use mpm_crypto::kdf::{self, KdfParams};
 use mpm_crypto::keys::{DeviceKey, KeyBundle};
 #[cfg(target_os = "macos")]
@@ -453,7 +453,9 @@ fn unlock(dir: &Path, recovery_mode: bool) -> Result<Vault, String> {
                 eprintln!("warning: skipping slot with out-of-bounds KDF params");
                 continue;
             }
-            let kek = kdf::derive_kek(&secret, salt, params).map_err(|e| e.to_string())?;
+            let kek = zeroize::Zeroizing::new(
+                kdf::derive_kek(&secret, salt, params).map_err(|e| e.to_string())?,
+            );
             if let Ok(b) = KeyBundle::unwrap(
                 &kek,
                 &mpm_core::aad::wrap_slot(&manifest.vault_id, manifest.key_epoch, slot_type),
@@ -477,6 +479,7 @@ fn unlock(dir: &Path, recovery_mode: bool) -> Result<Vault, String> {
                 name: "recovery device".into(),
                 active: true,
                 enrolled_at: mpm_core::vault::now_hlc(),
+                revoked_seq: None,
                 extra: Vec::new(),
             });
             let owner_sk = bundle.owner_signing_key();
@@ -501,19 +504,6 @@ fn unlock(dir: &Path, recovery_mode: bool) -> Result<Vault, String> {
         if &dev_id == vault.device_id() {
             continue;
         }
-        // Revoked or never-registered devices: their logs must not wedge
-        // unlock — verify_foreign_log fails NotEnrolled on !active. Skip:
-        // revocation means the device's writes are no longer trusted.
-        match vault.manifest.device(&dev_id) {
-            Some(e) if e.active => {}
-            _ => {
-                eprintln!(
-                    "note: skipping log of revoked/unknown device {}",
-                    mpm_store::hex(&dev_id)
-                );
-                continue;
-            }
-        }
         let lr = mpm_store::read_ops(dir, &dev_id).map_err(|e| e.to_string())?;
         if lr.torn_tail {
             eprintln!(
@@ -521,10 +511,25 @@ fn unlock(dir: &Path, recovery_mode: bool) -> Result<Vault, String> {
                 mpm_store::hex(&dev_id)
             );
         }
-        let pts = vault
-            .verify_foreign_log(&dev_id, &lr.ops)
-            .map_err(|e| e.to_string())?;
-        vault.apply_foreign(pts);
+        // Quarantine, don't wedge: keep the verified prefix (for a revoked
+        // device, everything up to its revocation horizon) and warn on the
+        // rest. A compromised device pushing signed garbage must not block
+        // unlock — or the owner's ability to run `pair revoke`.
+        let r = vault.verify_foreign_prefix(&dev_id, &lr.ops, 1, [0u8; HASH_LEN]);
+        if let Some((seq, e)) = &r.failed_at {
+            let why: String = match e {
+                CoreError::NotEnrolled => "unknown or fully revoked device".into(),
+                CoreError::RevokedWrite(_) => "ops written after revocation horizon".into(),
+                _ => "verification failed — log may be tampered".into(),
+            };
+            eprintln!(
+                "warning: quarantined log of device {} at seq {} ({})",
+                mpm_store::hex(&dev_id),
+                seq,
+                why
+            );
+        }
+        vault.apply_foreign(r.pts);
     }
 
     check_checkpoint(&vault)?;
@@ -606,6 +611,7 @@ fn cmd_init(dir: &Path) -> Result<(), String> {
         name: "this device".into(),
         active: true,
         enrolled_at: mpm_core::vault::now_hlc(),
+        revoked_seq: None,
         extra: Vec::new(),
     });
 
@@ -1254,18 +1260,11 @@ fn cmd_history(dir: &Path, rec: bool, name: &str, json: bool) -> Result<(), Stri
     // our own log too — this device is in the manifest registry.
     let mut pts: Vec<mpm_core::OpPlaintext> = Vec::new();
     for dev in mpm_store::list_device_logs(dir).map_err(|e| e.to_string())? {
-        // same skip as unlock: revoked/unknown devices can't be verified
-        // (and shouldn't merge) — their logs must not break history
-        match vault.manifest.device(&dev) {
-            Some(e) if e.active => {}
-            _ => continue,
-        }
         let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
-        pts.extend(
-            vault
-                .verify_foreign_log(&dev, &lr.ops)
-                .map_err(|e| e.to_string())?,
-        );
+        // same quarantine semantics as unlock: keep the verified prefix
+        // (a revoked device contributes up to its horizon), skip the rest
+        let r = vault.verify_foreign_prefix(&dev, &lr.ops, 1, [0u8; HASH_LEN]);
+        pts.extend(r.pts);
     }
     // the merge's total order — the same key apply_pt compares on
     pts.sort_by_key(|p| (p.hlc, p.origin_device, p.origin_seq));

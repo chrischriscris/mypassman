@@ -42,6 +42,7 @@ const D_VK: u8 = 0x02;
 const D_NAME: u8 = 0x03;
 const D_STATUS: u8 = 0x04; // 1 active, 2 tombstoned
 const D_ENROLLED: u8 = 0x05;
+const D_REVOKED_SEQ: u8 = 0x06; // trust horizon: ops with seq <= this still merge
 
 const KDF_PACKED_LEN: usize = 44; // m|t|p|salt
 
@@ -61,6 +62,11 @@ pub struct DeviceEntry {
     pub name: String,
     pub active: bool,
     pub enrolled_at: u64,
+    /// Revocation horizon: ops with seq <= this were written while the
+    /// device was still trusted and keep merging after revocation; later
+    /// seqs are rejected. `None` on an inactive device means "revoked
+    /// before horizons existed" — nothing merges (strict).
+    pub revoked_seq: Option<u64>,
     pub extra: Vec<(u8, Vec<u8>)>,
 }
 
@@ -291,6 +297,9 @@ fn encode_device(d: &DeviceEntry) -> Vec<u8> {
     f.push((D_NAME, d.name.as_bytes().to_vec()));
     f.push((D_STATUS, vec![if d.active { 1 } else { 2 }]));
     f.push((D_ENROLLED, d.enrolled_at.to_le_bytes().to_vec()));
+    if let Some(rs) = d.revoked_seq {
+        f.push((D_REVOKED_SEQ, rs.to_le_bytes().to_vec()));
+    }
     f.extend(d.extra.iter().cloned());
     f.sort_by_key(|(t, _)| *t);
     let mut w = Writer::new();
@@ -308,6 +317,7 @@ fn parse_device(buf: &[u8]) -> Result<DeviceEntry> {
     let mut name = String::new();
     let mut active = true;
     let mut enrolled = 0u64;
+    let mut revoked_seq = None;
     let mut extra = Vec::new();
     while let Some((t, v)) = r.next_field()? {
         ord.check(t, &[])?;
@@ -323,6 +333,7 @@ fn parse_device(buf: &[u8]) -> Result<DeviceEntry> {
             D_NAME => name = String::from_utf8_lossy(v).into_owned(),
             D_STATUS => active = tlv::u8v(t, v)? == 1,
             D_ENROLLED => enrolled = tlv::u64v(t, v)?,
+            D_REVOKED_SEQ => revoked_seq = Some(tlv::u64v(t, v)?),
             _ => extra.push((t, v.to_vec())),
         }
     }
@@ -332,6 +343,7 @@ fn parse_device(buf: &[u8]) -> Result<DeviceEntry> {
         name,
         active,
         enrolled_at: enrolled,
+        revoked_seq,
         extra,
     })
 }

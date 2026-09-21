@@ -10,6 +10,18 @@ use crate::{DEVICE_ID_LEN, HASH_LEN, RECORD_ID_LEN};
 use mpm_crypto::keys::{DeviceKey, KeyBundle};
 use std::collections::BTreeMap;
 
+/// Outcome of a best-effort foreign-log verification (`verify_foreign_prefix`):
+/// the verified prefix plus the first failure, so callers can keep good ops
+/// and quarantine the rest instead of wedging on one bad frame.
+pub struct ForeignVerify {
+    /// Plaintexts verified in order, up to (not including) the first failure.
+    pub pts: Vec<OpPlaintext>,
+    /// `(seq, error)` of the first op that failed, if any.
+    pub failed_at: Option<(u64, CoreError)>,
+    /// `(seq, op hash)` at the end of the verified prefix.
+    pub tip: (u64, [u8; HASH_LEN]),
+}
+
 /// Index entry — everything a DEK-holder may see without opening k_rec.
 #[derive(Debug, Clone)]
 pub struct RecordSummary {
@@ -84,11 +96,16 @@ impl Vault {
         if op.seq != self.next_seq {
             return Err(CoreError::ChainBreak(op.seq));
         }
-        let vk = self
+        let entry = self
             .manifest
             .device(&self.device.id)
-            .ok_or(CoreError::NotEnrolled)?
-            .vk;
+            .ok_or(CoreError::NotEnrolled)?;
+        // A revoked device's own ops past its horizon are untrusted too —
+        // this blocks new writes on a revoked device outright.
+        if !entry.active && op.seq > entry.revoked_seq.unwrap_or(0) {
+            return Err(CoreError::RevokedWrite(op.seq));
+        }
+        let vk = entry.vk;
         let pt = op.open(
             &vk,
             &self.bundle.dek,
@@ -108,6 +125,9 @@ impl Vault {
 
     /// Replay a FOREIGN device log (sync path): verifies each op's signature
     /// against the registry and its internal chain. Returns ops for merge.
+    /// Strict: any failure errors the whole log. Callers that must stay
+    /// usable on corrupt/compromised foreign logs should use
+    /// `verify_foreign_prefix` and quarantine instead.
     pub fn verify_foreign_log(
         &self,
         device_id: &[u8; DEVICE_ID_LEN],
@@ -120,6 +140,7 @@ impl Vault {
     /// chained onto `prev_head` (the hash of the last op we already
     /// verified — zero hash for a fresh log). Lets a live daemon merge
     /// sync-pulled ops without re-verifying the whole log.
+    /// Strict: any failure errors the whole log.
     pub fn verify_foreign_from(
         &self,
         device_id: &[u8; DEVICE_ID_LEN],
@@ -127,34 +148,77 @@ impl Vault {
         first_seq: u64,
         prev_head: [u8; HASH_LEN],
     ) -> Result<Vec<OpPlaintext>> {
-        let entry = self
-            .manifest
-            .device(device_id)
-            .ok_or(CoreError::NotEnrolled)?;
-        if !entry.active {
-            return Err(CoreError::NotEnrolled); // revoked devices don't merge
+        let r = self.verify_foreign_prefix(device_id, ops, first_seq, prev_head);
+        match r.failed_at {
+            Some((_, e)) => Err(e),
+            None => Ok(r.pts),
         }
-        let mut head = prev_head;
+    }
+
+    /// Best-effort foreign verification: returns the verified prefix plus
+    /// the first failure (if any). Ops after a revoked device's
+    /// `revoked_seq` horizon surface as `RevokedWrite`. Callers keep the
+    /// prefix and quarantine the rest — a compromised device's validly
+    /// signed garbage must not wedge unlock or block revocation.
+    pub fn verify_foreign_prefix(
+        &self,
+        device_id: &[u8; DEVICE_ID_LEN],
+        ops: &[Op],
+        first_seq: u64,
+        prev_head: [u8; HASH_LEN],
+    ) -> ForeignVerify {
         let mut out = Vec::with_capacity(ops.len());
+        let mut tip = (first_seq.saturating_sub(1), prev_head);
+        let Some(entry) = self.manifest.device(device_id) else {
+            return ForeignVerify {
+                pts: out,
+                failed_at: Some((first_seq, CoreError::NotEnrolled)),
+                tip,
+            };
+        };
+        // Trust horizon: active devices are unbounded; revoked devices keep
+        // only ops they wrote while still trusted.
+        let horizon = if entry.active {
+            u64::MAX
+        } else {
+            entry.revoked_seq.unwrap_or(0)
+        };
+        let mut head = prev_head;
         for (i, op) in ops.iter().enumerate() {
-            if op.seq != first_seq + i as u64 {
-                return Err(CoreError::ChainBreak(op.seq));
+            let expected = first_seq + i as u64;
+            let mut fail = |e: CoreError| ForeignVerify {
+                pts: std::mem::take(&mut out),
+                failed_at: Some((op.seq, e)),
+                tip,
+            };
+            if op.seq != expected {
+                return fail(CoreError::ChainBreak(op.seq));
             }
-            let pt = op.open(
+            if op.seq > horizon {
+                return fail(CoreError::RevokedWrite(op.seq));
+            }
+            match op.open(
                 &entry.vk,
                 &self.bundle.dek,
                 &self.manifest.vault_id,
                 self.manifest.format_v,
                 self.manifest.key_epoch,
                 device_id,
-            )?;
-            if pt.prev_op_hash != head {
-                return Err(CoreError::ChainBreak(op.seq));
+            ) {
+                Ok(pt) if pt.prev_op_hash == head => {
+                    head = op.hash();
+                    tip = (op.seq, head);
+                    out.push(pt);
+                }
+                Ok(_) => return fail(CoreError::ChainBreak(op.seq)),
+                Err(e) => return fail(e),
             }
-            head = op.hash();
-            out.push(pt);
         }
-        Ok(out)
+        ForeignVerify {
+            pts: out,
+            failed_at: None,
+            tip,
+        }
     }
 
     /// Merge already-verified foreign ops into the index (max-HLC wins;

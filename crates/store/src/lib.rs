@@ -149,6 +149,29 @@ pub fn append_frames(dir: &Path, device_id: &[u8; 16], frames: &[u8]) -> Result<
     Ok(())
 }
 
+/// Truncate a log to `len` bytes — used to drop a torn tail before
+/// re-pulling. Only ever called under the sync lock, and only ever
+/// shrinks (the dropped bytes are by definition unverified).
+pub fn truncate_log(dir: &Path, device_id: &[u8; 16], len: u64) -> Result<()> {
+    let path = log_path(dir, device_id);
+    let f = private_files().write(true).open(&path)?;
+    if !f.metadata()?.is_file() {
+        return Err(StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "op log is not a regular file",
+        )));
+    }
+    if f.metadata()?.len() < len {
+        return Err(StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "truncate_log only shrinks",
+        )));
+    }
+    f.set_len(len)?;
+    f.sync_all()?;
+    Ok(())
+}
+
 /// Result of reading a device log: verified-prefix ops plus a flag for a
 /// torn tail (crash mid-append leaves a truncated final record — that is
 /// expected damage, distinct from mid-log corruption which stays fatal).
@@ -244,7 +267,7 @@ pub fn save_device_key(vault_id: &[u8; 16], key: &DeviceKey) -> Result<()> {
     private_dirs().create(&dir)?;
     set_private_dir(&dir)?;
     let path = device_key_path(vault_id)?;
-    let mut buf = Vec::with_capacity(48);
+    let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(48));
     buf.extend_from_slice(&key.id);
     buf.extend_from_slice(key.seed_bytes());
     // mode at creation: the seed must never exist at 0644, even briefly
@@ -257,10 +280,10 @@ pub fn save_device_key(vault_id: &[u8; 16], key: &DeviceKey) -> Result<()> {
 
 pub fn load_device_key(vault_id: &[u8; 16]) -> Result<DeviceKey> {
     let path = device_key_path(vault_id)?;
-    let buf = fs::read(&path).map_err(|e| match e.kind() {
+    let buf = zeroize::Zeroizing::new(fs::read(&path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => StoreError::NoDeviceKey,
         _ => StoreError::Io(e),
-    })?;
+    })?);
     if buf.len() != 48 {
         return Err(StoreError::NoDeviceKey);
     }
