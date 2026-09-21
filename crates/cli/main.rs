@@ -501,6 +501,19 @@ fn unlock(dir: &Path, recovery_mode: bool) -> Result<Vault, String> {
         if &dev_id == vault.device_id() {
             continue;
         }
+        // Revoked or never-registered devices: their logs must not wedge
+        // unlock — verify_foreign_log fails NotEnrolled on !active. Skip:
+        // revocation means the device's writes are no longer trusted.
+        match vault.manifest.device(&dev_id) {
+            Some(e) if e.active => {}
+            _ => {
+                eprintln!(
+                    "note: skipping log of revoked/unknown device {}",
+                    mpm_store::hex(&dev_id)
+                );
+                continue;
+            }
+        }
         let lr = mpm_store::read_ops(dir, &dev_id).map_err(|e| e.to_string())?;
         if lr.torn_tail {
             eprintln!(
@@ -1241,6 +1254,12 @@ fn cmd_history(dir: &Path, rec: bool, name: &str, json: bool) -> Result<(), Stri
     // our own log too — this device is in the manifest registry.
     let mut pts: Vec<mpm_core::OpPlaintext> = Vec::new();
     for dev in mpm_store::list_device_logs(dir).map_err(|e| e.to_string())? {
+        // same skip as unlock: revoked/unknown devices can't be verified
+        // (and shouldn't merge) — their logs must not break history
+        match vault.manifest.device(&dev) {
+            Some(e) if e.active => {}
+            _ => continue,
+        }
         let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
         pts.extend(
             vault

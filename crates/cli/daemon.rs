@@ -224,7 +224,9 @@ pub fn run(dir: &Path, rec: bool, idle_ttl: u64) -> Result<(), String> {
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_secs(sync_interval()));
             if let Err(e) = crate::sync::cmd_sync(&dir) {
-                if !e.contains("no sync config") {
+                // expected misses: unconfigured vault, or a manual sync
+                // already holding the sync lock — neither is a failure
+                if !e.contains("no sync config") && !e.contains("another sync") {
                     eprintln!("daemon: background sync: {e}");
                 }
             }
@@ -344,6 +346,12 @@ fn refresh_foreign(
     for dev in devs {
         if &dev == vault.device_id() {
             continue;
+        }
+        // revoked/unknown devices: verify_foreign_from fails NotEnrolled —
+        // skip the log rather than fail every request until restart
+        match vault.manifest.device(&dev) {
+            Some(e) if e.active => {}
+            _ => continue,
         }
         let (cnt, head) = foreign.get(&dev).copied().unwrap_or((0, [0u8; 32]));
         let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;

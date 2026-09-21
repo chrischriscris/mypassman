@@ -130,6 +130,25 @@ pub fn append_op(dir: &Path, device_id: &[u8; 16], op: &Op) -> Result<()> {
     Ok(())
 }
 
+/// Append already-encoded frames to a log — the sync path's variant of
+/// `append_op` (pulled frames arrive pre-encoded and are stored verbatim).
+/// Same rules: 0600, regular-file check on the open fd, fsync file + dir.
+pub fn append_frames(dir: &Path, device_id: &[u8; 16], frames: &[u8]) -> Result<()> {
+    let path = log_path(dir, device_id);
+    let mut f = private_files().create(true).append(true).open(&path)?;
+    if !f.metadata()?.is_file() {
+        return Err(StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "op log is not a regular file",
+        )));
+    }
+    set_private_file(&path)?;
+    f.write_all(frames)?;
+    f.sync_all()?;
+    fsync_dir(&dir.join(OPS_DIR))?;
+    Ok(())
+}
+
 /// Result of reading a device log: verified-prefix ops plus a flag for a
 /// torn tail (crash mid-append leaves a truncated final record — that is
 /// expected damage, distinct from mid-log corruption which stays fatal).

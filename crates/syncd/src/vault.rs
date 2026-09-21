@@ -147,7 +147,9 @@ impl VaultStore {
             return ve(403, "insufficient scope");
         }
         if let Some(req) = device {
-            if scope != Scope::Admin && dev.as_deref() != Some(req) {
+            // stored bindings are lowercase — normalize the request's id
+            // or `?device=ABCD…` would 403 a legitimately bound token
+            if scope != Scope::Admin && dev.as_deref() != Some(req.to_ascii_lowercase().as_str()) {
                 return ve(403, "token not bound to this device");
             }
         }
@@ -607,17 +609,38 @@ impl VaultStore {
                 params![now_s() - INVITE_TTL_S],
             )
             .map_err(|_| Ve(500, "db".into()))?;
+        // A pending row may be refreshed by a retry, but a DIFFERENT vk
+        // for the same device id means someone is squatting it — never
+        // let one invite overwrite another joiner's key under a name the
+        // owner might recognize.
+        let existing: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT vk FROM pending WHERE device = ?1",
+                params![dev],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|_| Ve(500, "db".into()))?;
+        if let Some(old) = &existing {
+            if *old != vk {
+                return ve(
+                    409,
+                    "device id already pending under a different key — decline it first",
+                );
+            }
+        }
         let count: i64 = self
             .conn
             .query_row("SELECT count(*) FROM pending", [], |r| r.get(0))
             .map_err(|_| Ve(500, "db".into()))?;
-        if count >= MAX_PENDING {
+        if count >= MAX_PENDING && existing.is_none() {
             return ve(429, "too many pending devices");
         }
         self.conn
             .execute(
                 "INSERT INTO pending (device, vk, name, created) VALUES (?1,?2,?3,?4)
-                 ON CONFLICT(device) DO UPDATE SET vk=excluded.vk, name=excluded.name, created=excluded.created",
+                 ON CONFLICT(device) DO UPDATE SET name=excluded.name, created=excluded.created",
                 params![dev, vk, name, now_s()],
             )
             .map_err(|_| Ve(500, "db".into()))?;
@@ -711,10 +734,12 @@ impl VaultStore {
             .map_err(|_| Ve(500, "db".into()))?;
         let read = Self::mint_token_on(&tx, Scope::Read, Some(&dev), None)?;
         let write = Self::mint_token_on(&tx, Scope::Write, Some(&dev), None)?;
+        // burns must commit with the mints — a failed invite delete that
+        // still committed tokens would leave the code replayable
         tx.execute("DELETE FROM invites WHERE hash = ?1", params![hash])
-            .ok();
+            .map_err(|_| Ve(500, "db".into()))?;
         tx.execute("DELETE FROM pending WHERE device = ?1", params![dev])
-            .ok();
+            .map_err(|_| Ve(500, "db".into()))?;
         tx.commit().map_err(|_| Ve(500, "db".into()))?;
         Ok((read, write, bytes, m.snapshot_epoch))
     }

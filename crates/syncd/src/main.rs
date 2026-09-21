@@ -44,7 +44,10 @@ fn sha256_raw(b: &[u8]) -> [u8; 32] {
 
 /// Constant-time equality for fixed-size digests — no early exit.
 fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 struct ApiErr(Ve);

@@ -112,12 +112,20 @@ fn save_cfg(vault_id: &[u8; 16], cfg: &SyncCfg) -> Result<(), String> {
     Ok(())
 }
 
+/// Max bytes any single response may occupy — 64 MiB. The wire protocol
+/// is small (pages of ≤256 frames, a ≤64KiB manifest); this only guards
+/// against a malicious/buggy server streaming garbage.
+const MAX_RESP_BYTES: u64 = 64 << 20;
+
 // ── http ────────────────────────────────────────────────────────────
 
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(std::time::Duration::from_secs(20)))
+        // a fixed API never legitimately redirects — refusing them also
+        // means a compromised server can't bounce tokens/frames sideways
+        .max_redirects(0)
         .build()
         .into()
 }
@@ -181,8 +189,13 @@ fn http(
             )
         })
         .collect();
-    let body = res
-        .into_body()
+    // A hostile or broken server must not be able to OOM us: bound the
+    // body. Ops pages are server-capped at 256 frames; a page is far
+    // under this — the cap exists for the pathological case only.
+    let mut body = res.into_body();
+    let body = body
+        .with_config()
+        .limit(MAX_RESP_BYTES)
         .read_to_vec()
         .map_err(|e| format!("{method} {url}: {e}"))?;
     Ok(Resp {
@@ -327,6 +340,12 @@ pub fn cmd_sync_init(dir: &Path, url: &str, setup_key: &str) -> Result<(), Strin
 /// manifest. No unlock: everything crossing the wire is ciphertext.
 pub fn cmd_sync(dir: &Path) -> Result<(), String> {
     let m = mpm_store::load_manifest(dir).map_err(|e| e.to_string())?;
+    // Serialize sync runs per vault (daemon's timer vs. a manual `sync`):
+    // without it two pull loops read the same "new" foreign frames and
+    // each appends them — a duplicated seq breaks the log's continuity.
+    // Deliberately NOT the vault .lock: that one must stay free of
+    // network I/O so the daemon can keep answering requests mid-sync.
+    let _sync_lock = sync_lock(&m.vault_id)?;
     let cfg = load_cfg(&m.vault_id)?.ok_or(
         "no sync config — `mypassman sync init <url>` on the first device, \
          `mypassman pair join <url> <code>` on a new one",
@@ -356,11 +375,23 @@ pub fn cmd_sync(dir: &Path) -> Result<(), String> {
         .filter_map(|h| Some((jstr(h, "device").ok()?, jnum(h, "head").ok()?)))
         .collect();
 
-    // ── pull foreign logs (raw frames → append verbatim) ──
+    // ── pull foreign logs (raw frames → verify → append verbatim) ──
     let mut pulled = 0u64;
     for (dev_hex, head) in &heads {
         let dev = unhex16(dev_hex)?;
         if dev == me {
+            continue;
+        }
+        // Verify against the LOCAL manifest registry: an unknown device
+        // (e.g. enrolled elsewhere, remote manifest not yet adopted) or a
+        // revoked one is skipped — its ops can never merge anyway. The
+        // manifest reconcile below catches us up for the next sync.
+        let Some(entry) = m.device(&dev) else {
+            eprintln!("note: skipping {dev_hex} — not in local device registry");
+            continue;
+        };
+        if !entry.active {
+            eprintln!("note: skipping {dev_hex} — device is revoked");
             continue;
         }
         let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
@@ -385,10 +416,12 @@ pub fn cmd_sync(dir: &Path) -> Result<(), String> {
             if r.body.is_empty() {
                 break;
             }
-            // server emits whole frames only; a partial tail means
-            // corruption — refuse rather than plant a torn log
-            let n = count_frames(&r.body)?;
-            append_frames(dir, &dev, &r.body)?;
+            // Server emits whole frames only; verify seq continuity and
+            // each device signature BEFORE the bytes touch the log — a
+            // hostile relay could otherwise poison it with data that only
+            // fails at unlock. Fail closed: a bad frame aborts the sync.
+            let n = verify_frames(&r.body, &dev, count + 1, &entry.vk)?;
+            mpm_store::append_frames(dir, &dev, &r.body).map_err(|e| e.to_string())?;
             pulled += n as u64;
             count += n as u64;
             let more = r
@@ -500,33 +533,55 @@ pub fn cmd_sync(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Count complete op frames; error on a partial tail — the server must
-/// only ever send whole frames.
-fn count_frames(buf: &[u8]) -> Result<usize, String> {
+/// Decode a page of pulled frames and check each against the manifest
+/// registry BEFORE it lands in the local log: whole frames only (a
+/// partial tail means corruption), strict seq continuity from
+/// `first_seq`, and a valid device signature (verifiable without the
+/// vault DEK — the sig covers seq·nonce·ct). Returns the frame count.
+fn verify_frames(
+    buf: &[u8],
+    device: &[u8; 16],
+    first_seq: u64,
+    device_vk: &[u8; 32],
+) -> Result<usize, String> {
     let (mut pos, mut n) = (0usize, 0usize);
     while pos < buf.len() {
-        let (_, end) = Op::decode(&buf[pos..]).map_err(|e| e.to_string())?;
+        let (op, end) = Op::decode(&buf[pos..]).map_err(|e| e.to_string())?;
+        let want = first_seq + n as u64;
+        if op.seq != want {
+            return Err(format!(
+                "pulled {} op seq {} — expected {want} (relay sent a gap/reorder)",
+                mpm_store::hex(device),
+                op.seq
+            ));
+        }
+        op.verify_sig(device_vk)
+            .map_err(|_| format!("bad signature on pulled op seq {}", op.seq))?;
         pos += end;
         n += 1;
     }
     Ok(n)
 }
 
-/// Append already-encoded frames to a foreign log (append_op() takes a
-/// decoded Op; pulled frames arrive pre-encoded).
-fn append_frames(dir: &Path, device: &[u8; 16], frames: &[u8]) -> Result<(), String> {
-    let path = mpm_store::log_path(dir, device);
-    let mut f = std::fs::OpenOptions::new()
+/// Serialize `sync` runs per vault: the daemon's background timer and a
+/// manual `mypassman sync` must not interleave their pull/append loops.
+/// Lives beside the .conf so it survives vault-dir moves/restores.
+fn sync_lock(vault_id: &[u8; 16]) -> Result<std::fs::File, String> {
+    use fs2::FileExt;
+    let path = cfg_path(vault_id)?.with_extension("synclock");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
         .create(true)
-        .append(true)
+        .truncate(false)
         .open(&path)
         .map_err(|e| e.to_string())?;
-    if !f.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err("op log is not a regular file".into());
-    }
-    f.write_all(frames).map_err(|e| e.to_string())?;
-    f.sync_all().map_err(|e| e.to_string())?;
-    Ok(())
+    f.try_lock_exclusive()
+        .map_err(|_| "another sync is already running for this vault".to_string())?;
+    Ok(f)
 }
 
 // ── pairing ─────────────────────────────────────────────────────────
@@ -609,15 +664,23 @@ pub fn cmd_pair_pending(dir: &Path) -> Result<(), String> {
         println!("no pending devices");
         return Ok(());
     }
-    println!("{:<34} {:<24} CREATED", "DEVICE", "NAME");
+    println!(
+        "{:<34} {:<24} {:<14} CREATED",
+        "DEVICE", "NAME", "VK-FINGERPRINT"
+    );
     for p in &rows {
         println!(
-            "{:<34} {:<24} {}",
+            "{:<34} {:<24} {:<14} {}",
             jstr(p, "device")?,
             jstr(p, "name")?,
+            jstr(p, "vk")?
+                .get(..12)
+                .map(str::to_string)
+                .unwrap_or_else(|| "?".into()),
             jnum(p, "created")?
         );
     }
+    eprintln!("compare VK-FINGERPRINT with what the joining device printed before approving");
     Ok(())
 }
 
@@ -836,6 +899,10 @@ pub fn cmd_pair_join(dir: &Path, url: &str, invite: &str, name: &str) -> Result<
 
     eprintln!("requested as '{name}' ({})", mpm_store::hex(&dev.id));
     eprintln!(
+        "my vk fingerprint: {}",
+        &mpm_store::hex(&dev.verifying_key())[..12]
+    );
+    eprintln!(
         "waiting for the owner: `mypassman pair pending` / `pair approve {}`",
         &mpm_store::hex(&dev.id)[..8]
     );
@@ -877,6 +944,20 @@ pub fn cmd_pair_finish(dir: &Path) -> Result<(), String> {
     let rm = Manifest::from_file(&manifest_bytes).map_err(|e| e.to_string())?;
     if rm.vault_id != m.vault_id {
         return Err("server returned a manifest for a different vault".into());
+    }
+    // The server pinned owner_vk, but check anyway: a wrong-owner or
+    // missing-device manifest would leave us holding useless tokens.
+    if rm.owner_vk != m.owner_vk {
+        return Err("server returned a manifest under a different owner key".into());
+    }
+    match rm.device(&me) {
+        Some(d) if d.active => {}
+        _ => {
+            return Err(
+                "approved manifest doesn't list this device as active — re-check on the owner side"
+                    .into(),
+            )
+        }
     }
     mpm_store::write_manifest(dir, &manifest_bytes).map_err(|e| e.to_string())?;
     save_cfg(&m.vault_id, &cfg)?;

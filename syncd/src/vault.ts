@@ -130,7 +130,9 @@ export class VaultSync extends DurableObject<Env> {
       row.scope === need ||
       (need === "read" && row.scope === "write"); // a write token can read sync state
     if (!ok) throw http(403, `token lacks ${need} scope`);
-    if (device !== undefined && row.scope !== "admin" && row.device !== device) {
+    // stored bindings are lowercase — normalize the request's device id
+    // or ?device=ABCD… would 403 a legitimately bound token
+    if (device !== undefined && row.scope !== "admin" && row.device !== device.toLowerCase()) {
       throw http(403, "token not bound to this device");
     }
     return row;
@@ -420,8 +422,18 @@ export class VaultSync extends DurableObject<Env> {
     if (!name || name.length > 64) throw http(400, "bad device name");
     const dev = deviceId.toLowerCase();
     this.sql.exec(`DELETE FROM pending WHERE created < ?`, nowS() - INVITE_TTL_S);
-    const count = this.sql.exec(`SELECT count(*) AS n FROM pending`).one().n as number;
-    if (count >= MAX_PENDING) throw http(429, "too many pending devices");
+    // A retry may refresh the row, but a DIFFERENT vk for the same device
+    // id means squatting — an invite must never overwrite another joiner's
+    // key under a name the owner might recognize.
+    const existing = this.sql
+      .exec<{ vk: ArrayBuffer }>(`SELECT vk FROM pending WHERE device = ?`, dev)
+      .one();
+    if (existing && hex(VaultSync.bytes(existing.vk)) !== vk.toLowerCase())
+      throw http(409, "device id already pending under a different key — decline it first");
+    if (!existing) {
+      const count = this.sql.exec(`SELECT count(*) AS n FROM pending`).one().n as number;
+      if (count >= MAX_PENDING) throw http(429, "too many pending devices");
+    }
     this.sql.exec(
       `INSERT OR REPLACE INTO pending (device, vk, name, created) VALUES (?,?,?,?)`,
       dev,

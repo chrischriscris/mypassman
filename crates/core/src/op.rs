@@ -272,6 +272,20 @@ impl Op {
         *blake3::hash(&self.encode()).as_bytes()
     }
 
+    /// Verify only the device signature — no DEK needed. The sync path
+    /// uses this to check pulled frames before they touch the local log
+    /// (a hostile relay could otherwise poison logs with bytes that only
+    /// fail at unlock).
+    pub fn verify_sig(&self, device_vk: &[u8; 32]) -> Result<()> {
+        let sig = Signature::from_bytes(&self.sig);
+        mpm_crypto::keys::verify(
+            device_vk,
+            &aad::op_sig_preimage(self.seq, &self.nonce, &self.ct),
+            &sig,
+        )
+        .map_err(|_| CoreError::BadOpSig(self.seq))
+    }
+
     /// Verify device signature then open the outer layer.
     pub fn open(
         &self,
@@ -282,13 +296,7 @@ impl Op {
         key_epoch: u32,
         device_id: &[u8; DEVICE_ID_LEN],
     ) -> Result<OpPlaintext> {
-        let sig = Signature::from_bytes(&self.sig);
-        mpm_crypto::keys::verify(
-            device_vk,
-            &aad::op_sig_preimage(self.seq, &self.nonce, &self.ct),
-            &sig,
-        )
-        .map_err(|_| CoreError::BadOpSig(self.seq))?;
+        self.verify_sig(device_vk)?;
         let k_ops = subkey::derive_subkey(dek, subkey::CTX_OPS);
         let pt = aead::open(
             &k_ops,
