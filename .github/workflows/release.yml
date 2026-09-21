@@ -23,18 +23,18 @@ jobs:
             universal: true
             art: universal-apple-darwin
           # linux syncd for self-hosting
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             bin: mpm-syncd
             art: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
             bin: mpm-syncd
             cross: true
             art: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.universal && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
@@ -66,17 +66,17 @@ jobs:
           tar -C dist -czf dist/${{ matrix.bin }}-${{ github.ref_name }}-${{ matrix.art }}.tar.gz ${{ matrix.bin }}
           shasum -a 256 dist/*.tar.gz >> dist/SHA256SUMS
           rm dist/${{ matrix.bin }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: bins-${{ matrix.bin }}-${{ matrix.art }}
           path: dist/
 
   publish:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
           pattern: bins-*
           merge-multiple: true
