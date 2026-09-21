@@ -34,6 +34,8 @@ pub enum CoreError {
     RevokedWrite(u64),
     #[error("vault keys rotated to epoch {0} — this unlock is stale; re-unlock")]
     KeysRotated(u32),
+    #[error("snapshot rejected: {0}")]
+    BadSnapshot(&'static str),
     #[error("export passphrase wrong or blob tampered")]
     BadExportPassphrase,
     #[error("corrupt: {0}")]

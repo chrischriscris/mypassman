@@ -195,11 +195,21 @@ pub fn run(dir: &Path, rec: bool, idle_ttl: u64) -> Result<(), String> {
     for dev in mpm_store::list_device_logs(dir).map_err(|e| e.to_string())? {
         let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
         if let Some(tip) = lr.ops.last() {
-            foreign.insert(dev, (lr.ops.len() as u64, tip.hash()));
+            foreign.insert(dev, (tip.seq, tip.hash()));
         }
     }
     let mut vault = unlock(dir, rec)?;
     foreign.remove(vault.device_id()); // own log is tracked by `known`, not `foreign`
+                                       // a log fully covered by the adopted snapshot has no on-disk tip —
+                                       // its verified position is the anchor, else the daemon would re-verify
+                                       // the dropped prefix on every refresh
+    for (dev, tip) in foreign.iter_mut() {
+        if tip.0 == 0 {
+            if let Some(a) = vault.anchor(dev) {
+                *tip = a;
+            }
+        }
+    }
     let listener =
         UnixListener::bind(&path).map_err(|e| format!("bind {}: {e}", path.display()))?;
     #[cfg(unix)]
@@ -215,7 +225,7 @@ pub fn run(dir: &Path, rec: bool, idle_ttl: u64) -> Result<(), String> {
     // ops applied at startup — derive from the vault's own replay head,
     // not a fresh read (an op appended between unlock and a re-read would
     // be counted-but-never-applied → our next append forks the chain)
-    let mut known = vault.head().0 as usize;
+    let mut known = vault.head().0;
     // background sync: opportunistic ciphertext exchange — never needs the
     // unlocked vault (sync transports ciphertext only), so it runs while we
     // serve. Pulled foreign ops land on disk and merge into the index on
@@ -309,26 +319,56 @@ pub fn run(dir: &Path, rec: bool, idle_ttl: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// Refresh in-memory state from our own op log if another process appended
-/// while we slept. CALLER HOLDS THE VAULT LOCK. Fork/divergence → honest
-/// error (client falls back).
+/// Sentinel: on-disk state changed shape under the daemon (compaction,
+/// restore, log rewrite) — rebuild the index from scratch rather than
+/// erroring the request.
 #[cfg(unix)]
-fn refresh(vault: &mut Vault, dir: &Path, known: &mut usize) -> Result<bool, String> {
+const REBUILD: &str = "rebuild";
+
+/// Refresh in-memory state from our own op log if another process appended
+/// while we slept. CALLER HOLDS THE VAULT LOCK. `known` is the last applied
+/// SEQ (not a count — compaction drops prefixes). Shrink/divergence/gaps
+/// that only a snapshot anchor can bridge → REBUILD.
+#[cfg(unix)]
+fn refresh(vault: &mut Vault, dir: &Path, known: &mut u64) -> Result<bool, String> {
     let lr = mpm_store::read_ops(dir, vault.device_id()).map_err(|e| e.to_string())?;
     let torn = lr.torn_tail;
-    if lr.ops.len() < *known {
-        return Err("op log shrank under the daemon — restart it".into());
+    let own = *vault.device_id();
+    let disk_tip = lr
+        .ops
+        .last()
+        .map(|o| o.seq)
+        .or_else(|| vault.anchor(&own).map(|a| a.0))
+        .unwrap_or(0);
+    if disk_tip < *known {
+        return Err(REBUILD.into()); // shrank — compaction or worse
     }
-    // same length ≠ same log: a same-length prefix rewrite is silent
-    // without comparing the applied tip
-    if *known > 0 && lr.ops[*known - 1].hash() != vault.head().1 {
-        return Err("op log diverged under the daemon — restart it".into());
+    // same length ≠ same log: an op at our tip seq must hash to our head
+    match lr.ops.iter().find(|o| o.seq == *known) {
+        Some(o) if o.hash() != vault.head().1 => return Err(REBUILD.into()),
+        None if *known > 0 => {
+            // tip op itself was covered+dropped — anchor must match
+            match vault.anchor(&own) {
+                Some((s, h)) if s == *known && h == vault.head().1 => {}
+                _ => return Err(REBUILD.into()),
+            }
+        }
+        _ => {}
     }
-    for op in &lr.ops[*known..] {
-        vault.apply_own_op(op).map_err(|e| e.to_string())?;
-        // advance per-op: a bad tail op must not force replay of the
-        // valid prefix it follows
-        *known += 1;
+    let Some(i) = lr.ops.iter().position(|o| o.seq > *known) else {
+        return Ok(torn); // nothing new
+    };
+    let first_new = lr.ops[i].seq;
+    if first_new > *known + 1 {
+        // covered gap — only the adopted anchor can bridge it
+        match vault.anchor(&own) {
+            Some((s, _)) if s + 1 == first_new && s >= *known => vault.apply_own_anchor(),
+            _ => return Err(REBUILD.into()),
+        }
+    }
+    for op in &lr.ops[i..] {
+        vault.apply_own_op(op).map_err(|_| REBUILD.to_string())?;
+        *known = op.seq;
     }
     Ok(torn)
 }
@@ -359,21 +399,38 @@ fn refresh_foreign(
         }
         let (cnt, head) = foreign.get(&dev).copied().unwrap_or((0, [0u8; 32]));
         let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
-        let n = lr.ops.len() as u64;
-        if n < cnt {
-            return Err(format!(
-                "foreign op log {} shrank under the daemon — restart it",
-                mpm_store::hex(&dev)
-            ));
+        // disk tip by SEQ — post-compaction logs start mid-chain
+        let disk_tip = lr
+            .ops
+            .last()
+            .map(|o| o.seq)
+            .or_else(|| vault.anchor(&dev).map(|a| a.0))
+            .unwrap_or(0);
+        if disk_tip < cnt {
+            return Err(REBUILD.into()); // shrank — compaction or tamper
         }
-        if n == cnt {
+        if disk_tip == cnt {
             continue;
         }
+        let Some(i) = lr.ops.iter().position(|o| o.seq > cnt) else {
+            continue;
+        };
+        let first_new = lr.ops[i].seq;
+        // continuity: contiguous → chain from our stored tip; a covered
+        // gap → the adopted snapshot anchor bridges it
+        let (start, prev) = if first_new == cnt + 1 {
+            (cnt + 1, head)
+        } else {
+            match vault.anchor(&dev) {
+                Some((s, h)) if s + 1 == first_new && s >= cnt => (first_new, h),
+                _ => return Err(REBUILD.into()),
+            }
+        };
         // prefix verify: a revoked device still contributes ops up to its
         // revocation horizon; a failure quarantines the log (warn once)
         // rather than erroring every request until restart
-        let r = vault.verify_foreign_prefix(&dev, &lr.ops[cnt as usize..], cnt + 1, head);
-        vault.apply_foreign(r.pts);
+        let r = vault.verify_foreign_prefix(&dev, &lr.ops[i..], start, prev);
+        vault.apply_foreign(&r.pts);
         foreign.insert(dev, r.tip);
         if let Some((seq, e)) = r.failed_at {
             // warn once — a quarantined log keeps tripping the same frame
@@ -386,6 +443,32 @@ fn refresh_foreign(
             }
         }
     }
+    Ok(())
+}
+
+/// Rebuild the daemon's whole view: reload the manifest (still
+/// epoch-pinned), reset the vault, replay from snapshot base + log
+/// suffixes. Handles compaction, restores, and log rewrites uniformly.
+#[cfg(unix)]
+fn rebuild(
+    vault: &mut Vault,
+    dir: &Path,
+    known: &mut u64,
+    foreign: &mut HashMap<[u8; 16], (u64, [u8; 32])>,
+    quarantined: &mut std::collections::HashSet<[u8; 16]>,
+) -> Result<(), String> {
+    reload_manifest(vault, dir)?;
+    vault.reset();
+    let rep = crate::replay_state(vault, dir)?;
+    *known = vault.head().0;
+    foreign.clear();
+    quarantined.clear();
+    for (dev, tip) in rep.tips {
+        if dev != *vault.device_id() {
+            foreign.insert(dev, tip);
+        }
+    }
+    eprintln!("daemon: rebuilt vault state after on-disk change");
     Ok(())
 }
 
@@ -412,11 +495,22 @@ fn handle(
     payload: &[u8],
     vault: &mut Vault,
     dir: &Path,
-    known: &mut usize,
+    known: &mut u64,
     foreign: &mut HashMap<[u8; 16], (u64, [u8; 32])>,
     quarantined: &mut std::collections::HashSet<[u8; 16]>,
 ) -> (u8, Vec<u8>) {
-    match serve(op, payload, vault, dir, known, foreign, quarantined) {
+    let r = serve(op, payload, vault, dir, known, foreign, quarantined);
+    let r = match r {
+        Err(e) if e == REBUILD => {
+            if let Err(re) = rebuild(vault, dir, known, foreign, quarantined) {
+                Err(format!("rebuild: {re}"))
+            } else {
+                serve(op, payload, vault, dir, known, foreign, quarantined)
+            }
+        }
+        r => r,
+    };
+    match r {
         Ok(p) => (0, p),
         Err(e) => {
             let (status, msg) = if let Some(m) = e.strip_prefix("MISSING:") {
@@ -437,14 +531,26 @@ fn serve(
     payload: &[u8],
     vault: &mut Vault,
     dir: &Path,
-    known: &mut usize,
+    known: &mut u64,
     foreign: &mut HashMap<[u8; 16], (u64, [u8; 32])>,
     quarantined: &mut std::collections::HashSet<[u8; 16]>,
 ) -> Result<Vec<u8>, String> {
     // catch up with any out-of-band appends before answering (the caller
     // holds the vault lock across the whole request)
-    let torn = refresh(vault, dir, known).map_err(|e| format!("refresh: {e}"))?;
-    refresh_foreign(vault, dir, foreign, quarantined).map_err(|e| format!("refresh: {e}"))?;
+    let torn = refresh(vault, dir, known).map_err(|e| {
+        if e == REBUILD {
+            e
+        } else {
+            format!("refresh: {e}")
+        }
+    })?;
+    refresh_foreign(vault, dir, foreign, quarantined).map_err(|e| {
+        if e == REBUILD {
+            e
+        } else {
+            format!("refresh: {e}")
+        }
+    })?;
     if torn && matches!(op, OP_PUT | OP_DEL) {
         // appending past the tear would orphan the new op at next unlock
         return Err(

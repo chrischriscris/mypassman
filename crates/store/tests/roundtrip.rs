@@ -368,7 +368,7 @@ fn recovery_enrolls_device_when_key_absent() {
     // old device's log is foreign to the fresh device — verify + merge
     let old_log = mpm_store::read_ops(&dir, &_device.id).unwrap().ops;
     let pts = v2.verify_foreign_log(&_device.id, &old_log).unwrap();
-    v2.apply_foreign(pts);
+    v2.apply_foreign(&pts);
     assert_eq!(v2.records().count(), 1);
     let rid = v2.records().next().unwrap().record_id;
     assert_eq!(
@@ -534,6 +534,7 @@ fn merge_is_order_independent_on_equal_hlc() {
             name: b"shared".to_vec(),
             fields_ct,
             gossip: Vec::new(),
+            snapshot: None,
             origin_device: dev.id,
             origin_seq: 1,
             key_epoch: 1,
@@ -559,12 +560,12 @@ fn merge_is_order_independent_on_equal_hlc() {
     let pts = va
         .verify_foreign_log(&dev2_id, std::slice::from_ref(&op_b))
         .unwrap();
-    va.apply_foreign(pts);
+    va.apply_foreign(&pts);
 
     // order 2: foreign first (fresh vault, own log replayed second)
     let mut vb = reopen(&dir, pw, &seed, dev_id);
     let pts = vb.verify_foreign_log(&dev2_id, &[op_b]).unwrap();
-    vb.apply_foreign(pts);
+    vb.apply_foreign(&pts);
     vb.apply_own_op(&op_a).unwrap();
 
     let get_pw = |v: &Vault| {
@@ -657,6 +658,7 @@ fn revoked_device_horizon() {
             name: name.as_bytes().to_vec(),
             fields_ct,
             gossip: Vec::new(),
+            snapshot: None,
             origin_device: dev2.id,
             origin_seq: seq,
             key_epoch: 1,
@@ -699,7 +701,7 @@ fn revoked_device_horizon() {
         r.failed_at,
         Some((2, mpm_core::CoreError::RevokedWrite(2)))
     ));
-    v.apply_foreign(r.pts);
+    v.apply_foreign(&r.pts);
     assert!(matches!(v.find("one"), mpm_core::FindResult::One(_)));
     assert!(matches!(v.find("two"), mpm_core::FindResult::None));
 
@@ -758,6 +760,7 @@ fn revoked_device_no_horizon() {
         name: b"sneak".to_vec(),
         fields_ct,
         gossip: Vec::new(),
+        snapshot: None,
         origin_device: dev2.id,
         origin_seq: 1,
         key_epoch: 1,
@@ -899,4 +902,335 @@ fn legacy_bundle_v1_unwrap() {
     assert_eq!(b.current_epoch(), 5);
     assert_eq!(b.dek_at(5).unwrap(), &raw[..32]);
     assert_eq!(b.dek_at(1), None);
+}
+
+/// Compaction: a signed checkpoint covers all device tips; covered log
+/// prefixes drop; replay anchored at the checkpoint reproduces identical
+/// state; post-compaction writes chain on the anchor; a forged checkpoint
+/// is rejected by the winner-set check.
+#[test]
+fn checkpoint_compact_roundtrip() {
+    use mpm_core::op::Gossip;
+    use std::collections::BTreeMap;
+
+    let dir = tmpdir();
+    let pw = b"pw";
+    let (device, seed, _c) = init(&dir, pw);
+    let dev_id = device.id;
+    let mut v = reopen(&dir, pw, &seed, dev_id);
+
+    // own log: upsert + update (v1 becomes a droppable loser) + upsert + tombstone
+    let (op, rid) = v
+        .make_upsert(ItemKind::Login, login("a", "u", "p1"))
+        .unwrap();
+    mpm_store::append_op(&dir, &dev_id, &op).unwrap();
+    v.commit(&op).unwrap();
+    let op = v
+        .make_update(&rid, ItemKind::Login, login("a", "u", "p2"))
+        .unwrap();
+    mpm_store::append_op(&dir, &dev_id, &op).unwrap();
+    v.commit(&op).unwrap();
+    let (op, rid2) = v
+        .make_upsert(ItemKind::Login, login("b", "u", "p"))
+        .unwrap();
+    mpm_store::append_op(&dir, &dev_id, &op).unwrap();
+    v.commit(&op).unwrap();
+    let op = v.make_tombstone(&rid2).unwrap();
+    mpm_store::append_op(&dir, &dev_id, &op).unwrap();
+    v.commit(&op).unwrap();
+
+    // enroll dev2 (owner-signed) and have it write one foreign op
+    let dev2 = DeviceKey::generate();
+    let dev2_id = dev2.id;
+    {
+        let mut m = v.manifest.clone();
+        m.devices.push(mpm_core::DeviceEntry {
+            id: dev2.id,
+            vk: dev2.verifying_key(),
+            name: "d2".into(),
+            active: true,
+            enrolled_at: 0,
+            revoked_seq: None,
+            extra: Vec::new(),
+        });
+        let sk = v.bundle().owner_signing_key();
+        let bytes = m.to_file(&sk);
+        mpm_store::write_manifest(&dir, &bytes).unwrap();
+        v.manifest = mpm_core::Manifest::from_file(&bytes).unwrap();
+    }
+    let mut frid = [0u8; 16];
+    frid[0] = 0xcc;
+    let mut fit = Item::default();
+    fit.set(tag::NAME, b"c".to_vec());
+    let fct = mpm_core::OpPlaintext::seal_fields(
+        v.dek(),
+        &v.manifest.vault_id,
+        v.manifest.key_epoch,
+        &frid,
+        &fit,
+    )
+    .unwrap();
+    let fpt = mpm_core::OpPlaintext {
+        prev_op_hash: [0u8; 32],
+        hlc: 500,
+        op_type: mpm_core::OpType::Upsert,
+        record_id: frid,
+        kind: Some(ItemKind::Login),
+        schema_v: 1,
+        created: 500,
+        name: b"c".to_vec(),
+        fields_ct: fct,
+        gossip: Vec::new(),
+        snapshot: None,
+        origin_device: dev2_id,
+        origin_seq: 1,
+        key_epoch: 1,
+    };
+    let fop = mpm_core::Op::seal(
+        &fpt,
+        1,
+        v.dek(),
+        &v.manifest.vault_id,
+        v.manifest.format_v,
+        v.manifest.key_epoch,
+        &dev2,
+    )
+    .unwrap();
+    mpm_store::append_op(&dir, &dev2_id, &fop).unwrap();
+    let r = v.verify_foreign_prefix(&dev2_id, std::slice::from_ref(&fop), 1, [0u8; 32]);
+    assert!(r.failed_at.is_none());
+    v.apply_foreign(&r.pts);
+    assert_eq!(v.records().count(), 2); // a + c
+
+    // covered vector = verified tips; winners = every record's winning frame
+    let own_tip = v.head();
+    let covered = vec![
+        Gossip {
+            device_id: dev_id,
+            seq: own_tip.0,
+            head: own_tip.1,
+        },
+        Gossip {
+            device_id: dev2_id,
+            seq: 1,
+            head: fop.hash(),
+        },
+    ];
+    let own_log = mpm_store::read_ops(&dir, &dev_id).unwrap().ops;
+    let own_map: BTreeMap<u64, _> = own_log.iter().map(|o| (o.seq, o.clone())).collect();
+    let winners: Vec<([u8; 16], mpm_core::Op)> = v
+        .winner_origins()
+        .iter()
+        .map(|(d, s)| {
+            let op = if *d == dev_id {
+                own_map[s].clone()
+            } else {
+                fop.clone()
+            };
+            (*d, op)
+        })
+        .collect();
+    assert_eq!(winners.len(), 3); // a (v2), b (tombstone), c
+
+    // ── replica-side claim check BEFORE any drop: must verify ──
+    let mut tips: BTreeMap<[u8; 16], (u64, [u8; 32])> = BTreeMap::new();
+    tips.insert(dev_id, own_tip);
+    tips.insert(dev2_id, (1, fop.hash()));
+    // pts like replay_state collects: every verified op plaintext
+    let mut pts: Vec<mpm_core::OpPlaintext> = Vec::new();
+    {
+        let mut vc = {
+            let m = mpm_store::load_manifest(&dir).unwrap();
+            let slot = m
+                .wrap_slots
+                .iter()
+                .find(|s| s.slot_type == SLOT_PASSWORD)
+                .unwrap();
+            let (params, salt) = slot.kdf.unwrap();
+            let kek = kdf::derive_kek(pw, &salt, &params).unwrap();
+            let bundle = KeyBundle::unwrap(
+                &kek,
+                &mpm_core::aad::wrap_slot(&m.vault_id, m.key_epoch, SLOT_PASSWORD),
+                &slot.blob,
+                m.key_epoch,
+            )
+            .unwrap();
+            Vault::new(m, bundle, DeviceKey::from_bytes(&seed, dev_id)).unwrap()
+        };
+        for op in &own_log {
+            pts.push(vc.apply_own_op(op).unwrap());
+        }
+        let rr = vc.verify_foreign_prefix(&dev2_id, std::slice::from_ref(&fop), 1, [0u8; 32]);
+        pts.extend(rr.pts);
+    }
+
+    let ckpt = v.make_checkpoint(covered.clone(), winners).unwrap();
+    let snap = v.open_snapshot_op(&ckpt, &dev_id).unwrap();
+    v.check_snapshot_claim(&snap, &tips, &pts)
+        .expect("fresh checkpoint must verify against the covered replay");
+
+    // a forged checkpoint (winner swapped for the losing v1 op) must fail
+    let mut forged = snap.clone();
+    forged.winners.iter_mut().for_each(|(d, o)| {
+        if *d == dev_id && o.seq == 2 {
+            *o = own_map[&1].clone(); // claim the LOSER op as winner
+        }
+    });
+    assert!(v.check_snapshot_claim(&forged, &tips, &pts).is_err());
+
+    // ── author side: append the checkpoint, drop covered prefixes ──
+    mpm_store::append_op(&dir, &dev_id, &ckpt).unwrap();
+    v.commit(&ckpt).unwrap();
+    mpm_store::save_snapshot(&dir, &dev_id, &ckpt.encode()).unwrap();
+    for g in &covered {
+        mpm_store::drop_covered_prefix(&dir, &g.device_id, g.seq).unwrap();
+    }
+    mpm_store::save_base_vector(&dir, &covered).unwrap();
+
+    // own log now holds ONLY the checkpoint; dev2's is fully dropped
+    let own_lr = mpm_store::read_ops(&dir, &dev_id).unwrap();
+    assert_eq!(own_lr.ops.len(), 1);
+    assert_eq!(own_lr.ops[0].seq, ckpt.seq);
+    assert!(mpm_store::read_ops(&dir, &dev2_id).unwrap().ops.is_empty());
+    assert_eq!(mpm_store::load_base_vector(&dir).unwrap().len(), 2);
+
+    // ── anchored replay reproduces identical state (what replay_state does) ──
+    let mut v2 = {
+        let m = mpm_store::load_manifest(&dir).unwrap();
+        let slot = m
+            .wrap_slots
+            .iter()
+            .find(|s| s.slot_type == SLOT_PASSWORD)
+            .unwrap();
+        let (params, salt) = slot.kdf.unwrap();
+        let kek = kdf::derive_kek(pw, &salt, &params).unwrap();
+        let bundle = KeyBundle::unwrap(
+            &kek,
+            &mpm_core::aad::wrap_slot(&m.vault_id, m.key_epoch, SLOT_PASSWORD),
+            &slot.blob,
+            m.key_epoch,
+        )
+        .unwrap();
+        Vault::new(m, bundle, DeviceKey::from_bytes(&seed, dev_id)).unwrap()
+    };
+    let snaps = mpm_store::load_snapshots(&dir).unwrap();
+    assert_eq!(snaps.len(), 1);
+    let (author, frame) = &snaps[0];
+    let snap2 = v2.open_snapshot_op(frame, author).unwrap();
+    v2.adopt_snapshot(&snap2).unwrap();
+    let (aseq, _) = v2.anchor(&dev_id).expect("own anchor");
+    let lr2 = mpm_store::read_ops(&dir, &dev_id).unwrap();
+    assert_eq!(lr2.ops[0].seq, aseq + 1);
+    v2.apply_own_anchor();
+    for op in &lr2.ops {
+        v2.apply_own_op(op).unwrap();
+    }
+    // dev2's suffix is empty; verify still anchors cleanly
+    let (fs, prev) = v2.anchor(&dev2_id).map(|(s, h)| (s + 1, h)).unwrap();
+    let r2 = v2.verify_foreign_prefix(&dev2_id, &[], fs, prev);
+    assert!(r2.failed_at.is_none());
+    v2.apply_foreign(&r2.pts);
+
+    assert_eq!(v2.records().count(), 2);
+    let it = v2.item(&rid).unwrap();
+    assert_eq!(it.get(tag::PASSWORD).unwrap(), b"p2"); // winner kept, not loser
+    assert!(v2.item(&rid2).is_err()); // tombstone kept: stays deleted
+    assert!(matches!(v2.find("c"), mpm_core::FindResult::One(_)));
+
+    // checkpoint op itself is merge-inert (never creates a record)
+    assert_eq!(v2.records().count(), 2);
+
+    // post-compaction write chains from the anchor — and re-replays clean
+    let (op, _rid3) = v2
+        .make_upsert(ItemKind::Login, login("d", "u", "p"))
+        .unwrap();
+    mpm_store::append_op(&dir, &dev_id, &op).unwrap();
+    v2.commit(&op).unwrap();
+    let mut v3 = {
+        let m = mpm_store::load_manifest(&dir).unwrap();
+        let slot = m
+            .wrap_slots
+            .iter()
+            .find(|s| s.slot_type == SLOT_PASSWORD)
+            .unwrap();
+        let (params, salt) = slot.kdf.unwrap();
+        let kek = kdf::derive_kek(pw, &salt, &params).unwrap();
+        let bundle = KeyBundle::unwrap(
+            &kek,
+            &mpm_core::aad::wrap_slot(&m.vault_id, m.key_epoch, SLOT_PASSWORD),
+            &slot.blob,
+            m.key_epoch,
+        )
+        .unwrap();
+        Vault::new(m, bundle, DeviceKey::from_bytes(&seed, dev_id)).unwrap()
+    };
+    let snap3 = v3
+        .open_snapshot_op(&mpm_store::load_snapshots(&dir).unwrap()[0].1, &dev_id)
+        .unwrap();
+    v3.adopt_snapshot(&snap3).unwrap();
+    v3.apply_own_anchor();
+    for op in &mpm_store::read_ops(&dir, &dev_id).unwrap().ops {
+        v3.apply_own_op(op).unwrap();
+    }
+    assert_eq!(v3.records().count(), 3); // a, c, d — d chained past the ckpt
+}
+
+/// A checkpoint op type from a NEWER client must not wedge older replay:
+/// unknown op types decode, chain-verify, and are ignored by merge.
+#[test]
+fn unknown_op_type_is_forward_compatible() {
+    let dir = tmpdir();
+    let pw = b"pw";
+    let (device, seed, _c) = init(&dir, pw);
+    let dev_id = device.id;
+    let mut v = reopen(&dir, pw, &seed, dev_id);
+
+    let (op, _rid) = v
+        .make_upsert(ItemKind::Login, login("a", "u", "p"))
+        .unwrap();
+    mpm_store::append_op(&dir, &dev_id, &op).unwrap();
+    v.commit(&op).unwrap();
+
+    // hand-craft an op with an unrecognized type byte (9) — chains fine
+    let mut rid2 = [0u8; 16];
+    rid2[0] = 9;
+    let pt = mpm_core::OpPlaintext {
+        prev_op_hash: v.head().1,
+        hlc: v.next_hlc(),
+        op_type: mpm_core::OpType::Unknown(9),
+        record_id: rid2,
+        kind: None,
+        schema_v: 1,
+        created: 0,
+        name: Vec::new(),
+        fields_ct: Vec::new(),
+        gossip: Vec::new(),
+        snapshot: None,
+        origin_device: dev_id,
+        origin_seq: 2,
+        key_epoch: 1,
+    };
+    let weird = mpm_core::Op::seal(
+        &pt,
+        2,
+        v.dek(),
+        &v.manifest.vault_id,
+        v.manifest.format_v,
+        v.manifest.key_epoch,
+        &device,
+    )
+    .unwrap();
+    mpm_store::append_op(&dir, &dev_id, &weird).unwrap();
+    v.apply_own_op(&weird).unwrap(); // decodes, chains, no merge effect
+    assert_eq!(v.records().count(), 1);
+
+    let (op, _rid) = v
+        .make_upsert(ItemKind::Login, login("b", "u", "p"))
+        .unwrap();
+    mpm_store::append_op(&dir, &dev_id, &op).unwrap();
+    v.commit(&op).unwrap();
+    assert_eq!(v.records().count(), 2);
+
+    let v2 = reopen(&dir, pw, &seed, dev_id);
+    assert_eq!(v2.records().count(), 2); // replay across the unknown op
 }

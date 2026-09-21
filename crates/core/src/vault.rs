@@ -5,7 +5,7 @@
 use crate::error::{CoreError, Result};
 use crate::item::{tag, Item, ItemKind};
 use crate::manifest::Manifest;
-use crate::op::{Gossip, Op, OpPlaintext, OpType};
+use crate::op::{Gossip, Op, OpPlaintext, OpType, Snapshot};
 use crate::{DEVICE_ID_LEN, HASH_LEN, RECORD_ID_LEN};
 use mpm_crypto::keys::{DeviceKey, KeyBundle};
 use std::collections::BTreeMap;
@@ -47,6 +47,13 @@ pub struct Vault {
     head: [u8; HASH_LEN],
     max_hlc: u64,
     records: BTreeMap<[u8; RECORD_ID_LEN], RecordSummary>,
+    /// Adopted snapshot's covered vector: (device → seq, head hash). Chain
+    /// anchors for logs whose covered prefixes were dropped — replay and
+    /// sync verify suffixes against these instead of genesis.
+    anchors: BTreeMap<[u8; DEVICE_ID_LEN], (u64, [u8; HASH_LEN])>,
+    /// The snapshot currently adopted as replay base — its winner frames
+    /// are where covered ops' bytes live after the logs were compacted.
+    adopted: Option<Snapshot>,
 }
 
 /// Wall-clock millis — metadata only (e.g. `enrolled_at`). Op ordering
@@ -82,7 +89,216 @@ impl Vault {
             head: [0u8; HASH_LEN],
             max_hlc: 0,
             records: BTreeMap::new(),
+            anchors: BTreeMap::new(),
+            adopted: None,
         })
+    }
+
+    /// Chain anchor for a device log under the adopted snapshot — replay
+    /// of a compacted log starts at `covered+1` with `prev = covered head`.
+    /// None when no snapshot covers the device (verify from genesis).
+    pub fn anchor(&self, dev: &[u8; DEVICE_ID_LEN]) -> Option<(u64, [u8; HASH_LEN])> {
+        self.anchors.get(dev).copied()
+    }
+
+    /// Clear all replayed state — records, chain position, snapshot anchors.
+    /// Used by the daemon to rebuild after an on-disk change (compaction,
+    /// restore) without re-running key derivation.
+    pub fn reset(&mut self) {
+        self.next_seq = 1;
+        self.head = [0u8; HASH_LEN];
+        self.max_hlc = 0;
+        self.records.clear();
+        self.anchors.clear();
+        self.adopted = None;
+    }
+
+    /// The snapshot this vault's index is currently seeded from, if any.
+    pub fn adopted_snapshot(&self) -> Option<&Snapshot> {
+        self.adopted.as_ref()
+    }
+
+    /// Whether any device's log has a compacted (dropped) prefix — i.e.
+    /// replay is anchored mid-chain rather than at genesis.
+    pub fn has_compacted(&self) -> bool {
+        !self.anchors.is_empty()
+    }
+
+    /// Verify + decode a checkpoint op frame pulled from a snapshot file or
+    /// observed mid-replay: device signature, author enrolled and within
+    /// its trust horizon, outer AEAD. Returns the snapshot payload.
+    pub fn open_snapshot_op(&self, op: &Op, author: &[u8; DEVICE_ID_LEN]) -> Result<Snapshot> {
+        let entry = self.manifest.device(author).ok_or(CoreError::NotEnrolled)?;
+        let horizon = if entry.active {
+            u64::MAX
+        } else {
+            entry.revoked_seq.unwrap_or(0)
+        };
+        if op.seq > horizon {
+            return Err(CoreError::RevokedWrite(op.seq));
+        }
+        let pt = self.open_op_hinted(op, &entry.vk, author, self.manifest.key_epoch)?;
+        if pt.op_type != OpType::Checkpoint {
+            return Err(CoreError::BadSnapshot("op is not a checkpoint"));
+        }
+        pt.snapshot
+            .ok_or(CoreError::BadSnapshot("empty checkpoint"))
+    }
+
+    /// Adopt a verified snapshot as the replay base: seed the index from
+    /// its winner frames and record the covered vector as chain anchors.
+    /// Returns the winner plaintexts (they're covered ops — callers feeding
+    /// `check_snapshot_claim` need them in the pts set).
+    /// Own-chain position is NOT seeded here — `apply_own_anchor` after
+    /// confirming the on-disk log actually starts past the anchor.
+    pub fn adopt_snapshot(&mut self, snap: &Snapshot) -> Result<Vec<OpPlaintext>> {
+        for g in &snap.covered {
+            self.anchors.insert(g.device_id, (g.seq, g.head));
+        }
+        self.adopted = Some(snap.clone());
+        let mut pts = Vec::with_capacity(snap.winners.len());
+        for (dev, op) in &snap.winners {
+            let vk = self.manifest.device(dev).ok_or(CoreError::NotEnrolled)?.vk;
+            let pt = self.open_op_hinted(op, &vk, dev, self.manifest.key_epoch)?;
+            self.apply_pt(pt.clone());
+            pts.push(pt);
+        }
+        Ok(pts)
+    }
+
+    /// Continue our own chain from the adopted anchor — call only when the
+    /// on-disk log's first op is `anchor_seq + 1` (i.e. the covered prefix
+    /// was physically dropped). If the log still starts at genesis, replay
+    /// it whole instead.
+    pub fn apply_own_anchor(&mut self) {
+        if let Some(&(seq, head)) = self.anchors.get(&self.device.id) {
+            self.next_seq = seq + 1;
+            self.head = head;
+        }
+    }
+
+    /// Check a candidate checkpoint against locally replayed state.
+    /// `tips`: per-device verified (seq, head). `pts`: every verified op
+    /// plaintext this replay produced (snapshot winners included if a prior
+    /// snapshot seeded us — they replay as ordinary ops).
+    ///
+    /// Adoption is verify-or-nothing: every covered device must be at-or-
+    /// past its claimed head with a provable hash link, and the claimed
+    /// winner set must equal the winners we compute over the covered ops.
+    /// Anything less and the checkpoint is ignored — compaction is only
+    /// ever a cache, never an authority.
+    pub fn check_snapshot_claim(
+        &self,
+        snap: &Snapshot,
+        tips: &BTreeMap<[u8; DEVICE_ID_LEN], (u64, [u8; HASH_LEN])>,
+        pts: &[OpPlaintext],
+    ) -> Result<()> {
+        // hash at covered seq: tip hash when covered == tip, else the
+        // prev_op_hash of the op at covered+1 (chain link), else an
+        // already-adopted anchor (deeper coverage is pre-verified).
+        let hash_at = |dev: &[u8; DEVICE_ID_LEN], seq: u64| -> Option<[u8; HASH_LEN]> {
+            if let Some(&(tseq, thead)) = tips.get(dev) {
+                if tseq == seq {
+                    return Some(thead);
+                }
+                if tseq > seq {
+                    return pts
+                        .iter()
+                        .find(|p| p.origin_device == *dev && p.origin_seq == seq + 1)
+                        .map(|p| p.prev_op_hash);
+                }
+            }
+            self.anchors
+                .get(dev)
+                .and_then(|&(aseq, ahead)| (aseq == seq).then_some(ahead))
+        };
+        for g in &snap.covered {
+            match hash_at(&g.device_id, g.seq) {
+                Some(h) if h == g.head => {}
+                _ => return Err(CoreError::BadSnapshot("covered head unverified")),
+            }
+        }
+        // Claimed winners must be covered, authentic, and exactly the set
+        // we'd compute by replaying the covered ops ourselves.
+        let mut claimed: BTreeMap<[u8; RECORD_ID_LEN], ([u8; DEVICE_ID_LEN], u64)> =
+            BTreeMap::new();
+        let covered_of = |dev: &[u8; DEVICE_ID_LEN]| -> u64 {
+            snap.covered
+                .iter()
+                .find(|g| g.device_id == *dev)
+                .map(|g| g.seq)
+                .unwrap_or(0)
+        };
+        for (dev, op) in &snap.winners {
+            if op.seq > covered_of(dev) {
+                return Err(CoreError::BadSnapshot("winner beyond covered seq"));
+            }
+            let vk = self.manifest.device(dev).ok_or(CoreError::NotEnrolled)?.vk;
+            let pt = self.open_op_hinted(op, &vk, dev, self.manifest.key_epoch)?;
+            claimed.insert(pt.record_id, (*dev, op.seq));
+        }
+        let mut computed: BTreeMap<[u8; RECORD_ID_LEN], (u64, [u8; DEVICE_ID_LEN], u64)> =
+            BTreeMap::new();
+        for p in pts {
+            if p.origin_seq > covered_of(&p.origin_device) {
+                continue; // post-horizon op — not part of this cut
+            }
+            if !matches!(p.op_type, OpType::Upsert | OpType::Tombstone) {
+                continue;
+            }
+            let e = computed
+                .entry(p.record_id)
+                .or_insert((p.hlc, p.origin_device, p.origin_seq));
+            if (p.hlc, p.origin_device, p.origin_seq) >= *e {
+                *e = (p.hlc, p.origin_device, p.origin_seq);
+            }
+        }
+        for (rid, (dev, seq)) in &claimed {
+            match computed.get(rid) {
+                Some(&(_, d, s)) if d == *dev && s == *seq => {}
+                _ => return Err(CoreError::BadSnapshot("winner set mismatch")),
+            }
+        }
+        if computed.len() != claimed.len() {
+            return Err(CoreError::BadSnapshot("winner set mismatch"));
+        }
+        Ok(())
+    }
+
+    /// Seal + sign a checkpoint op covering `covered` device heads with
+    /// `winners` as the materialized state. The op sits in our own log at
+    /// the next seq — vector entries must be strictly below it for us.
+    pub fn make_checkpoint(
+        &mut self,
+        covered: Vec<Gossip>,
+        winners: Vec<([u8; DEVICE_ID_LEN], Op)>,
+    ) -> Result<Op> {
+        let epoch = self.write_epoch()?;
+        let pt = OpPlaintext {
+            prev_op_hash: self.head,
+            hlc: self.next_hlc(),
+            op_type: OpType::Checkpoint,
+            record_id: [0u8; RECORD_ID_LEN],
+            kind: None,
+            schema_v: 1,
+            created: 0,
+            name: Vec::new(),
+            fields_ct: Vec::new(),
+            gossip: self.gossip(),
+            snapshot: Some(Snapshot { covered, winners }),
+            origin_device: self.device.id,
+            origin_seq: self.next_seq,
+            key_epoch: epoch,
+        };
+        Op::seal(
+            &pt,
+            self.next_seq,
+            self.bundle.dek(),
+            &self.manifest.vault_id,
+            self.manifest.format_v,
+            epoch,
+            &self.device,
+        )
     }
 
     /// Monotone timestamp: wall clock, but never below max observed + 1.
@@ -93,8 +309,10 @@ impl Vault {
     }
 
     /// Verify + apply one stored op from this device's log. Enforces seq
-    /// order, chain linkage, signature, and AEAD integrity.
-    pub fn apply_own_op(&mut self, op: &Op) -> Result<()> {
+    /// order, chain linkage, signature, and AEAD integrity. Returns the
+    /// verified plaintext (callers that replay collect it for snapshot
+    /// adoption checks).
+    pub fn apply_own_op(&mut self, op: &Op) -> Result<OpPlaintext> {
         if op.seq != self.next_seq {
             return Err(CoreError::ChainBreak(op.seq));
         }
@@ -114,8 +332,8 @@ impl Vault {
         }
         self.head = op.hash();
         self.next_seq += 1;
-        self.apply_pt(pt);
-        Ok(())
+        self.apply_pt(pt.clone());
+        Ok(pt)
     }
 
     /// Epoch new ops must be sealed under. If the manifest moved past the
@@ -268,14 +486,25 @@ impl Vault {
 
     /// Merge already-verified foreign ops into the index (max-HLC wins;
     /// preserved-loser conflict versions land with sync UI at M3).
-    pub fn apply_foreign(&mut self, pts: Vec<OpPlaintext>) {
+    pub fn apply_foreign(&mut self, pts: &[OpPlaintext]) {
         for pt in pts {
-            self.apply_pt(pt);
+            self.apply_pt(pt.clone());
         }
+    }
+
+    /// Winner (device, seq) of every tracked record, tombstones included —
+    /// what a checkpoint must carry so covered ops can be dropped.
+    pub fn winner_origins(&self) -> Vec<([u8; DEVICE_ID_LEN], u64)> {
+        self.records.values().map(|r| r.origin).collect()
     }
 
     fn apply_pt(&mut self, pt: OpPlaintext) {
         self.max_hlc = self.max_hlc.max(pt.hlc);
+        // Only record ops touch the index — checkpoints/meta/unknown ops
+        // still advance the HLC clock and chain, nothing else.
+        if !matches!(pt.op_type, OpType::Upsert | OpType::Tombstone) {
+            return;
+        }
         let e = self
             .records
             .entry(pt.record_id)
@@ -309,7 +538,7 @@ impl Vault {
                     e.fields_ct.clear();
                     e.origin = (pt.origin_device, pt.origin_seq);
                 }
-                OpType::Meta => {}
+                _ => {}
             }
         }
     }
@@ -380,6 +609,7 @@ impl Vault {
             name,
             fields_ct,
             gossip: self.gossip(),
+            snapshot: None,
             origin_device: self.device.id,
             origin_seq: self.next_seq,
             key_epoch: epoch,
@@ -409,6 +639,7 @@ impl Vault {
             name: Vec::new(),
             fields_ct: Vec::new(),
             gossip: self.gossip(),
+            snapshot: None,
             origin_device: self.device.id,
             origin_seq: self.next_seq,
             key_epoch: epoch,
@@ -427,7 +658,7 @@ impl Vault {
     /// Commit a freshly-made op to the in-memory index (call after store
     /// durably writes it).
     pub fn commit(&mut self, op: &Op) -> Result<()> {
-        self.apply_own_op(op)
+        self.apply_own_op(op).map(|_| ())
     }
 
     /// Open a record's secret fields — decrypt-on-demand boundary.
@@ -447,6 +678,7 @@ impl Vault {
             name: rec.name.as_bytes().to_vec(),
             fields_ct: rec.fields_ct.clone(),
             gossip: Vec::new(),
+            snapshot: None,
             origin_device: [0u8; 16],
             origin_seq: 0,
             key_epoch: rec.key_epoch,

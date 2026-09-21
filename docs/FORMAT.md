@@ -10,7 +10,9 @@ little-endian. `||` = concatenation. Code: `crates/core` (format),
 <vault>/
   MANIFEST                 owner_sig(64) || manifest TLV body
   ops/<device_id_hex>.log  append-only op frames, one log per device
-  snapshots/               compacted state (post-compaction; may be empty)
+  snapshots/               adopted compaction state (post-compaction; may be empty)
+    <author_device>.snap   raw checkpoint op frame (sealed + signed like any op)
+    base.vec               adopted covered vector: (device_id, seq, head) triples
 ```
 
 Outside the vault dir, per device (platform local data dir,
@@ -102,20 +104,75 @@ OpPlaintext TLV (`ct` decrypts to):
 |---|---|
 | 0x01 | prev_op_hash (32) — hash chain within this device's log |
 | 0x02 | hlc (u64) |
-| 0x03 | type (u8): 1=Upsert, 2=Tombstone, 3=Meta |
+| 0x03 | type (u8): 1=Upsert, 2=Tombstone, 3=Meta, 4=Checkpoint |
 | 0x04 | record_id (16) |
 | 0x05 | kind |
 | 0x06 | schema_v |
 | 0x07 | created (u64) |
-| 0x08 | fields_ct — nonce(24)‖XChaCha20-Poly1305(k_rec, fields TLV); empty for tombstone/meta |
+| 0x08 | fields_ct — nonce(24)‖XChaCha20-Poly1305(k_rec, fields TLV); empty for tombstone/meta/checkpoint |
 | 0x09 | gossip — vector of observed foreign heads |
 | 0x0A | name — display name (UTF-8). Inside the DEK-encrypted op plaintext but
 outside the k_rec field seal — index-visible to vault members without
 opening per-record secrets |
+| 0x0B | snapshot — nested TLV (below); present only on type=4 |
+
+Unknown type bytes (>4) MUST decode as an opaque `Unknown(u8)`: they
+chain-verify (signature + prev_op_hash still checked), carry no merge
+effect, and never wedge older readers. New op kinds can therefore ship
+without breaking deployed clients.
+
+Snapshot TLV (0x0B):
+
+| tag | field | value |
+|---|---|---|
+| 0x01 | covered | repeated gossip triples: device_id(16) ‖ seq(8) ‖ head_hash(32) — one per device log this checkpoint claims to cover, ≤4096 entries |
+| 0x02 | winner | repeated (device_id(16) ‖ raw op frame) — the verbatim winning frame for every record, tombstones included, ≤200k entries |
 
 Merge semantics: deterministic order `(hlc, device_id, seq)`; per-record
 last-writer-wins; tombstone suppresses earlier upserts. All devices
 converge to identical state for identical op sets — order-independent.
+Checkpoint ops are merge-inert (no record effect).
+
+## Compaction
+
+A checkpoint op asserts: "at covered vector V = {(dev, seq, head)}, the
+merge of all covered ops yields exactly this winner set." It is authored
+by any device that has fully replayed V, sealed and signed like any op,
+and travels through the normal sync path (the relay needs no compaction
+awareness — it retains full logs regardless).
+
+Adoption is **verify-or-nothing** — a replica never trusts a checkpoint
+on signature alone:
+
+1. Every covered `(dev, seq, head)` must be a head the replica has itself
+   verified: its replayed tip, the prev_op_hash of a verified op at
+   `seq+1`, or an anchor from a previously adopted checkpoint.
+2. Every claimed winner frame must be authentic (device signature +
+   DEK open), and `winner.seq <= covered[dev]`.
+3. The claimed winner set must equal the winner set the replica computes
+   from its own replay of the covered ops.
+
+Only then: the snapshot frame is persisted to `snapshots/`, the covered
+vector becomes each log's new hash-chain **anchor**, and covered log
+prefixes are dropped (frames with `seq > covered` kept; tmp-write +
+rename + dir fsync). `base.vec` records the adopted vector — advisory
+only; it carries ids/seqs/hashes, no secrets, and cannot forge ops.
+
+Post-compaction verification anchors at the covered head instead of the
+zero hash: a log starting at `seq = covered+1` verifies iff its first
+op's `prev_op_hash` equals the covered head. A log still holding its
+genesis prefix simply replays from genesis — anchors seed state, replay
+is idempotent.
+
+The own-device anchor is applied only when the local log's first frame
+is exactly `covered+1` — a crash between adoption and prefix-drop leaves
+a full log that still verifies from genesis, never a corrupt state.
+
+Sync cursors are logical `seq` numbers, never log lengths: a fully
+covered (empty) local log still pulls from `base.vec`'s covered seq and
+pushes `seq > remote_head` frames only. Checkpoint frames themselves
+replicate like any op and are dropped once a deeper checkpoint covers
+them.
 
 ## Head checkpoint
 
@@ -133,6 +190,10 @@ checkpointed prefix is rejected as rollback/divergence.
   enforced by server CAS too).
 - Op can't be forged or transplanted (device sig binds seq+nonce+ct;
   replay = identical bytes = idempotent).
-- Log can't be silently truncated (per-device checkpoint + hash chain).
+- Log can't be silently truncated (per-device checkpoint + hash chain;
+  post-compaction, the chain anchors at the adopted covered head).
+- A checkpoint can't be forged: adoption requires the claimed covered
+  heads AND winner set to match the replica's own verified replay —
+  verify-or-nothing, never signature-only trust.
 - A revoked device can't push (server checks registry) nor be
   re-enrolled by anyone but the owner (signature required).

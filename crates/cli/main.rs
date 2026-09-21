@@ -87,6 +87,13 @@ enum Cmd {
     },
     /// Show enrolled devices
     Devices,
+    /// Compact local op logs: append a signed checkpoint op covering every
+    /// device's verified tip, then drop covered op prefixes. Replicas
+    /// adopt the checkpoint only after independently re-deriving the same
+    /// winner set — verify-or-nothing. Record history before the covered
+    /// horizon is gone from LOCAL logs afterward (the relay still holds
+    /// it; `history` shows what's here).
+    Compact,
     /// Change the master password — re-wraps the vault keys under a new
     /// password-derived KEK. The DEK itself does not rotate (that happens
     /// on `pair revoke`); copies of this manifest already exfiltrated stay
@@ -391,11 +398,16 @@ fn read_line(prompt: &str) -> String {
     s.trim().to_string()
 }
 
+fn unlock(dir: &Path, recovery_mode: bool) -> Result<Vault, String> {
+    unlock_full(dir, recovery_mode).map(|(v, _)| v)
+}
+
 /// Open vault: manifest → password (or recovery code) → slot → replay logs
 /// → checkpoint check. A `--recovery` unlock on a machine with no device key
 /// (disaster restore) enrolls a fresh device signed by the owner key —
 /// that's the point of the recovery kit surviving device loss.
-fn unlock(dir: &Path, recovery_mode: bool) -> Result<Vault, String> {
+/// Returns the replay outcome too — `history` and `compact` need it.
+pub(crate) fn unlock_full(dir: &Path, recovery_mode: bool) -> Result<(Vault, Replay), String> {
     let mut manifest = mpm_store::load_manifest(dir).map_err(|e| e.to_string())?;
     manifest
         .kdf
@@ -507,16 +519,83 @@ fn unlock(dir: &Path, recovery_mode: bool) -> Result<Vault, String> {
     };
 
     let mut vault = Vault::new(manifest, bundle, device).map_err(|e| e.to_string())?;
+    let rep = replay_state(&mut vault, dir)?;
+    check_checkpoint(&vault)?;
+    Ok((vault, rep))
+}
 
-    let lr = mpm_store::read_ops(dir, vault.device_id()).map_err(|e| e.to_string())?;
+/// What a full replay learned: per-device verified tips (needed by sync
+/// cursors and daemon refresh) and every verified op plaintext — the raw
+/// material for checkpoint adoption checks and `history`.
+pub(crate) struct Replay {
+    pub tips: std::collections::BTreeMap<[u8; 16], (u64, [u8; HASH_LEN])>,
+    pub pts: Vec<mpm_core::op::OpPlaintext>,
+}
+
+/// Replay all local state into `vault`: adopt the best stored snapshot as
+/// replay base (its winner frames seed the index; its covered vector is the
+/// new chain anchor per log), then replay each log's surviving suffix.
+/// Checkpoint ops seen mid-replay are adopted only after their claimed
+/// winners verify against our own replay — verify-or-nothing — and
+/// adopting is what physically drops covered log prefixes.
+pub(crate) fn replay_state(vault: &mut Vault, dir: &Path) -> Result<Replay, String> {
+    // ── snapshot base: best stored checkpoint that still opens ──
+    let mut base: Option<mpm_core::op::Snapshot> = None;
+    let mut base_score = 0u64;
+    for (author, frame) in mpm_store::load_snapshots(dir).map_err(|e| e.to_string())? {
+        match vault.open_snapshot_op(&frame, &author) {
+            Ok(snap) => {
+                let score: u64 = snap.covered.iter().map(|g| g.seq).sum();
+                if score > base_score {
+                    base_score = score;
+                    base = Some(snap);
+                } else {
+                    let _ = mpm_store::remove_snapshot(dir, &author); // dominated
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: discarding unreadable snapshot from {} ({e})",
+                    mpm_store::hex(&author)
+                );
+                let _ = mpm_store::remove_snapshot(dir, &author);
+            }
+        }
+    }
+    let mut all_pts: Vec<mpm_core::op::OpPlaintext> = Vec::new();
+    if let Some(snap) = &base {
+        let seed_pts = vault.adopt_snapshot(snap).map_err(|e| e.to_string())?;
+        all_pts.extend(seed_pts);
+    }
+
+    let mut tips: std::collections::BTreeMap<[u8; 16], (u64, [u8; HASH_LEN])> =
+        std::collections::BTreeMap::new();
+    let mut candidates: Vec<([u8; 16], mpm_core::op::Op)> = Vec::new();
+
+    // ── own log (anchored iff its on-disk prefix was actually dropped) ──
+    let own = *vault.device_id();
+    let lr = mpm_store::read_ops(dir, &own).map_err(|e| e.to_string())?;
+    if let Some((aseq, _)) = vault.anchor(&own) {
+        let starts_past = lr.ops.first().map(|o| o.seq == aseq + 1).unwrap_or(true);
+        if starts_past {
+            vault.apply_own_anchor();
+        }
+    }
     for op in &lr.ops {
-        vault.apply_own_op(op).map_err(|e| e.to_string())?;
+        let pt = vault.apply_own_op(op).map_err(|e| e.to_string())?;
+        if pt.snapshot.is_some() {
+            candidates.push((own, op.clone()));
+        }
+        all_pts.push(pt);
     }
     if lr.torn_tail {
         eprintln!("warning: discarded torn tail of your op log (interrupted write)");
     }
+    tips.insert(own, vault.head());
+
+    // ── foreign logs: quarantine on failure, never wedge ──
     for dev_id in mpm_store::list_device_logs(dir).map_err(|e| e.to_string())? {
-        if &dev_id == vault.device_id() {
+        if dev_id == own {
             continue;
         }
         let lr = mpm_store::read_ops(dir, &dev_id).map_err(|e| e.to_string())?;
@@ -526,11 +605,11 @@ fn unlock(dir: &Path, recovery_mode: bool) -> Result<Vault, String> {
                 mpm_store::hex(&dev_id)
             );
         }
-        // Quarantine, don't wedge: keep the verified prefix (for a revoked
-        // device, everything up to its revocation horizon) and warn on the
-        // rest. A compromised device pushing signed garbage must not block
-        // unlock — or the owner's ability to run `pair revoke`.
-        let r = vault.verify_foreign_prefix(&dev_id, &lr.ops, 1, [0u8; HASH_LEN]);
+        let (first_seq, prev) = match vault.anchor(&dev_id) {
+            Some((s, h)) if lr.ops.first().map(|o| o.seq == s + 1).unwrap_or(true) => (s + 1, h),
+            _ => (1, [0u8; HASH_LEN]),
+        };
+        let r = vault.verify_foreign_prefix(&dev_id, &lr.ops, first_seq, prev);
         if let Some((seq, e)) = &r.failed_at {
             let why: String = match e {
                 CoreError::NotEnrolled => "unknown or fully revoked device".into(),
@@ -544,11 +623,48 @@ fn unlock(dir: &Path, recovery_mode: bool) -> Result<Vault, String> {
                 why
             );
         }
-        vault.apply_foreign(r.pts);
+        for (op, pt) in lr.ops.iter().zip(r.pts.iter()) {
+            if pt.snapshot.is_some() {
+                candidates.push((dev_id, op.clone()));
+            }
+        }
+        tips.insert(dev_id, r.tip);
+        vault.apply_foreign(&r.pts);
+        all_pts.extend(r.pts);
     }
 
-    check_checkpoint(&vault)?;
-    Ok(vault)
+    // ── adoption pass: deepest verifiable checkpoint wins ──
+    candidates.sort_by_key(|(_, op)| std::cmp::Reverse(op.seq));
+    for (author, frame) in candidates {
+        let Ok(snap) = vault.open_snapshot_op(&frame, &author) else {
+            continue;
+        };
+        if vault.check_snapshot_claim(&snap, &tips, &all_pts).is_err() {
+            continue; // not covered/verified — stays a plain op in the log
+        }
+        if let Err(e) = mpm_store::save_snapshot(dir, &author, &frame.encode()) {
+            eprintln!("warning: snapshot save failed: {e}");
+            break;
+        }
+        if let Err(e) = vault.adopt_snapshot(&snap).map(|_| ()) {
+            eprintln!("warning: snapshot adopt failed: {e}");
+            break;
+        }
+        // Physical drop under the vault lock; contended → next unlock drops.
+        if let Ok(_lock) = mpm_store::lock_vault(dir) {
+            let mut freed = 0usize;
+            for g in &snap.covered {
+                freed += mpm_store::drop_covered_prefix(dir, &g.device_id, g.seq).unwrap_or(0);
+            }
+            let _ = mpm_store::save_base_vector(dir, &snap.covered);
+            if freed > 0 {
+                eprintln!("compacted: dropped {freed} covered op bytes from local logs");
+            }
+        }
+        break;
+    }
+
+    Ok(Replay { tips, pts: all_pts })
 }
 
 /// Compare the replayed log tip with our last verified checkpoint
@@ -1268,18 +1384,14 @@ fn cmd_rm(dir: &Path, rec: bool, name: &str) -> Result<(), String> {
 /// verified op (own + foreign logs) in merge order. Field values never
 /// print; rows show which field KEYS changed between versions.
 fn cmd_history(dir: &Path, rec: bool, name: &str, json: bool) -> Result<(), String> {
-    let vault = unlock(dir, rec)?;
+    let (vault, rep) = unlock_full(dir, rec)?;
 
-    // unlock() already verified every log once; re-verifying per device
-    // recovers the plaintexts history needs. verify_foreign_log covers
-    // our own log too — this device is in the manifest registry.
-    let mut pts: Vec<mpm_core::OpPlaintext> = Vec::new();
-    for dev in mpm_store::list_device_logs(dir).map_err(|e| e.to_string())? {
-        let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
-        // same quarantine semantics as unlock: keep the verified prefix
-        // (a revoked device contributes up to its horizon), skip the rest
-        let r = vault.verify_foreign_prefix(&dev, &lr.ops, 1, [0u8; HASH_LEN]);
-        pts.extend(r.pts);
+    // replay_state already verified every op once — its pts carry real
+    // (device, seq) origins, snapshot winners included. Compacted loser
+    // ops are simply gone from local logs; say so.
+    let mut pts = rep.pts;
+    if vault.has_compacted() {
+        eprintln!("note: pre-compaction loser ops are no longer in local logs");
     }
     // the merge's total order — the same key apply_pt compares on
     pts.sort_by_key(|p| (p.hlc, p.origin_device, p.origin_seq));
@@ -1296,7 +1408,7 @@ fn cmd_history(dir: &Path, rec: bool, name: &str, json: bool) -> Result<(), Stri
                 e.1 = false;
             }
             mpm_core::OpType::Tombstone => e.1 = true,
-            mpm_core::OpType::Meta => {}
+            _ => {}
         }
     }
 
@@ -1404,6 +1516,8 @@ fn cmd_history(dir: &Path, rec: bool, name: &str, json: bool) -> Result<(), Stri
         mpm_core::OpType::Upsert => "upsert",
         mpm_core::OpType::Tombstone => "tombstone",
         mpm_core::OpType::Meta => "meta",
+        mpm_core::OpType::Checkpoint => "checkpoint",
+        mpm_core::OpType::Unknown(_) => "unknown",
     };
     if json {
         let mut objs = Vec::new();
@@ -1446,6 +1560,8 @@ fn cmd_history(dir: &Path, rec: bool, name: &str, json: bool) -> Result<(), Stri
         let label = match r.op {
             mpm_core::OpType::Tombstone => "(deleted)".to_string(),
             mpm_core::OpType::Meta => "(meta)".to_string(),
+            mpm_core::OpType::Checkpoint => "(checkpoint)".to_string(),
+            mpm_core::OpType::Unknown(_) => "(unknown op)".to_string(),
             mpm_core::OpType::Upsert if i == 0 => "(created)".to_string(),
             mpm_core::OpType::Upsert if r.changed.is_empty() => "(unchanged)".to_string(),
             mpm_core::OpType::Upsert => r.changed.join(", "),
@@ -1526,6 +1642,99 @@ fn cmd_passwd(dir: &Path, rec: bool) -> Result<(), String> {
     eprintln!("note: sync propagates the new manifest; other devices unlock with the new password");
     eprintln!("note: manifest copies already out there still open with the OLD password —");
     eprintln!("      if the old password may be compromised, `pair revoke` rotates the DEK too");
+    Ok(())
+}
+
+/// `compact` — write a checkpoint op covering every device's verified tip,
+/// then drop the covered log prefixes. The checkpoint replicates as a
+/// normal op; every replica independently verifies its winner set before
+/// adopting and dropping — a forged or premature checkpoint just never
+/// gets adopted.
+fn cmd_compact(dir: &Path, rec: bool) -> Result<(), String> {
+    let _lock = mpm_store::lock_vault(dir).map_err(|e| e.to_string())?;
+    let (mut vault, _rep) = unlock_full(dir, rec)?;
+    let own = *vault.device_id();
+
+    // covered vector = each device's VERIFIED tip (a quarantined tail stays
+    // uncovered — its bytes keep verifying-or-failing honestly)
+    let mut covered: Vec<mpm_core::op::Gossip> = Vec::new();
+    let mut frames: std::collections::HashMap<
+        [u8; 16],
+        std::collections::HashMap<u64, mpm_core::op::Op>,
+    > = std::collections::HashMap::new();
+    let (tseq, thead) = vault.head();
+    {
+        let lr = mpm_store::read_ops(dir, &own).map_err(|e| e.to_string())?;
+        frames.insert(own, lr.ops.into_iter().map(|o| (o.seq, o)).collect());
+        if tseq > 0 {
+            covered.push(mpm_core::op::Gossip {
+                device_id: own,
+                seq: tseq,
+                head: thead,
+            });
+        }
+    }
+    for dev in mpm_store::list_device_logs(dir).map_err(|e| e.to_string())? {
+        if dev == own {
+            continue;
+        }
+        let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
+        let (fs, prev) = match vault.anchor(&dev) {
+            Some((s, h)) if lr.ops.first().map(|o| o.seq == s + 1).unwrap_or(true) => (s + 1, h),
+            _ => (1, [0u8; HASH_LEN]),
+        };
+        let r = vault.verify_foreign_prefix(&dev, &lr.ops, fs, prev);
+        if r.tip.0 > 0 {
+            covered.push(mpm_core::op::Gossip {
+                device_id: dev,
+                seq: r.tip.0,
+                head: r.tip.1,
+            });
+        }
+        frames.insert(dev, lr.ops.into_iter().map(|o| (o.seq, o)).collect());
+    }
+    if covered.is_empty() {
+        return Err("nothing to compact".into());
+    }
+
+    // winners: every record's winning op frame — on-disk first, then the
+    // adopted snapshot (already-covered ops live only inside it)
+    let mut winners: Vec<([u8; 16], mpm_core::op::Op)> = Vec::new();
+    for (dev, seq) in vault.winner_origins() {
+        let op = frames
+            .get(&dev)
+            .and_then(|m| m.get(&seq))
+            .or_else(|| {
+                vault.adopted_snapshot().and_then(|s| {
+                    s.winners
+                        .iter()
+                        .find(|(d, o)| *d == dev && o.seq == seq)
+                        .map(|(_, o)| o)
+                })
+            })
+            .ok_or("winner op missing locally — sync before compacting")?;
+        winners.push((dev, op.clone()));
+    }
+
+    let op = vault
+        .make_checkpoint(covered.clone(), winners)
+        .map_err(|e| e.to_string())?;
+    let ckpt_seq = op.seq;
+    let frame = op.encode();
+    mpm_store::append_op(dir, &own, &op).map_err(|e| e.to_string())?;
+    vault.commit(&op).map_err(|e| e.to_string())?;
+    mpm_store::save_snapshot(dir, &own, &frame).map_err(|e| e.to_string())?;
+    let mut freed = 0usize;
+    for g in &covered {
+        freed +=
+            mpm_store::drop_covered_prefix(dir, &g.device_id, g.seq).map_err(|e| e.to_string())?;
+    }
+    mpm_store::save_base_vector(dir, &covered).map_err(|e| e.to_string())?;
+    save_checkpoint(&vault)?;
+    println!(
+        "checkpoint seq {ckpt_seq}: covered {} device log(s), dropped {freed}B of op history",
+        covered.len()
+    );
     Ok(())
 }
 
@@ -2590,6 +2799,22 @@ fn cmd_backup(dir: &Path, rec: bool, dest: &Path) -> Result<(), String> {
             }
         }
     }
+    // snapshots/ too: a compacted log starts mid-chain and only replays
+    // anchored at the adopted checkpoint — without it the backup can't
+    // restore. All ciphertext (sealed frames + device/seq/hash vectors).
+    let snaps_dir = dir.join(mpm_store::SNAPS_DIR);
+    if snaps_dir.is_dir() {
+        mkdir_private(&out.join(mpm_store::SNAPS_DIR))?;
+        for e in std::fs::read_dir(&snaps_dir).map_err(|e| e.to_string())? {
+            let e = e.map_err(|e| e.to_string())?;
+            if e.file_type().map_err(|e| e.to_string())?.is_file() {
+                copy_private(
+                    &e.path(),
+                    &out.join(mpm_store::SNAPS_DIR).join(e.file_name()),
+                )?;
+            }
+        }
+    }
     let f = std::fs::File::open(&out).map_err(|e| e.to_string())?;
     f.sync_all().map_err(|e| e.to_string())?;
     eprintln!(
@@ -2624,6 +2849,21 @@ fn cmd_restore(dir: &Path, src: &Path) -> Result<(), String> {
             if e.path().extension().is_some_and(|x| x == "log") {
                 copy_private(&e.path(), &dir.join(mpm_store::OPS_DIR).join(e.file_name()))?;
                 n += 1;
+            }
+        }
+    }
+    // snapshots restore the compaction anchor — mid-chain logs verify
+    // only against an adopted checkpoint's covered vector
+    let src_snaps = src.join(mpm_store::SNAPS_DIR);
+    if src_snaps.is_dir() {
+        mkdir_private(&dir.join(mpm_store::SNAPS_DIR))?;
+        for e in std::fs::read_dir(&src_snaps).map_err(|e| e.to_string())? {
+            let e = e.map_err(|e| e.to_string())?;
+            if e.file_type().map_err(|e| e.to_string())?.is_file() {
+                copy_private(
+                    &e.path(),
+                    &dir.join(mpm_store::SNAPS_DIR).join(e.file_name()),
+                )?;
             }
         }
     }
@@ -2784,6 +3024,7 @@ fn main() {
         Cmd::Rm { name } => cmd_rm(&dir, rec, name),
         Cmd::History { name, json } => cmd_history(&dir, rec, name, *json),
         Cmd::Devices => cmd_devices(&dir, cli.recovery),
+        Cmd::Compact => cmd_compact(&dir, rec),
         Cmd::Passwd => cmd_passwd(&dir, rec),
         Cmd::Recovery { sub } => match sub {
             RecoveryCmd::Rotate => cmd_recovery_rotate(&dir, rec),

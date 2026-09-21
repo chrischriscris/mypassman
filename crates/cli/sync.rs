@@ -420,6 +420,10 @@ pub fn cmd_sync(dir: &Path) -> Result<(), String> {
         .filter_map(|h| Some((jstr(h, "device").ok()?, jnum(h, "head").ok()?)))
         .collect();
 
+    // adopted compaction base (device → covered seq) — pull cursors start
+    // past it so dropped prefixes never re-download
+    let bases = mpm_store::load_base_vector(dir).map_err(|e| e.to_string())?;
+
     // ── pull foreign logs (raw frames → verify → append verbatim) ──
     let mut pulled = 0u64;
     for (dev_hex, head) in &heads {
@@ -453,7 +457,15 @@ pub fn cmd_sync(dir: &Path) -> Result<(), String> {
             continue;
         }
         let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
-        let mut count = lr.ops.len() as u64;
+        // pull cursor by SEQ, not position: compacted logs start mid-chain.
+        // An empty log still has a cursor — the adopted base vector's
+        // covered seq — so covered ops never re-pull.
+        let base = bases
+            .iter()
+            .find(|(d, _)| d == &dev)
+            .map(|(_, s)| *s)
+            .unwrap_or(0);
+        let mut count = lr.ops.last().map(|o| o.seq).unwrap_or(base).max(base);
         if count > horizon {
             // Pulled while the device was still trusted, but now past its
             // revocation horizon — these bytes are untrusted; drop them so
@@ -466,7 +478,14 @@ pub fn cmd_sync(dir: &Path) -> Result<(), String> {
                 .sum();
             eprintln!("note: dropping post-revocation tail of {dev_hex} (past seq {horizon})");
             mpm_store::truncate_log(dir, &dev, keep).map_err(|e| e.to_string())?;
-            count = lr.ops.iter().take_while(|o| o.seq <= horizon).count() as u64;
+            count = lr
+                .ops
+                .iter()
+                .take_while(|o| o.seq <= horizon)
+                .last()
+                .map(|o| o.seq)
+                .unwrap_or(base)
+                .max(base);
         }
         if lr.torn_tail {
             // Heal it: the tail bytes never decoded, so they are by
@@ -520,22 +539,33 @@ pub fn cmd_sync(dir: &Path) -> Result<(), String> {
 
     // ── push our own ops ──
     let own = mpm_store::read_ops(dir, &me).map_err(|e| e.to_string())?;
+    let own_base = bases
+        .iter()
+        .find(|(d, _)| d == &me)
+        .map(|(_, s)| *s)
+        .unwrap_or(0);
+    let own_tip = own.ops.last().map(|o| o.seq).unwrap_or(own_base);
     let remote_head = heads
         .iter()
         .find(|(d, _)| unhex16(d).ok() == Some(me))
         .map(|(_, h)| *h)
         .unwrap_or(0);
     let mut pushed = 0u64;
-    if (own.ops.len() as u64) < remote_head {
+    if remote_head > own_tip {
         eprintln!(
             "warning: server holds {} of our ops but local log has {} — \
              this device lost state (restored backup?). Re-pair if unintended.",
-            remote_head,
-            own.ops.len()
+            remote_head, own_tip
         );
-    } else if own.ops.len() as u64 > remote_head {
+    } else if remote_head < own_base {
+        eprintln!(
+            "warning: relay is missing ops our checkpoint already covered — \
+             another replica's full log must re-push them"
+        );
+    }
+    if own_tip > remote_head {
         let mut body = Vec::new();
-        for op in &own.ops[remote_head as usize..] {
+        for op in own.ops.iter().skip_while(|o| o.seq <= remote_head) {
             body.extend_from_slice(&op.encode());
         }
         let r = http(
@@ -550,7 +580,7 @@ pub fn cmd_sync(dir: &Path) -> Result<(), String> {
             &[],
         )?;
         check(r.status, &r.body)?;
-        pushed = own.ops.len() as u64 - remote_head;
+        pushed = own_tip - remote_head;
     }
 
     // ── manifest reconcile ──
@@ -1203,7 +1233,7 @@ pub fn cmd_pair_revoke(dir: &Path, rec: bool, prefix: &str, keep_keys: bool) -> 
             .or_else(|| {
                 mpm_store::read_ops(dir, &dev.id)
                     .ok()
-                    .map(|lr| lr.ops.len() as u64)
+                    .and_then(|lr| lr.ops.last().map(|o| o.seq))
             })
             .unwrap_or(0)
     };

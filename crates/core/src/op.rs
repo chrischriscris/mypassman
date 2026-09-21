@@ -30,23 +30,39 @@ const T_CREATED: u8 = 0x07;
 const T_FIELDS_CT: u8 = 0x08;
 const T_GOSSIP: u8 = 0x09;
 const T_NAME: u8 = 0x0A;
+const T_SNAPSHOT: u8 = 0x0B;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum OpType {
-    Upsert = 1,
-    Tombstone = 2,
-    Meta = 3,
+    Upsert,
+    Tombstone,
+    Meta,
+    Checkpoint,
+    /// Any op type from a newer version — decodes, chain-verifies, and is
+    /// ignored by merge, so old clients keep replaying a log that contains
+    /// ops they don't understand.
+    Unknown(u8),
 }
 
 impl OpType {
-    fn from_u8(v: u8) -> Result<Self> {
-        Ok(match v {
+    fn from_u8(v: u8) -> Self {
+        match v {
             1 => Self::Upsert,
             2 => Self::Tombstone,
             3 => Self::Meta,
-            v => return Err(CoreError::BadOpType(v)),
-        })
+            4 => Self::Checkpoint,
+            v => Self::Unknown(v),
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Upsert => 1,
+            Self::Tombstone => 2,
+            Self::Meta => 3,
+            Self::Checkpoint => 4,
+            Self::Unknown(v) => v,
+        }
     }
 }
 
@@ -60,6 +76,10 @@ pub struct Gossip {
 
 impl Gossip {
     pub const LEN: usize = DEVICE_ID_LEN + 8 + HASH_LEN;
+
+    pub fn encode_pub(&self) -> [u8; Self::LEN] {
+        self.encode()
+    }
 
     fn encode(&self) -> [u8; Self::LEN] {
         let mut b = [0u8; Self::LEN];
@@ -84,6 +104,74 @@ impl Gossip {
     }
 }
 
+/// Checkpoint payload carried by an OpType::Checkpoint op: the per-device
+/// log heads it covers (same layout as `Gossip`) plus the winning op
+/// frames over that covered set — the materialized state, verbatim. A
+/// replica adopts a checkpoint only after replaying the covered ops itself
+/// and computing an identical winner set; after adoption the covered log
+/// prefixes can be dropped and the vector becomes the new chain anchor.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    /// (device_id, seq, head_hash) — every op at or below these seqs is
+    /// covered by this checkpoint.
+    pub covered: Vec<Gossip>,
+    /// The winning op per record, as (origin_device, frame) pairs. Includes
+    /// tombstone winners — a dropped delete must stay dead to stragglers.
+    pub winners: Vec<([u8; DEVICE_ID_LEN], Op)>,
+}
+
+const SNAP_MAX_COVERED: usize = 4096;
+const SNAP_MAX_WINNERS: usize = 200_000;
+
+const S_COVERED: u8 = 0x01;
+const S_WINNER: u8 = 0x02;
+
+impl Snapshot {
+    fn encode(&self) -> Result<Vec<u8>> {
+        let mut w = Writer::new();
+        for g in &self.covered {
+            w.field(S_COVERED, &g.encode());
+        }
+        for (dev, op) in &self.winners {
+            let mut v = Vec::with_capacity(DEVICE_ID_LEN + op.encode().len());
+            v.extend_from_slice(dev);
+            v.extend_from_slice(&op.encode());
+            w.field(S_WINNER, &v);
+        }
+        Ok(w.finish())
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(buf);
+        let mut covered = Vec::new();
+        let mut winners = Vec::new();
+        while let Some((t, v)) = r.next_field()? {
+            match t {
+                S_COVERED => {
+                    if covered.len() >= SNAP_MAX_COVERED {
+                        return Err(CoreError::Tlv("snapshot covered overflow"));
+                    }
+                    covered.push(Gossip::decode(v)?);
+                }
+                S_WINNER => {
+                    if winners.len() >= SNAP_MAX_WINNERS || v.len() < DEVICE_ID_LEN + OP_HEADER_LEN
+                    {
+                        return Err(CoreError::Tlv("snapshot winner"));
+                    }
+                    let dev: [u8; DEVICE_ID_LEN] = v[..16].try_into().unwrap();
+                    let (op, end) = Op::decode(&v[16..])?;
+                    if end != v.len() - DEVICE_ID_LEN {
+                        return Err(CoreError::Tlv("snapshot winner trailing"));
+                    }
+                    winners.push((dev, op));
+                }
+                _ => {} // forward-compatible
+            }
+        }
+        Ok(Snapshot { covered, winners })
+    }
+}
+
 /// Decrypted op plaintext — record graph + display name visible to a
 /// DEK-holder (needed for list/search without touching per-record keys),
 /// secret fields still sealed behind k_rec.
@@ -99,6 +187,8 @@ pub struct OpPlaintext {
     pub name: Vec<u8>,      // index-visible display name (UTF-8)
     pub fields_ct: Vec<u8>, // nonce||inner_ct; empty for tombstone/meta
     pub gossip: Vec<Gossip>,
+    /// Checkpoint payload — present only on OpType::Checkpoint ops.
+    pub snapshot: Option<Snapshot>,
     /// Merge metadata — which device log + seq produced this op, and the
     /// key_epoch the op was sealed under. Not part of the encoded plaintext
     /// (already bound by AAD + device signature); filled by `Op::open` —
@@ -151,7 +241,7 @@ impl OpPlaintext {
         let mut w = Writer::new();
         w.field(T_PREV_HASH, &self.prev_op_hash);
         w.u64f(T_HLC, self.hlc);
-        w.u8f(T_TYPE, self.op_type as u8);
+        w.u8f(T_TYPE, self.op_type.to_u8());
         w.field(T_RECORD_ID, &self.record_id);
         if let Some(k) = self.kind {
             w.u8f(T_KIND, k as u8);
@@ -163,6 +253,9 @@ impl OpPlaintext {
             w.field(T_GOSSIP, &g.encode());
         }
         w.field(T_NAME, &self.name);
+        if let Some(s) = &self.snapshot {
+            w.field(T_SNAPSHOT, &s.encode()?);
+        }
         Ok(w.finish())
     }
 
@@ -178,6 +271,7 @@ impl OpPlaintext {
         let mut fields_ct = Vec::new();
         let mut gossip = Vec::new();
         let mut name = Vec::new();
+        let mut snapshot = None;
         let mut ord = tlv::OrderGuard::default();
         while let Some((t, v)) = r.next_field()? {
             ord.check(t, &[T_GOSSIP])?;
@@ -187,7 +281,7 @@ impl OpPlaintext {
                     prev = Some(v.try_into().unwrap());
                 }
                 T_HLC => hlc = Some(tlv::u64v(t, v)?),
-                T_TYPE => ty = Some(OpType::from_u8(tlv::u8v(t, v)?)?),
+                T_TYPE => ty = Some(OpType::from_u8(tlv::u8v(t, v)?)),
                 T_RECORD_ID => {
                     Reader::want_fixed(t, v, RECORD_ID_LEN)?;
                     rid = Some(v.try_into().unwrap());
@@ -198,6 +292,7 @@ impl OpPlaintext {
                 T_FIELDS_CT => fields_ct = v.to_vec(),
                 T_GOSSIP => gossip.push(Gossip::decode(v)?),
                 T_NAME => name = v.to_vec(),
+                T_SNAPSHOT => snapshot = Some(Snapshot::decode(v)?),
                 _ => {} // forward-compatible: ignore unknown tags
             }
         }
@@ -212,6 +307,7 @@ impl OpPlaintext {
             name,
             fields_ct,
             gossip,
+            snapshot,
             origin_device: [0u8; 16],
             origin_seq: 0,
             key_epoch: 0,

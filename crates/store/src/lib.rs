@@ -217,6 +217,135 @@ pub fn read_ops(dir: &Path, device_id: &[u8; 16]) -> Result<LogRead> {
     Ok(LogRead { ops, torn_tail })
 }
 
+/// Rewrite a device log keeping only ops with `seq > covered_seq` — the
+/// physical half of checkpoint adoption. Atomic (tmp + rename + fsync);
+/// frames are copied verbatim so signatures and hashes are untouched.
+/// Only ever called under the vault write lock.
+pub fn drop_covered_prefix(dir: &Path, device_id: &[u8; 16], covered_seq: u64) -> Result<usize> {
+    let path = log_path(dir, device_id);
+    let lr = read_ops(dir, device_id)?;
+    let keep: Vec<u8> = lr
+        .ops
+        .iter()
+        .filter(|o| o.seq > covered_seq)
+        .flat_map(|o| o.encode())
+        .collect();
+    let old_len = path.metadata().map(|m| m.len()).unwrap_or(0);
+    if keep.len() as u64 == old_len {
+        return Ok(0); // nothing covered on disk
+    }
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    {
+        let mut f = private_files().create_new(true).open(&tmp)?;
+        f.write_all(&keep)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    fsync_dir(&dir.join(OPS_DIR))?;
+    Ok((old_len - keep.len() as u64) as usize)
+}
+
+// ── snapshots (adopted checkpoint ops, inside the synced vault dir) ──
+//
+// A snapshot file is just the raw checkpoint op frame — self-authenticating
+// (device signature + DEK-sealed body), re-verified at every unlock. The
+// winner frames it carries are real signed ops, so a tampered file fails
+// verification rather than seeding bad state.
+
+fn snap_path(dir: &Path, author: &[u8; 16]) -> PathBuf {
+    dir.join(SNAPS_DIR).join(format!("{}.snap", hex(author)))
+}
+
+/// Persist an adopted checkpoint frame (one per author — a newer
+/// checkpoint from the same author supersedes).
+pub fn save_snapshot(dir: &Path, author: &[u8; 16], frame: &[u8]) -> Result<()> {
+    let path = snap_path(dir, author);
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    {
+        let mut f = private_files().create_new(true).open(&tmp)?;
+        f.write_all(frame)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    fsync_dir(&dir.join(SNAPS_DIR))?;
+    set_private_file(&path)?;
+    Ok(())
+}
+
+/// All stored snapshot frames: (author_device_id, op).
+pub fn load_snapshots(dir: &Path) -> Result<Vec<([u8; 16], Op)>> {
+    let mut out = Vec::new();
+    let snaps = dir.join(SNAPS_DIR);
+    if !snaps.exists() {
+        return Ok(out);
+    }
+    for e in fs::read_dir(snaps)? {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(id) = name.strip_suffix(".snap").and_then(unhex16) else {
+            continue;
+        };
+        let buf = fs::read(e.path())?;
+        match Op::decode(&buf) {
+            Ok((op, end)) if end == buf.len() => out.push((id, op)),
+            _ => continue, // torn/corrupt snapshot — ignorable, it's a cache
+        }
+    }
+    Ok(out)
+}
+
+/// Drop a snapshot file that failed verification or was superseded by a
+/// deeper checkpoint — never fatal to unlock.
+pub fn remove_snapshot(dir: &Path, author: &[u8; 16]) -> Result<()> {
+    match fs::remove_file(snap_path(dir, author)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The adopted covered vector, stored UNENCRYPTED (device ids, seqs, and
+/// op hashes — none secret; the relay already sees them) so the sync path
+/// can compute pull cursors without unlocking the vault.
+pub fn save_base_vector(dir: &Path, covered: &[mpm_core::op::Gossip]) -> Result<()> {
+    let mut buf = Vec::with_capacity(covered.len() * mpm_core::op::Gossip::LEN);
+    for g in covered {
+        buf.extend_from_slice(&g.encode_pub());
+    }
+    let path = dir.join(SNAPS_DIR).join("base.vec");
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    {
+        let mut f = private_files().create_new(true).open(&tmp)?;
+        f.write_all(&buf)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    set_private_file(&path)?;
+    Ok(())
+}
+
+/// Read the adopted covered vector — (device → covered seq). Advisory
+/// only: a wrong value can waste a re-pull but cannot forge ops (frames
+/// are signature-verified regardless).
+pub fn load_base_vector(dir: &Path) -> Result<Vec<([u8; 16], u64)>> {
+    let buf = match fs::read(dir.join(SNAPS_DIR).join("base.vec")) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    if buf.len() % mpm_core::op::Gossip::LEN != 0 {
+        return Ok(Vec::new()); // torn — advisory data, just ignore it
+    }
+    let mut out = Vec::with_capacity(buf.len() / mpm_core::op::Gossip::LEN);
+    for chunk in buf.chunks(mpm_core::op::Gossip::LEN) {
+        let mut dev = [0u8; 16];
+        dev.copy_from_slice(&chunk[..16]);
+        let seq = u64::from_le_bytes(chunk[16..24].try_into().unwrap());
+        out.push((dev, seq));
+    }
+    Ok(out)
+}
+
 /// List device log files present in the vault (hex device ids).
 pub fn list_device_logs(dir: &Path) -> Result<Vec<[u8; 16]>> {
     let mut out = Vec::new();

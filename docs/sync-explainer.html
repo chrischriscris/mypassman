@@ -852,8 +852,13 @@ h3 { font-size: 22px; margin-top: 2em; }
   atomic sync-config writes, HTTPS enforcement, and zeroized key paths. Since the third:
   multi-epoch key bundles — <code>pair revoke</code> rotates the DEK (with a new master
   password, or it would be theater), so a revoked device can never read post-revocation
-  ciphertext. Still open: compaction/snapshots, conflict copies, gossip vectors,
-  restored-device handling.
+  ciphertext. Since the fourth: compaction — signed checkpoint ops carry the covered
+  per-device vector plus every record's winning frame (tombstones included); replicas
+  adopt one only after re-deriving the same winner set from their own verified replay,
+  then drop covered log prefixes and anchor chain verification at the covered head.
+  The relay stays oblivious (it keeps full history; sync cursors are logical seqs),
+  and unknown op types decode inert so older clients never wedge. Still open:
+  conflict copies, gossip vectors, restored-device handling.
 </footer>
 
 </main>

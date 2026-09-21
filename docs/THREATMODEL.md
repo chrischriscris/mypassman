@@ -57,6 +57,20 @@ rotates). An equal-epoch/different-bytes state means two owners wrote
 concurrently — the relay's copy wins, the loser is told to redo its
 change.
 
+**Compaction can't smuggle state.** Checkpoint ops are signed and sealed
+like any op, but a valid signature is never sufficient: a replica adopts
+a checkpoint only after independently re-deriving the same covered heads
+and winner set from its own verified replay (verify-or-nothing). A forged
+checkpoint — wrong winners, wrong covered heads, winners beyond the
+covered seq — is rejected and stays an inert op; covered log prefixes
+drop only after adoption, atomically per log. A checkpoint can't
+resurrect deleted records (tombstones are first-class winners) nor inject
+ops the author never signed (winner frames are re-verified verbatim).
+What compaction deliberately does NOT protect: it rewrites local storage,
+so a replica that adopts and then loses its relay history can't re-derive
+covered losers — that's why `history` notes the horizon and the relay is
+the full-history tier.
+
 ## What the relay still sees (metadata)
 
 - vault ids, device ids, device names, enrolled/active status, counts
@@ -99,6 +113,8 @@ service**. It cannot silently modify vault history.
 | stolen sync token (write, device-bound) | replay own device ops, push own signed ops | push as another device, mint tokens, touch manifest |
 | stolen setup key | create empty vaults on the deployment | touch any existing vault |
 | stolen invite code (in TTL) | insert self into pending | finish without owner's manifest signature |
+| forged checkpoint op | sit inert in the log | be adopted — winner-set verification requires the replica's own replay to agree |
+| tampered snapshot file / base.vec | cause a re-pull or re-verify | forge ops or anchors — every frame still signature + chain checked |
 | revoked device | keep old ciphertext | pull/push anything new; after revoke's key rotation, decrypt post-rotation ops too |
 
 ## Auditing notes
