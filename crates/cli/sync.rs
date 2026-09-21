@@ -454,6 +454,20 @@ pub fn cmd_sync(dir: &Path) -> Result<(), String> {
         }
         let lr = mpm_store::read_ops(dir, &dev).map_err(|e| e.to_string())?;
         let mut count = lr.ops.len() as u64;
+        if count > horizon {
+            // Pulled while the device was still trusted, but now past its
+            // revocation horizon — these bytes are untrusted; drop them so
+            // they stop tripping verification at every unlock.
+            let keep: u64 = lr
+                .ops
+                .iter()
+                .take_while(|o| o.seq <= horizon)
+                .map(|o| o.encode().len() as u64)
+                .sum();
+            eprintln!("note: dropping post-revocation tail of {dev_hex} (past seq {horizon})");
+            mpm_store::truncate_log(dir, &dev, keep).map_err(|e| e.to_string())?;
+            count = lr.ops.iter().take_while(|o| o.seq <= horizon).count() as u64;
+        }
         if lr.torn_tail {
             // Heal it: the tail bytes never decoded, so they are by
             // definition unverified — truncate to the verified prefix and
