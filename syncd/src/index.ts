@@ -2,7 +2,7 @@
 //! Routing + auth extraction only; all state and policy live in the
 //! per-vault VaultSync Durable Object (the transaction coordinator).
 
-import { unhex, WireError } from "./wire";
+import { sha256Hex, unhex, WireError } from "./wire";
 import { VaultSync } from "./vault";
 
 export { VaultSync };
@@ -38,11 +38,16 @@ export default {
     try {
       // ── bootstrap: setup-key only, one shot per vault ──────────────
       if (sub === "bootstrap" && req.method === "POST") {
-        if (!env.SETUP_KEY || req.headers.get("x-setup-key") !== env.SETUP_KEY) {
-          return json({ error: "bad setup key" }, 401);
-        }
+        // digest-compare: SETUP_KEY is a long-lived shared secret — never
+        // compare raw strings (timing oracle on the secret itself)
+        const provided = req.headers.get("x-setup-key");
+        const ok =
+          !!env.SETUP_KEY &&
+          !!provided &&
+          (await sha256Hex(provided)) === (await sha256Hex(env.SETUP_KEY));
+        if (!ok) return json({ error: "bad setup key" }, 401);
         const body = await req.arrayBuffer();
-        const { token } = await stub.bootstrap(body);
+        const { token } = await stub.bootstrap(vaultId, body);
         return json({ token });
       }
 

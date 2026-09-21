@@ -3,741 +3,1236 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>mypassman · how sync works</title>
+<title>How mypassman sync works</title>
 <style>
-  :root {
-    --bg: #090b10;
-    --ink: #eef2f8;
-    --dim: #93a0b4;
-    --faint: #5b6577;
-    --card: rgba(255,255,255,.035);
-    --edge: rgba(255,255,255,.09);
-    --a: #22d3ee;  /* device A — cyan   */
-    --b: #fbbf24;  /* device B — amber  */
-    --s: #a78bfa;  /* syncd   — violet  */
-    --ok: #34d399;
-    --bad: #fb7185;
-    --mono: ui-monospace, "SF Mono", Menlo, monospace;
-    --ease: cubic-bezier(.22,1,.36,1);
+/* ────────────────────────────────────────────────────────────────
+   Palette. Colour encodes knowledge: plaintext is coloured, ciphertext
+   is grey hatching, and the relay lane is monochrome because it is blind.
+   ──────────────────────────────────────────────────────────────── */
+:root {
+  --paper: #EEF1F4;
+  --panel: #E3E8ED;
+  --panel-2: #D8DFE6;
+  --ink: #14181D;
+  --ink-2: #4B5560;
+  --ink-3: #7C8691;
+  --rule: #C7CFD7;
+
+  --laptop: #0E7C73;
+  --laptop-soft: #D4ECE9;
+  --phone: #8A3963;
+  --phone-soft: #F0DCE7;
+  --relay: #5B6470;
+  --room: #23282F;
+  --room-2: #2E343C;
+  --room-ink: #D9DEE4;
+  --room-dim: #8C949E;
+  --seal: #9C6B16;
+  --seal-soft: #F3E6CC;
+  --reject: #B93A2C;
+  --reject-soft: #F6DCD7;
+
+  --serif: "Charter", "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+  --mono: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --ease: cubic-bezier(.2, .8, .2, 1);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
+body {
+  overflow-x: hidden;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 19px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+a { color: inherit; text-decoration-color: var(--ink-3); text-underline-offset: .15em; }
+a:hover { text-decoration-color: var(--ink); }
+button { font: inherit; color: inherit; cursor: pointer; background: none; border: 0; }
+button:focus-visible, a:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid var(--laptop); outline-offset: 3px; border-radius: 2px;
+}
+code, .mono { font-family: var(--mono); font-size: .82em; }
+p code { background: var(--panel); padding: .05em .35em; border-radius: 3px; }
+strong { font-weight: 700; }
+em { font-style: italic; }
+
+/* ── page frame ─────────────────────────────────────────────── */
+.page { max-width: 1160px; margin: 0 auto; padding: 0 28px 120px; }
+.prose { max-width: 66ch; }
+.prose p + p { margin-top: 1em; }
+.prose p { margin-top: 1em; }
+.prose ul, .prose ol { margin: 1em 0 0 1.3em; }
+.prose li + li { margin-top: .45em; }
+
+h1, h2, h3 { font-weight: 700; letter-spacing: -.015em; line-height: 1.1; }
+h1 { font-size: clamp(38px, 5.6vw, 66px); max-width: 20ch; letter-spacing: -.025em; }
+h2 { font-size: clamp(30px, 3.6vw, 42px); max-width: 26ch; margin-top: .2em; }
+h3 { font-size: 22px; margin-top: 2em; }
+.lede { font-size: clamp(20px, 2vw, 24px); color: var(--ink-2); max-width: 56ch; margin-top: 1.1em; line-height: 1.45; }
+
+/* chapters */
+.chapter { padding-top: 120px; scroll-margin-top: 20px; }
+.chapter + .chapter { border-top: 1px solid var(--rule); margin-top: 120px; }
+.chapter-head { display: grid; grid-template-columns: 1fr; gap: 6px; }
+.chapter-num { font-size: 15px; color: var(--ink-3); font-style: italic; }
+
+/* sticky contents rail (wide screens only) */
+.rail {
+  display: none;
+}
+@media (min-width: 1600px) {
+  .rail {
+    display: block; position: fixed; left: 26px; top: 50%; transform: translateY(-50%);
+    width: 190px; font-size: 14px; line-height: 1.4; color: var(--ink-3);
   }
-  * { box-sizing: border-box; margin: 0; }
-  html { scroll-behavior: smooth; }
-  body {
-    background: var(--bg); color: var(--ink);
-    font: 16px/1.6 -apple-system, "SF Pro Text", system-ui, sans-serif;
-    -webkit-font-smoothing: antialiased;
-    overflow-x: hidden;
-  }
-  code, .mono { font-family: var(--mono); font-size: .85em; }
-  code { background: rgba(255,255,255,.06); padding: .15em .45em; border-radius: 5px; }
-  button { font: inherit; cursor: pointer; }
+  .rail a { display: block; padding: 4px 0 4px 12px; text-decoration: none; border-left: 1px solid var(--rule); color: var(--ink-3); }
+  .rail a.on { color: var(--ink); border-left-color: var(--ink); }
+}
 
-  /* ambient */
-  .glow { position: fixed; inset: 0; pointer-events: none; z-index: 0;
-    background:
-      radial-gradient(700px 420px at 15% -5%, #22d3ee14, transparent 60%),
-      radial-gradient(700px 420px at 85% 10%, #a78bfa12, transparent 60%),
-      radial-gradient(600px 500px at 50% 110%, #fbbf240a, transparent 60%);
-  }
+/* figures & stages */
+.stage {
+  margin-top: 44px;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.stage-bar {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 14px 18px; border-bottom: 1px solid var(--rule);
+  font-size: 16px; color: var(--ink-2);
+}
+.stage-bar .title { font-weight: 700; color: var(--ink); margin-right: auto; }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 8px 16px; border-radius: 999px; font-size: 16px; line-height: 1;
+  background: var(--ink); color: var(--paper); border: 1px solid var(--ink);
+  transition: transform .15s var(--ease), background .15s;
+}
+.btn:hover { background: #000; }
+.btn:active { transform: translateY(1px); }
+.btn.quiet { background: transparent; color: var(--ink); border-color: var(--ink-3); }
+.btn.quiet:hover { background: var(--panel-2); }
+.btn[disabled] { opacity: .35; cursor: default; }
+.btn.small { padding: 6px 12px; font-size: 14px; }
+.toggle { display: inline-flex; align-items: center; gap: 8px; font-size: 15px; color: var(--ink-2); }
+.toggle input { accent-color: var(--ink); width: 16px; height: 16px; }
 
-  /* progress nav */
-  .pnav {
-    position: fixed; top: 0; left: 0; right: 0; z-index: 50;
-    display: flex; gap: 4px; justify-content: center; padding: 14px;
-    background: linear-gradient(#090b10f2, #090b1000);
-  }
-  .pnav .dot {
-    width: 26px; height: 4px; border-radius: 2px; border: 0; padding: 0;
-    background: rgba(255,255,255,.14); transition: all .35s var(--ease);
-  }
-  .pnav .dot.on { background: var(--a); width: 44px; }
-  .pnav .dot.seen { background: rgba(255,255,255,.4); }
+.caption {
+  padding: 16px 18px; border-top: 1px solid var(--rule); background: var(--paper);
+  font-size: 17px; color: var(--ink-2); min-height: 74px; display: flex; gap: 12px; align-items: flex-start;
+}
+.caption b { color: var(--ink); }
+.caption .step-ix { flex: none; color: var(--ink-3); font-style: italic; min-width: 3.2em; }
 
-  /* chapters */
-  main { position: relative; z-index: 1; }
-  .ch { min-height: 100vh; display: flex; flex-direction: column; justify-content: center;
-    align-items: center; padding: 90px 24px 60px; }
-  .ch-in { width: min(980px, 100%); }
-  .kick { font: 600 12px/1 var(--mono); letter-spacing: .22em; text-transform: uppercase;
-    color: var(--a); margin-bottom: 18px; }
-  h1 { font-size: clamp(42px, 7vw, 76px); font-weight: 800; letter-spacing: -.03em; line-height: 1.02; }
-  h2 { font-size: clamp(30px, 4.5vw, 46px); font-weight: 750; letter-spacing: -.025em; line-height: 1.08; margin-bottom: 18px; }
-  .lede { font-size: 18px; color: var(--dim); max-width: 62ch; }
-  .lede strong { color: var(--ink); }
-  .body { color: var(--dim); max-width: 66ch; margin-top: 14px; }
-  .body strong { color: var(--ink); }
+/* ── hero wire ───────────────────────────────────────────────── */
+.hero { padding-top: 84px; }
+.wire {
+  margin-top: 56px; position: relative; height: 150px;
+  display: grid; grid-template-columns: 1fr 1fr 1fr; align-items: center;
+}
+.wire .node { display: flex; flex-direction: column; align-items: center; gap: 8px; font-size: 15px; color: var(--ink-2); position: relative; z-index: 2; }
+.wire .node .glyph { width: 74px; height: 74px; border-radius: 12px; display: grid; place-items: center; }
+.wire .node.laptop .glyph { background: var(--laptop-soft); color: var(--laptop); }
+.wire .node.phone .glyph { background: var(--phone-soft); color: var(--phone); }
+.wire .node.relay .glyph { background: var(--room); color: var(--room-dim); border-radius: 50%; }
+.wire .line { position: absolute; left: calc(16.6% + 44px); right: calc(16.6% + 44px); top: 37px; height: 1px; background: var(--rule); z-index: 1; }
+.wire .pkt {
+  position: absolute; top: 24px; left: calc(16.6% + 52px); width: 84px; height: 26px; border-radius: 4px;
+  background: repeating-linear-gradient(135deg, #9AA3AD 0 3px, #C1C8D0 3px 6px);
+  border: 1px solid #7C8691; z-index: 3; display: grid; place-items: center;
+  font-family: var(--mono); font-size: 11px; color: var(--ink);
+  animation: travel 7s var(--ease) infinite;
+}
+.wire .pkt::before {
+  content: ""; position: absolute; right: -6px; top: -6px; width: 14px; height: 14px; border-radius: 50%;
+  background: var(--seal); border: 2px solid var(--paper);
+}
+.wire .stamp {
+  position: absolute; left: 50%; top: 84px; transform: translateX(-50%);
+  font-size: 13px; color: var(--seal); opacity: 0; animation: stamp 7s var(--ease) infinite; white-space: nowrap;
+}
+@keyframes travel {
+  0%   { left: calc(16.6% + 52px); transform: scale(.9); opacity: 0; }
+  6%   { opacity: 1; transform: scale(1); }
+  38%  { left: calc(50% - 42px); }
+  55%  { left: calc(50% - 42px); }
+  90%  { left: calc(83.4% - 136px); opacity: 1; }
+  96%, 100% { left: calc(83.4% - 136px); opacity: 0; }
+}
+@keyframes stamp {
+  0%, 36% { opacity: 0; transform: translate(-50%, 6px); }
+  42%, 56% { opacity: 1; transform: translate(-50%, 0); }
+  64%, 100% { opacity: 0; }
+}
 
-  .card {
-    background: var(--card); border: 1px solid var(--edge); border-radius: 16px;
-    padding: 22px; backdrop-filter: blur(8px);
-  }
-  .row { display: flex; gap: 16px; }
-  .row > * { flex: 1; }
-  @media (max-width: 760px) { .row { flex-direction: column; } }
+/* ── lanes (shared by sync, pairing, daemon stages) ──────────── */
+.lanes { display: grid; grid-template-columns: 1fr 1fr 1fr; min-height: 420px; }
+.lane { padding: 18px; border-right: 1px solid var(--rule); min-width: 0; }
+.lane:last-child { border-right: 0; }
+.lane.laptop { --c: var(--laptop); --soft: var(--laptop-soft); }
+.lane.phone  { --c: var(--phone);  --soft: var(--phone-soft); }
+.lane.relay  { background: var(--room); color: var(--room-ink); --c: var(--room-dim); }
+.lane-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 14px; }
+.lane-head .name { font-weight: 700; font-size: 18px; color: var(--c); }
+.lane.relay .lane-head .name { color: var(--room-ink); }
+.lane-head .sub { font-size: 13px; color: var(--ink-3); font-family: var(--mono); }
+.lane.relay .lane-head .sub { color: var(--room-dim); }
+.lane.busy { box-shadow: inset 0 0 0 2px var(--c); }
+.lane.relay.busy { box-shadow: inset 0 0 0 2px var(--room-dim); }
+@media (max-width: 860px) {
+  .lanes { grid-template-columns: 1fr; }
+  .lane { border-right: 0; border-bottom: 1px solid var(--rule); }
+  .lane:last-child { border-bottom: 0; }
+}
 
-  .nextbtn {
-    margin-top: 34px; align-self: center;
-    background: rgba(255,255,255,.06); color: var(--ink); border: 1px solid var(--edge);
-    border-radius: 999px; padding: 11px 26px; font-weight: 600; font-size: 14px;
-    transition: all .25s var(--ease);
-  }
-  .nextbtn:hover { background: var(--a); color: #06262b; border-color: var(--a); transform: translateY(-1px); }
+/* record card (plaintext view) */
+.record {
+  background: #fff; border: 1px solid var(--rule); border-left: 4px solid var(--c);
+  border-radius: 4px; padding: 10px 12px; font-size: 15px; transition: background .3s;
+}
+.record .rname { font-weight: 700; }
+.record dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin-top: 6px; color: var(--ink-2); }
+.record dt { color: var(--ink-3); }
+.record dd { font-family: var(--mono); font-size: 13.5px; color: var(--ink); word-break: break-all; }
+.record .origin { margin-top: 8px; font-size: 12.5px; color: var(--ink-3); }
+.record.flash { animation: flash .9s var(--ease); }
+@keyframes flash { 0% { background: var(--soft); } 100% { background: #fff; } }
+.record.blind { filter: grayscale(1); }
+.record.blind dd, .record.blind .rname { color: transparent; text-shadow: none;
+  background: repeating-linear-gradient(135deg, #9AA3AD 0 3px, #C1C8D0 3px 6px); border-radius: 2px; }
 
-  /* animated reveal */
-  .rv { opacity: 0; transform: translateY(26px); transition: opacity .7s var(--ease), transform .7s var(--ease); }
-  .ch.vis .rv { opacity: 1; transform: none; }
-  .rv.d1 { transition-delay: .12s } .rv.d2 { transition-delay: .24s } .rv.d3 { transition-delay: .36s } .rv.d4 { transition-delay: .48s }
+/* op logs (ledgers) */
+.logs { margin-top: 14px; display: grid; gap: 10px; }
+.log { font-size: 13px; }
+.log .log-name { font-family: var(--mono); color: var(--ink-3); margin-bottom: 4px; display: flex; gap: 8px; align-items: baseline; }
+.lane.relay .log .log-name { color: var(--room-dim); }
+.log .log-name .who { color: var(--c); }
+.log .frames { display: flex; flex-wrap: wrap; gap: 4px; min-height: 26px; }
+.frame {
+  height: 26px; padding: 0 8px; border-radius: 3px; display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 11.5px; color: var(--ink); border: 1px solid transparent; position: relative;
+  background: var(--soft); border-color: color-mix(in srgb, var(--c) 40%, transparent);
+}
+.frame .seq { font-weight: 700; }
+.frame .hlc { color: var(--ink-3); }
+.frame.ct {
+  color: var(--room-ink);
+  background: repeating-linear-gradient(135deg, #3A414A 0 3px, #4A525C 3px 6px);
+  border-color: #5B6470;
+}
+.frame.ct .hlc { display: none; }
+.frame .sealdot { width: 8px; height: 8px; border-radius: 50%; background: var(--seal); flex: none; }
+.frame.new { animation: pop .5s var(--ease); }
+@keyframes pop { 0% { transform: scale(.6); opacity: 0; } 60% { transform: scale(1.08); } 100% { transform: scale(1); opacity: 1; } }
+.frame.dim { opacity: .35; }
+.empty { color: var(--ink-3); font-style: italic; font-size: 13px; padding: 4px 0; font-family: var(--serif); }
+.lane.relay .empty { color: var(--room-dim); }
 
-  /* ═══ vault tree ═══ */
-  .tree { font-family: var(--mono); font-size: 14.5px; line-height: 1.9; color: var(--dim); }
-  .tree b { color: var(--ink); font-weight: 600; }
-  .tree .hl { color: var(--a); }
-  .tree .note { color: var(--faint); }
+/* relay checklist */
+.checks { margin-top: 14px; display: grid; gap: 6px; font-size: 13.5px; }
+.check { display: flex; gap: 8px; align-items: baseline; color: var(--room-dim); transition: color .2s; }
+.check .mark { width: 16px; height: 16px; border-radius: 50%; border: 1px solid var(--room-dim); flex: none; display: grid; place-items: center; font-size: 10px; transform: translateY(2px); }
+.check.ok { color: var(--room-ink); }
+.check.ok .mark { background: var(--seal); border-color: var(--seal); color: #fff; }
+.check.bad { color: #F3B4AA; }
+.check.bad .mark { background: var(--reject); border-color: var(--reject); color: #fff; }
+.check.pending .mark { border-style: dashed; }
+.manifest-chip {
+  margin-top: 16px; padding: 8px 10px; border-radius: 4px; background: var(--room-2); font-size: 12.5px; color: var(--room-dim);
+  font-family: var(--mono); display: flex; gap: 12px; flex-wrap: wrap;
+}
+.manifest-chip b { color: var(--room-ink); font-weight: 400; }
+.wire-note { font-size: 13px; color: var(--room-dim); margin-top: 10px; font-style: italic; }
+.http { font-family: var(--mono); font-size: 12.5px; color: var(--room-ink); background: var(--room-2); padding: 6px 10px; border-radius: 4px; margin-top: 12px; word-break: break-all; }
+.http .m { color: var(--seal); }
 
-  /* ═══ op frame builder ═══ */
-  .frame { display: flex; gap: 6px; margin: 26px 0 8px; min-height: 86px; }
-  .seg {
-    border-radius: 10px; border: 1px solid var(--edge); padding: 12px 14px;
-    display: flex; flex-direction: column; justify-content: center;
-    opacity: 0; transform: translateY(14px) scale(.96);
-    transition: all .55s var(--ease); position: relative;
-  }
-  .seg.in { opacity: 1; transform: none; }
-  .seg .nm { font: 700 11px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
-  .seg .vl { font: 12px/1.4 var(--mono); color: var(--dim); margin-top: 6px; word-break: break-all; }
-  .seg.seq  { background: #fbbf2418; border-color: #fbbf2450; flex: 0 0 74px; }
-  .seg.seq .nm { color: var(--b); }
-  .seg.non  { background: #22d3ee14; border-color: #22d3ee45; flex: 0 0 96px; }
-  .seg.non .nm { color: var(--a); }
-  .seg.sig  { background: #34d39914; border-color: #34d39945; flex: 0 0 110px; }
-  .seg.sig .nm { color: var(--ok); }
-  .seg.ct   { background: #a78bfa14; border-color: #a78bfa45; flex: 1; }
-  .seg.ct .nm { color: var(--s); }
-  .cap { font-size: 13px; color: var(--faint); min-height: 20px; }
+/* flying packet */
+.fly {
+  position: fixed; z-index: 99; pointer-events: none; height: 26px; padding: 0 8px; border-radius: 3px;
+  display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11.5px; color: var(--room-ink);
+  background: repeating-linear-gradient(135deg, #3A414A 0 3px, #4A525C 3px 6px); border: 1px solid #5B6470;
+  transition: transform .9s var(--ease), opacity .3s; will-change: transform;
+}
+.fly .sealdot { width: 8px; height: 8px; border-radius: 50%; background: var(--seal); }
 
-  /* ═══ chain ═══ */
-  .chainv { display: flex; align-items: center; gap: 0; margin: 30px 0 10px; flex-wrap: wrap; }
-  .opchip {
-    background: var(--card); border: 1px solid var(--edge); border-radius: 12px;
-    padding: 12px 16px; font-family: var(--mono); font-size: 13px;
-    transition: all .4s var(--ease);
-  }
-  .opchip .s { color: var(--b); font-weight: 700; }
-  .opchip .pv { display: block; font-size: 11px; color: var(--faint); margin-top: 3px; }
-  .opchip .pv b { color: var(--a); font-weight: 500; }
-  .opchip:hover { border-color: var(--a); transform: translateY(-3px); }
-  .carr { color: var(--faint); padding: 0 8px; font-size: 18px; }
+/* converged banner */
+.banner {
+  margin: 0 18px 14px; padding: 10px 14px; border-radius: 4px; font-size: 15px;
+  background: var(--seal-soft); color: #5C3F0B; border: 1px solid #E2CFA3; display: none;
+}
+.banner.show { display: block; animation: pop .4s var(--ease); }
 
-  /* ═══ live simulator ═══ */
-  .sim { display: grid; grid-template-columns: 1fr 1.15fr 1fr; gap: 14px; margin-top: 24px; }
-  @media (max-width: 820px) { .sim { grid-template-columns: 1fr; } }
-  .col { border-radius: 16px; border: 1px solid var(--edge); background: var(--card); padding: 16px; min-height: 330px; position: relative; }
-  .col h4 { font-size: 14px; display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
-  .col .role { font-size: 11.5px; color: var(--faint); margin-bottom: 12px; }
-  .col.a { border-top: 3px solid var(--a); }
-  .col.b { border-top: 3px solid var(--b); }
-  .col.s { border-top: 3px solid var(--s); }
-  .pill { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
-  .pill.a { background: var(--a); box-shadow: 0 0 10px var(--a); }
-  .pill.b { background: var(--b); box-shadow: 0 0 10px var(--b); }
-  .pill.s { background: var(--s); box-shadow: 0 0 10px var(--s); }
+/* ── directory tree ──────────────────────────────────────────── */
+.tree-wrap { display: grid; grid-template-columns: 1.1fr 1fr; gap: 0; }
+@media (max-width: 860px) { .tree-wrap { grid-template-columns: 1fr; } }
+.tree { padding: 22px 24px; font-family: var(--mono); font-size: 14px; line-height: 1.8; border-right: 1px solid var(--rule); }
+@media (max-width: 860px) { .tree { border-right: 0; border-bottom: 1px solid var(--rule); padding: 18px 16px; font-size: 13px; } .tree-detail { padding: 18px 16px; } .anatomy { padding: 18px 12px 14px; } .seg { font-size: 10.5px; } .page { padding: 0 18px 90px; } body { font-size: 17px; } }
+.tree .dir { color: var(--ink-3); overflow-wrap: anywhere; }
+.tree .file { overflow-wrap: anywhere; white-space: normal; line-height: 1.5; padding-top: 2px; padding-bottom: 2px; }
+.tree .file { display: block; width: 100%; text-align: left; padding: 0 6px; margin-left: -6px; border-radius: 3px; }
+.tree .file:hover, .tree .file.on { background: var(--panel-2); }
+.tree .file.on { color: var(--ink); font-weight: 700; }
+.tree .indent { padding-left: 26px; }
+.tree .aside { margin-top: 22px; padding-top: 14px; border-top: 1px dashed var(--rule); color: var(--ink-2); }
+.tree .aside .note { font-family: var(--serif); font-size: 14.5px; color: var(--ink-3); line-height: 1.45; margin-top: 4px; }
+.tree .lock { color: var(--seal); }
+.tree-detail { padding: 22px 24px; font-size: 16px; color: var(--ink-2); }
+.tree-detail h4 { font-size: 18px; color: var(--ink); margin-bottom: 8px; }
+.tree-detail .kv { margin-top: 12px; display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 14px; }
+.tree-detail .kv dt { font-family: var(--mono); font-size: 12.5px; color: var(--ink-3); }
+.tree-detail .kv dd { color: var(--ink-2); }
+.tree-detail p { margin-top: 10px; }
 
-  .logbox, .vaultbox { margin-top: 10px; }
-  .logbox .lb, .vaultbox .lb { font: 600 10.5px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--faint); margin-bottom: 6px; }
-  .oprow {
-    font: 12px/1.5 var(--mono); background: rgba(255,255,255,.045); border: 1px solid var(--edge);
-    border-radius: 8px; padding: 5px 10px; margin: 4px 0;
-    display: flex; justify-content: space-between; gap: 8px;
-    animation: pop .4s var(--ease);
-  }
-  .oprow .d { font-weight: 700; }
-  .oprow .d.a { color: var(--a); } .oprow .d.b { color: var(--b); }
-  .itemrow {
-    font-size: 13px; background: rgba(52,211,153,.08); border: 1px solid rgba(52,211,153,.25);
-    color: var(--ink); border-radius: 8px; padding: 6px 10px; margin: 4px 0;
-    animation: pop .45s var(--ease);
-  }
-  .itemrow .k { color: var(--ok); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; margin-right: 8px; font-family: var(--mono); }
-  @keyframes pop { from { opacity: 0; transform: translateY(8px) scale(.95); } }
-  .empty { color: var(--faint); font-size: 12.5px; font-style: italic; padding: 4px 0; }
+/* ── frame anatomy ───────────────────────────────────────────── */
+.anatomy { padding: 24px 18px 18px; }
+.bytes { display: flex; gap: 3px; width: 100%; }
+.seg {
+  height: 58px; border-radius: 4px; display: grid; place-items: center; text-align: center;
+  font-family: var(--mono); font-size: 12px; line-height: 1.25; border: 1px solid transparent; transition: transform .2s var(--ease), box-shadow .2s;
+  padding: 0 4px; cursor: pointer; color: var(--ink);
+}
+.seg:hover, .seg.on { transform: translateY(-3px); box-shadow: 0 6px 14px -8px rgba(20,24,29,.5); }
+.seg.on { border-color: var(--ink); }
+.seg .len { display: block; color: var(--ink-3); font-size: 11px; }
+.seg.seq   { flex: 0 0 9%;  background: #D9E2EA; }
+.seg.nonce { flex: 0 0 13%; background: #D0DAE3; }
+.seg.sig   { flex: 0 0 22%; background: var(--seal-soft); }
+.seg.ctlen { flex: 0 0 7%;  background: #D9E2EA; }
+.seg.ct    { flex: 1 1 auto; background: repeating-linear-gradient(135deg, #9AA3AD 0 3px, #C1C8D0 3px 6px); color: var(--ink); }
+.seg.ct > span, .seg.ct { }
+.seg.ct .lbl { background: var(--paper); padding: 3px 8px; border-radius: 3px; }
+.seg.ct .lbl .len { color: var(--ink-2); }
+.seg.ct.open { background: var(--laptop-soft); }
+.brace { position: relative; height: 22px; margin-top: 8px; }
+.brace .span { position: absolute; top: 0; height: 100%; border: 1px solid var(--seal); border-top: 0; border-radius: 0 0 6px 6px; }
+.brace .lbl { position: absolute; top: 100%; margin-top: 4px; font-size: 13px; color: var(--seal); white-space: nowrap; }
+.anatomy-detail { margin-top: 44px; min-height: 110px; font-size: 16px; color: var(--ink-2); max-width: 70ch; }
+.anatomy-detail h4 { font-size: 18px; color: var(--ink); margin-bottom: 6px; }
+.inside { margin-top: 14px; display: none; gap: 6px; flex-wrap: wrap; }
+.inside.show { display: flex; }
+.inside .tlv { font-family: var(--mono); font-size: 12px; padding: 4px 8px; border-radius: 3px; background: var(--laptop-soft); color: var(--laptop); border: 1px solid #A9D6D0; }
+.inside .tlv.link { background: var(--seal-soft); color: var(--seal); border-color: #E2CFA3; }
 
-  .headstat { font: 12px var(--mono); color: var(--dim); }
-  .headstat b { color: var(--ink); font-size: 15px; }
+/* ── numbered sync steps ─────────────────────────────────────── */
+.moves { counter-reset: mv; margin-top: 34px; display: grid; gap: 0; max-width: 72ch; }
+.move { counter-increment: mv; display: grid; grid-template-columns: 52px 1fr; gap: 14px; padding: 20px 0; border-top: 1px solid var(--rule); }
+.move::before { content: counter(mv); font-size: 34px; line-height: 1; color: var(--ink-3); font-style: italic; }
+.move h4 { font-size: 20px; }
+.move p { margin-top: 6px; color: var(--ink-2); font-size: 17px; }
+.move .http { background: var(--panel); color: var(--ink); margin-top: 10px; }
+.move .http .m { color: var(--seal); }
 
-  .simbtn {
-    background: rgba(255,255,255,.07); color: var(--ink); border: 1px solid var(--edge);
-    border-radius: 9px; padding: 8px 13px; font-size: 13px; font-weight: 600; margin: 4px 4px 0 0;
-    transition: all .2s var(--ease);
-  }
-  .simbtn:hover { transform: translateY(-1px); }
-  .simbtn.a:hover { background: var(--a); color: #06262b; }
-  .simbtn.b:hover { background: var(--b); color: #292004; }
-  .simbtn.s:hover { background: var(--s); color: #1e1245; }
-  .simbtn:disabled { opacity: .35; cursor: default; transform: none; }
+/* ── attack panel ────────────────────────────────────────────── */
+.attacks { display: grid; grid-template-columns: 260px 1fr; }
+@media (max-width: 860px) { .attacks { grid-template-columns: 1fr; } }
+.attack-list { display: flex; flex-direction: column; border-right: 1px solid var(--rule); }
+@media (max-width: 860px) { .attack-list { border-right: 0; border-bottom: 1px solid var(--rule); flex-direction: row; flex-wrap: wrap; } }
+.attack-list button { text-align: left; padding: 14px 18px; border-bottom: 1px solid var(--rule); font-size: 16px; transition: background .15s; }
+.attack-list button:hover { background: var(--panel-2); }
+.attack-list button.on { background: var(--room); color: var(--room-ink); }
+.attack-list button:last-child { border-bottom: 0; }
+.attack-out { padding: 24px; background: var(--room); color: var(--room-ink); min-height: 300px; }
+.attack-out h4 { font-size: 20px; margin-bottom: 8px; }
+.attack-out .verdict { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 14px; margin-bottom: 14px; }
+.attack-out .verdict.blocked { background: var(--reject); color: #fff; }
+.attack-out .verdict.leaks { background: var(--seal); color: #fff; }
+.attack-out .verdict.limit { background: var(--room-2); color: var(--room-ink); border: 1px solid var(--room-dim); }
+.attack-out p { color: #B9C1CA; font-size: 16px; max-width: 62ch; }
+.attack-out p + p { margin-top: 10px; }
+.attack-out .checks { margin-top: 18px; }
+.attack-out .where { margin-top: 18px; font-family: var(--mono); font-size: 12.5px; color: var(--room-dim); }
 
-  /* flying op packet */
-  .pkt {
-    position: absolute; z-index: 30; pointer-events: none;
-    font: 700 11px var(--mono); padding: 5px 10px; border-radius: 8px;
-    transition: all .8s var(--ease); box-shadow: 0 4px 20px rgba(0,0,0,.5);
-    white-space: nowrap;
-  }
-  .pkt.a { background: var(--a); color: #06262b; }
-  .pkt.b { background: var(--b); color: #292004; }
+/* ── daemon stage ────────────────────────────────────────────── */
+.mem { display: grid; gap: 8px; font-size: 13px; }
+.memrow { display: grid; grid-template-columns: auto 1fr; gap: 10px; font-family: var(--mono); font-size: 12.5px; padding: 6px 8px; border-radius: 3px; background: #fff; border: 1px solid var(--rule); }
+.memrow .k { color: var(--ink-3); }
+.memrow.hot { border-color: var(--laptop); background: var(--laptop-soft); animation: flash .8s var(--ease); }
+.memrow.warn { border-color: var(--reject); background: var(--reject-soft); }
+.req { margin-top: 14px; padding: 10px 12px; border-radius: 4px; background: #fff; border: 1px solid var(--rule); font-size: 14px; color: var(--ink-2); }
+.req b { color: var(--ink); }
+.req.hot { border-color: var(--seal); }
 
-  .simlog { margin-top: 14px; font: 12.5px/1.7 var(--mono); color: var(--dim); min-height: 44px; }
-  .simlog .t { color: var(--faint); }
-  .simlog .hl { color: var(--ok); }
-
-  /* ═══ pairing sequence ═══ */
-  .pstage { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 18px; position: relative; margin-top: 20px; }
-  .actor { text-align: center; }
-  .actor .box { border-radius: 14px; border: 1px solid var(--edge); background: var(--card); padding: 14px; min-height: 74px; }
-  .actor .nm { font-weight: 700; font-size: 14px; }
-  .actor .st { font: 11.5px var(--mono); color: var(--dim); margin-top: 6px; min-height: 34px; }
-  .actor .st b { font-weight: 600; }
-  .actor .st .have { color: var(--ok); }
-  .actor .st .want { color: var(--faint); }
-  .actor.b .nm { color: var(--b); } .actor.s .nm { color: var(--s); } .actor.a .nm { color: var(--a); }
-  .pmsg { margin: 18px 0 0; }
-  .pline {
-    display: flex; align-items: center; gap: 12px; padding: 9px 14px;
-    border-radius: 10px; margin: 5px 0; border: 1px solid transparent;
-    font-size: 14px; color: var(--faint); transition: all .45s var(--ease);
-  }
-  .pline .n { font: 700 11px var(--mono); color: var(--faint); width: 20px; }
-  .pline.on { color: var(--ink); background: var(--card); border-color: var(--edge); }
-  .pline.on .n { color: var(--a); }
-  .pline.done { color: var(--dim); }
-  .pline.done .n { color: var(--ok); }
-  .pline .who { font-weight: 700; min-width: 88px; font-size: 13px; }
-  .pline .who.b { color: var(--b); } .pline .who.a { color: var(--a); } .pline .who.s { color: var(--s); }
-
-  /* ═══ views toggle ═══ */
-  .vtoggle { display: inline-flex; background: var(--card); border: 1px solid var(--edge); border-radius: 999px; padding: 4px; margin: 18px 0; }
-  .vtoggle button { border: 0; background: transparent; color: var(--dim); padding: 8px 20px; border-radius: 999px; font-weight: 600; font-size: 13.5px; transition: all .25s var(--ease); }
-  .vtoggle button.on { background: var(--ink); color: var(--bg); }
-  .view { display: none; }
-  .view.on { display: block; animation: fade .3s var(--ease); }
-  @keyframes fade { from { opacity: 0; } }
-  .view .row pre {
-    font: 12px/1.7 var(--mono); color: var(--dim); white-space: pre-wrap; word-break: break-all;
-  }
-  .view pre .enc { color: var(--s); }
-  .view pre .meta { color: var(--b); }
-
-  /* checklist */
-  .todo li { list-style: none; padding: 8px 0 8px 30px; position: relative; color: var(--dim); }
-  .todo li::before { content: "◻"; position: absolute; left: 0; color: var(--faint); }
-  .todo li.done::before { content: "◼"; color: var(--ok); }
-  .todo li.done { color: var(--ink); }
-  .todo { padding-left: 0; }
-  ul { padding-left: 22px; }
-  li { margin: 5px 0; }
+/* ── footer ──────────────────────────────────────────────────── */
+.foot { margin-top: 140px; padding-top: 28px; border-top: 1px solid var(--rule); font-size: 15px; color: var(--ink-3); max-width: 66ch; }
+.foot .mono { font-size: 13px; }
+.srconly { position: absolute; left: -9999px; }
 </style>
 </head>
 <body>
-<div class="glow"></div>
-<nav class="pnav" id="pnav"></nav>
-<main id="main">
 
-<!-- ═══ 0 · hero ═══ -->
-<section class="ch" data-ch>
-  <div class="ch-in" style="text-align:center">
-    <div class="kick rv">mypassman · M3</div>
-    <h1 class="rv d1">Your vault,<br>everywhere.<br><span style="color:var(--dim);font-weight:600">Without trusting anyone.</span></h1>
-    <p class="lede rv d3" style="margin:26px auto 0">How a password manager syncs between your devices through a server that
-    <strong>can verify but never read</strong> — a guided tour of the pieces we just built.</p>
-    <button class="nextbtn rv d4" data-next>begin ↓</button>
+<nav class="rail" aria-label="Chapters">
+  <a href="#vault">The vault</a>
+  <a href="#frame">One op</a>
+  <a href="#sync">Two devices sync</a>
+  <a href="#relay">The relay</a>
+  <a href="#moves">One sync, four moves</a>
+  <a href="#pair">Adding a device</a>
+  <a href="#daemon">The daemon keeps up</a>
+  <a href="#threat">What the relay can do</a>
+</nav>
+
+<main class="page">
+
+<!-- ═══════════════════════════ HERO ═══════════════════════════ -->
+<header class="hero">
+  <h1>Two devices, one vault, and a relay that can never read either.</h1>
+  <p class="lede">
+    mypassman syncs by mailing sealed envelopes through a post office that checks
+    every seal but can't open a single letter. This page walks through how that
+    works, with a live two-device sync you can step through yourself.
+  </p>
+  <div class="wire" aria-hidden="true">
+    <div class="line"></div>
+    <div class="node laptop"><div class="glyph">
+      <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="5" width="18" height="11" rx="1.5"/><path d="M2 19h20"/></svg>
+    </div>laptop</div>
+    <div class="node relay"><div class="glyph">
+      <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 8h16v10H4z"/><path d="M4 8l8 6 8-6"/></svg>
+    </div>syncd</div>
+    <div class="node phone"><div class="glyph">
+      <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="7" y="2.5" width="10" height="19" rx="2"/><path d="M11 18.5h2"/></svg>
+    </div>phone</div>
+    <div class="pkt">seq 7</div>
+    <div class="stamp">seal checked, letter unopened</div>
   </div>
-</section>
+</header>
 
-<!-- ═══ 1 · the problem ═══ -->
-<section class="ch" data-ch>
-  <div class="ch-in">
-    <div class="kick rv">the itch</div>
-    <h2 class="rv d1">Two laptops. One vault.<br>A server in between.</h2>
-    <p class="body rv d2">You add a login on your work machine. Tonight, on the couch machine, it's just… there.
-    The naive way is a cloud that holds your database. But then the cloud <strong>holds your database</strong>.</p>
-    <div class="row rv d3" style="margin-top:26px">
-      <div class="card"><b style="color:var(--bad)">✗ trust-based</b><p style="font-size:14px;margin-top:8px">Server stores your vault, encrypted or not — a breach, an insider, a subpoena, and the question is always "how much did they get?"</p></div>
-      <div class="card"><b style="color:var(--ok)">✓ zero-knowledge</b><p style="font-size:14px;margin-top:8px">Server stores only ciphertext it can <em>verify</em> — who wrote it, that it wasn't forged, that it fits the chain — and can never read.</p></div>
-    </div>
-    <p class="body rv d4">mypassman's sync is the second kind. The trick that makes it work: <strong>every change is already a signed, encrypted frame</strong>. Sync just moves frames.</p>
-    <button class="nextbtn rv d4" data-next>what gets moved →</button>
+<!-- ═══════════════════════════ 1. VAULT ═══════════════════════════ -->
+<section class="chapter" id="vault">
+  <div class="chapter-head">
+    <span class="chapter-num">First,</span>
+    <h2>A vault is just a folder of sealed things.</h2>
   </div>
-</section>
-
-<!-- ═══ 2 · the vault ═══ -->
-<section class="ch" data-ch>
-  <div class="ch-in">
-    <div class="kick rv">the shape</div>
-    <h2 class="rv d1">A vault is a folder,<br>not a file.</h2>
-    <div class="row" style="margin-top:10px;align-items:flex-start">
-      <div class="card rv d2">
-        <div class="tree">~/.mypassman/vault/<br>
-├── <b class="hl">MANIFEST</b> <span class="note">← who owns this, who's allowed in</span><br>
-├── <b>ops/</b><br>
-│&nbsp;&nbsp; ├── <b class="hl">7fd5aa1f….log</b> <span class="note">← laptop A's changes</span><br>
-│&nbsp;&nbsp; └── <b class="hl">1a25c173….log</b> <span class="note">← laptop B's changes</span><br>
-└── snapshots/ <span class="note">(compaction, later)</span></div>
-      </div>
-      <div class="rv d3">
-        <p class="body" style="margin-top:0">One append-only log <strong>per device</strong>. Nobody ever writes to anyone else's — so two devices can edit offline with zero coordination, then exchange logs and converge.</p>
-        <p class="body">Sync is just: <strong>give the server my new lines, take their new lines.</strong></p>
-        <p class="body" style="font-size:13.5px;color:var(--faint)">Device signing keys live <em>outside</em> the vault dir (<code>~/Library/…/mypassman/devices/</code>) — they never travel.</p>
-      </div>
-    </div>
-    <button class="nextbtn rv d4" data-next>inside one op →</button>
+  <div class="prose">
+    <p>
+      There is no database. A vault is a directory with one signed index file and one
+      append-only log per device that has ever written to it. Each log is a chain of
+      encrypted, signed operations. Nothing in the folder is secret on its own: you
+      could publish it and lose nothing but privacy of <em>shape</em>.
+    </p>
+    <p>
+      The things that <em>are</em> secret live somewhere else entirely. Your device's
+      signing key and its sync credentials sit in your user data directory, mode
+      <code>0600</code>, never inside the vault. That split is what lets the whole folder
+      travel through a relay, an iCloud drive, or a USB stick without carrying the
+      authority to change itself.
+    </p>
+    <p>Click any entry to see what it holds.</p>
   </div>
-</section>
 
-<!-- ═══ 3 · an op is born ═══ -->
-<section class="ch" data-ch>
-  <div class="ch-in">
-    <div class="kick rv">the unit</div>
-    <h2 class="rv d1">Every change becomes<br>a signed, sealed frame.</h2>
-    <p class="body rv d2">Watch one assemble — click <b style="color:var(--a)">add "github login" on device A</b>:</p>
-    <div class="rv d3">
-      <button class="simbtn a" id="birthBtn">+ add item on A</button>
-      <span class="cap mono" id="birthCap" style="margin-left:12px"></span>
-      <div class="frame" id="frame">
-        <div class="seg seq"><span class="nm">seq</span><span class="vl" id="vSeq"></span></div>
-        <div class="seg non"><span class="nm">nonce</span><span class="vl" id="vNon"></span></div>
-        <div class="seg sig"><span class="nm">ed25519 sig</span><span class="vl" id="vSig"></span></div>
-        <div class="seg ct"><span class="nm">ciphertext</span><span class="vl" id="vCt"></span></div>
-      </div>
-      <div class="cap" id="frameCap"></div>
-    </div>
-    <p class="body rv d4" style="margin-top:22px">The signature covers <code>seq · nonce · ciphertext</code> — <strong>verifiable without the key</strong>. Inside the ciphertext: the item, and the hash of the previous op — the chain link.</p>
-    <button class="nextbtn rv d4" data-next>the chain →</button>
-  </div>
-</section>
-
-<!-- ═══ 4 · chain ═══ -->
-<section class="ch" data-ch>
-  <div class="ch-in">
-    <div class="kick rv">integrity</div>
-    <h2 class="rv d1">Each op locks onto the last.</h2>
-    <p class="body rv d2">Inside every ciphertext sits <code>prev_op_hash</code>. Cut the log, reorder it, swap an op — the chain breaks and the vault <strong>refuses</strong>, loudly. Each device's chain is its own seq space: A counts 1,2,3… and so does B.</p>
-    <div class="card rv d3">
-      <div style="font:600 11px var(--mono);color:var(--faint);letter-spacing:.1em;margin-bottom:4px">DEVICE A'S LOG</div>
-      <div class="chainv">
-        <div class="opchip"><span class="s">seq 1</span><span class="pv">prev <b>0x000000</b></span></div><div class="carr">→</div>
-        <div class="opchip"><span class="s">seq 2</span><span class="pv">prev <b>9f2e1a</b></span></div><div class="carr">→</div>
-        <div class="opchip"><span class="s">seq 3</span><span class="pv">prev <b>41c8d0</b></span></div><div class="carr">→</div>
-        <div class="opchip" style="border-color:var(--a)"><span class="s">seq 4</span><span class="pv">prev <b>b77e33</b> · head</span></div>
-      </div>
-      <div style="font:600 11px var(--mono);color:var(--faint);letter-spacing:.1em;margin:14px 0 4px">DEVICE B'S LOG — independent</div>
-      <div class="chainv">
-        <div class="opchip"><span class="s" style="color:var(--b)">seq 1</span><span class="pv">prev <b>0x000000</b></span></div><div class="carr">→</div>
-        <div class="opchip"><span class="s" style="color:var(--b)">seq 2</span><span class="pv">prev <b>5aa1f9</b> · head</span></div>
-      </div>
-    </div>
-    <p class="body rv d4">When both logs live in one vault, merge is <strong>per-record, last-writer-wins by hybrid clock</strong> — every device that sees the same ops lands on the same state, in any order.</p>
-    <button class="nextbtn rv d4" data-next>the relay →</button>
-  </div>
-</section>
-
-<!-- ═══ 5 · syncd ═══ -->
-<section class="ch" data-ch>
-  <div class="ch-in">
-    <div class="kick rv">the relay</div>
-    <h2 class="rv d1">syncd: a suspicious bouncer<br>for ciphertext.</h2>
-    <p class="body rv d2">A Cloudflare Worker routes <code>/v/&lt;vault&gt;/…</code> to a <strong>Durable Object</strong> — a tiny single-threaded actor with its own SQLite, one per vault. Free-tier self-hostable.</p>
-    <div class="row rv d3" style="margin-top:8px">
-      <div class="card"><b style="color:var(--ok)">it enforces</b>
-        <ul style="font-size:14px;margin-top:8px">
-          <li>op signature valid <em>for that device</em> (from the manifest)</li>
-          <li>seq continues the chain — no gaps, no forks</li>
-          <li>manifest swap is compare-and-swap on sha256</li>
-          <li>epochs never go backwards</li>
-        </ul>
-      </div>
-      <div class="card"><b style="color:var(--bad)">it can't</b>
-        <ul style="font-size:14px;margin-top:8px">
-          <li>read a single byte of an item — no key, ever</li>
-          <li>add a device — that needs the owner's signature</li>
-          <li>forge ops — a write token only extends <em>its own</em> chain</li>
-        </ul>
-      </div>
-    </div>
-    <div class="card rv d4 mono" style="font-size:13px;margin-top:14px;color:var(--dim)">
-      tokens (stored as sha256): <b style="color:var(--a)">admin</b> — bootstrap machine only, approves devices ·
-      <b style="color:var(--ok)">write</b> — append ops, bound to one device ·
-      <b style="color:var(--dim)">read</b> — fetch manifest/ops/state
-    </div>
-    <button class="nextbtn rv d4" data-next>see it move →</button>
-  </div>
-</section>
-
-<!-- ═══ 6 · LIVE SIMULATOR ═══ -->
-<section class="ch" data-ch>
-  <div class="ch-in">
-    <div class="kick rv">live demo</div>
-    <h2 class="rv d1">Play with it.<br>Break it if you can.</h2>
-    <p class="body rv d2">A toy version of the real protocol. Add items while "offline", then sync. Ops only appear where they've actually been delivered.</p>
-    <div class="sim rv d3" id="sim">
-      <div class="col a" id="colA">
-        <h4><span class="pill a"></span>laptop A <span class="headstat" style="margin-left:auto">log: <b id="hA">0</b> ops</span></h4>
-        <div class="role">has admin + its own r/w tokens</div>
-        <div class="logbox"><div class="lb">ops/…A.log</div><div id="logA"><div class="empty">empty</div></div></div>
-        <div class="vaultbox"><div class="lb">unlocked view</div><div id="viewA"><div class="empty">—</div></div></div>
-        <div style="margin-top:10px">
-          <button class="simbtn a" id="addA">+ add item</button>
-          <button class="simbtn a" id="syncA">⇅ mypassman sync</button>
+  <div class="stage tree-wrap">
+    <div class="tree" role="tablist" aria-label="Vault directory">
+      <div class="dir">~/Vaults/personal/</div>
+      <div class="indent">
+        <button class="file on" role="tab" data-t="manifest">MANIFEST</button>
+        <div class="dir">ops/</div>
+        <div class="indent">
+          <button class="file" role="tab" data-t="loga"><span style="color:var(--laptop)">a1f0c9e2…7b4d</span>.log</button>
+          <button class="file" role="tab" data-t="logb"><span style="color:var(--phone)">5e9d21ab…c0f3</span>.log</button>
         </div>
       </div>
-      <div class="col s" id="colS">
-        <h4><span class="pill s"></span>syncd <span class="headstat" style="margin-left:auto">durable object</span></h4>
-        <div class="role">verifies sigs, stores frames it can't read</div>
-        <div class="logbox"><div class="lb">stored heads</div>
-          <div class="headstat">A → <b id="srvA">0</b> &nbsp;·&nbsp; B → <b id="srvB">0</b></div>
-          <div id="logS" style="margin-top:8px"><div class="empty">no ops stored</div></div>
+      <div class="aside">
+        <div class="dir">~/Library/Application Support/mypassman/</div>
+        <div class="indent">
+          <div class="dir">devices/</div>
+          <div class="indent"><button class="file" role="tab" data-t="devkey"><span class="lock">●</span> 3fa2…19e0.dev</button></div>
+          <div class="dir">sync/</div>
+          <div class="indent"><button class="file" role="tab" data-t="creds"><span class="lock">●</span> 3fa2…19e0.conf</button></div>
         </div>
-      </div>
-      <div class="col b" id="colB">
-        <h4><span class="pill b"></span>laptop B <span class="headstat" style="margin-left:auto">log: <b id="hB">0</b> ops</span></h4>
-        <div class="role">paired device — own r/w tokens</div>
-        <div class="logbox"><div class="lb">ops/…B.log (+ pulled A.log)</div><div id="logB"><div class="empty">empty</div></div></div>
-        <div class="vaultbox"><div class="lb">unlocked view</div><div id="viewB"><div class="empty">—</div></div></div>
-        <div style="margin-top:10px">
-          <button class="simbtn b" id="addB">+ add item</button>
-          <button class="simbtn b" id="syncB">⇅ mypassman sync</button>
-        </div>
+        <div class="note">Outside the vault. Owner-only files. Losing the vault folder leaks nothing that can sign; losing these leaks nothing that can decrypt.</div>
       </div>
     </div>
-    <div class="simlog rv d4 mono" id="simLog"><span class="t">// try: add on A → sync A → sync B → item appears on B</span></div>
-    <button class="nextbtn rv d4" data-next>how B got in →</button>
+    <div class="tree-detail" id="tree-detail" role="tabpanel"></div>
   </div>
 </section>
 
-<!-- ═══ 7 · pairing ═══ -->
-<section class="ch" data-ch>
-  <div class="ch-in">
-    <div class="kick rv">enrollment</div>
-    <h2 class="rv d1">A new device earns its seat.<br>By signature, not by promise.</h2>
-    <div class="row rv d2" style="align-items:flex-start">
-      <div style="flex:1.5">
-        <div class="pstage">
-          <div class="actor b"><div class="box"><div class="nm">new device</div><div class="st" id="stB"><span class="want">no vault yet</span></div></div></div>
-          <div class="actor s"><div class="box"><div class="nm">syncd</div><div class="st" id="stS"><span class="want">manifest · ops · pending[]</span></div></div></div>
-          <div class="actor a"><div class="box"><div class="nm">owner A</div><div class="st" id="stA"><span class="have">admin token · owner key</span></div></div></div>
-        </div>
-        <div class="pmsg" id="plines"></div>
-        <button class="simbtn s" id="pairPlay" style="margin-top:10px">▶ play enrollment</button>
+<!-- ═══════════════════════════ 2. FRAME ═══════════════════════════ -->
+<section class="chapter" id="frame">
+  <div class="chapter-head">
+    <span class="chapter-num">Then,</span>
+    <h2>One operation, as it looks on disk and on the wire.</h2>
+  </div>
+  <div class="prose">
+    <p>
+      Every change to the vault is one <em>op</em>: a small sealed frame appended to the
+      writing device's log. The same bytes that sit on disk are the bytes that travel to
+      the relay and land in the other device's copy of that log. Nothing is re-encoded
+      along the way, so a frame is either the original or it isn't.
+    </p>
+    <p>Hover over a part of the frame. Then flip who is looking at it.</p>
+  </div>
+
+  <div class="stage">
+    <div class="stage-bar">
+      <span class="title">Op frame</span>
+      <label class="toggle"><input type="checkbox" id="anat-view"> I hold the vault keys</label>
+    </div>
+    <div class="anatomy">
+      <div class="bytes" id="bytes">
+        <button class="seg seq on" data-k="seq">seq<span class="len">8</span></button>
+        <button class="seg nonce" data-k="nonce">nonce<span class="len">24</span></button>
+        <button class="seg sig" data-k="sig">ed25519 signature<span class="len">64</span></button>
+        <button class="seg ctlen" data-k="ctlen">len<span class="len">4</span></button>
+        <button class="seg ct" data-k="ct"><span class="lbl">ciphertext<span class="len">len bytes</span></span></button>
       </div>
-      <div class="card rv d3" style="flex:1">
-        <b>The one idea that matters</b>
-        <p style="font-size:14.5px;margin-top:10px">The server keeps a <code>pending</code> queue — but approval isn't a row there. Approval is <strong>A re-signing the manifest with B inside it</strong>.</p>
-        <p style="font-size:14.5px">When B calls <code>finish</code>, the server looks at the <em>manifest</em> — a thing it cannot forge — and only then mints B's tokens. A stolen invite code buys you a queue position and nothing else.</p>
+      <div class="brace">
+        <div class="span" style="left:0; width:9%"></div>
+        <div class="span" style="left:9.4%; width:13%"></div>
+        <div class="span" style="left:52%; right:0"></div>
+        <div class="lbl" style="left:0">the signature covers seq, nonce and ciphertext</div>
+      </div>
+      <div class="anatomy-detail" id="anat-detail"></div>
+      <div class="inside" id="inside">
+        <span class="tlv link">prev_op_hash</span>
+        <span class="tlv">hlc</span>
+        <span class="tlv">type</span>
+        <span class="tlv">record_id</span>
+        <span class="tlv">kind</span>
+        <span class="tlv">name</span>
+        <span class="tlv">fields (encrypted again, per record)</span>
       </div>
     </div>
-    <button class="nextbtn rv d4" data-next>the daemon →</button>
+  </div>
+
+  <div class="prose">
+    <p>
+      Two consequences follow from that layout. The signature preimage is the seq, the
+      nonce and the ciphertext, prefixed by a fixed context string, so <strong>anyone can
+      verify the frame without holding a single key</strong>. And because the hash of the
+      previous op is sealed inside the ciphertext, <strong>only someone who can decrypt can
+      walk the chain</strong>, while the relay still enforces that seq numbers never skip.
+    </p>
+    <p>
+      Sequence numbers are per device. Your laptop's op 12 and your phone's op 12 are
+      unrelated, which is what lets both write offline without asking anyone. When the
+      logs meet, each record keeps whichever op carries the highest hybrid logical clock,
+      with the writing device and its seq as the tie-break. That is a total order on ops,
+      so the merged result depends only on which ops exist, never on the order they
+      arrived in.
+    </p>
   </div>
 </section>
 
-<!-- ═══ 8 · daemon ═══ -->
-<section class="ch" data-ch>
-  <div class="ch-in">
-    <div class="kick rv">live merge</div>
-    <h2 class="rv d1">The daemon notices<br>what sync dropped off.</h2>
-    <p class="body rv d2">Your unlock daemon holds the vault in memory. A <code>sync</code> appends foreign ops to disk <em>while it sleeps between requests</em>. So before answering <em>any</em> request — a Raycast list, a <code>get</code> — it:</p>
-    <div class="card rv d3 mono" style="font-size:13.5px;line-height:1.9;margin-top:14px">
-      <b>refresh()</b> — own log: new ops? apply. shrank/diverged? scream.<br>
-      <b>refresh_foreign()</b> — for each other device's log:<br>
-      &nbsp;&nbsp;· reload MANIFEST if devices changed (approvals land here)<br>
-      &nbsp;&nbsp;· verify only the <b style="color:var(--a)">new suffix</b>: sig + seq + chain<br>
-      &nbsp;&nbsp;· merge → records update by max-HLC
+<!-- ═══════════════════════════ 3. SYNC CENTERPIECE ═══════════════════════════ -->
+<section class="chapter" id="sync">
+  <div class="chapter-head">
+    <span class="chapter-num">Now,</span>
+    <h2>Watch two devices edit the same record and end up agreeing.</h2>
+  </div>
+  <div class="prose">
+    <p>
+      A laptop and a phone share a vault with one record in it. Both go offline, both
+      change that record, then each runs <code>mypassman sync</code> in turn. Step through
+      it. The middle lane is the relay, and it stays grey on purpose: that is everything
+      it will ever see.
+    </p>
+  </div>
+
+  <div class="stage" id="sim">
+    <div class="stage-bar">
+      <span class="title">Two-device sync</span>
+      <label class="toggle"><input type="checkbox" id="sim-blind"> Look through the relay's eyes</label>
+      <button class="btn quiet small" id="sim-reset">Start over</button>
+      <button class="btn quiet small" id="sim-back">Back</button>
+      <button class="btn small" id="sim-next">Next step</button>
     </div>
-    <p class="body rv d4">Net effect from the couch: <code>sync</code> on a cron, and the vault you open is always current — <strong>no re-unlock, no restart</strong>.</p>
-    <button class="nextbtn rv d4" data-next>who sees what →</button>
+    <div class="lanes">
+      <div class="lane laptop" id="lane-laptop">
+        <div class="lane-head"><span class="name">MacBook</span><span class="sub">a1f0c9e2</span></div>
+        <div id="rec-laptop"></div>
+        <div class="logs" id="logs-laptop"></div>
+      </div>
+      <div class="lane relay" id="lane-relay">
+        <div class="lane-head"><span class="name">syncd</span><span class="sub">one Durable Object for this vault</span></div>
+        <div class="http" id="relay-http">idle</div>
+        <div class="checks" id="relay-checks"></div>
+        <div class="logs" id="logs-relay"></div>
+        <div class="manifest-chip" id="relay-manifest"></div>
+      </div>
+      <div class="lane phone" id="lane-phone">
+        <div class="lane-head"><span class="name">iPhone</span><span class="sub">5e9d21ab</span></div>
+        <div id="rec-phone"></div>
+        <div class="logs" id="logs-phone"></div>
+      </div>
+    </div>
+    <div class="banner" id="sim-banner"></div>
+    <div class="caption"><span class="step-ix" id="sim-ix"></span><span id="sim-cap"></span></div>
   </div>
 </section>
 
-<!-- ═══ 9 · who sees what ═══ -->
-<section class="ch" data-ch>
-  <div class="ch-in">
-    <div class="kick rv">the deal</div>
-    <h2 class="rv d1">Same wire. Two views.</h2>
-    <div class="vtoggle rv d2">
-      <button class="on" data-v="dev">your device's view</button>
-      <button data-v="srv">the server's view</button>
-    </div>
-    <div class="view on rv d3" id="v-dev">
-      <div class="card"><pre><span class="meta">op seq=7 dev=A</span>
-  plaintext (after unwrap): upsert login "github" {username: me, password: •••}
-  prev_op_hash: b77e33… · hlc: 1789949021500
-  sig: <span class="meta">valid under device A vk ✓</span></pre></div>
-    </div>
-    <div class="view rv d3" id="v-srv">
-      <div class="card"><pre><span class="meta">op seq=7 dev=A · 612 bytes · arrived 18:02:41Z</span>
-  nonce: 8f3a…c1
-  ct:    <span class="enc">e2 9f 41 7b 0a d3 55 18 9c 02 f7 b1 4e 88 3d 66 a0 12 …</span>
-  sig:   <span class="meta">valid under device A vk ✓</span>   <span class="enc">← all it will ever know</span></pre></div>
-    </div>
-    <p class="body rv d4">Metadata leaks — device ids, op counts, timing. Content doesn't. A hostile server's best moves are <em>withholding</em> (availability) and <em>reordering</em> — both detected, never silently accepted.</p>
-    <button class="nextbtn rv d4" data-next>what's left →</button>
+<!-- ═══════════════════════════ 4. RELAY ═══════════════════════════ -->
+<section class="chapter" id="relay">
+  <div class="chapter-head">
+    <span class="chapter-num">About the middle lane:</span>
+    <h2>The relay is a bouncer, not a librarian.</h2>
+  </div>
+  <div class="prose">
+    <p>
+      <code>syncd</code> is a Cloudflare Worker in front of one Durable Object per vault.
+      Each Durable Object owns a small SQLite database: the current manifest, the op frames
+      keyed by device and seq, hashed tokens, live invite codes, and a queue of devices
+      asking to join. Because a Durable Object is single-threaded, appending ops and
+      swapping the manifest are plain SQLite transactions. There is no coordinator to
+      build and no race to win.
+    </p>
+    <p>
+      It stores only what it can verify. Before an op frame is accepted the relay checks
+      that the bearer token is bound to the device named in the URL, that the device is in
+      the manifest's registry and still active, that the ed25519 signature verifies against
+      that device's public key, and that the seq is exactly the head plus one. A re-push of
+      identical bytes is silently fine. Different bytes at an existing seq is called out as
+      equivocation and refused.
+    </p>
+    <p>
+      Before a manifest is replaced it checks the owner signature, that the vault id is
+      unchanged, that neither epoch went backwards, and that the caller's
+      <code>base_hash</code> matches the sha256 of what is currently stored. That last
+      check is a compare-and-swap: two admins racing to add devices can't overwrite each
+      other, and the loser is told to pull and try again.
+    </p>
+    <h3>Three tokens and one key</h3>
+    <ul>
+      <li><strong>admin</strong> is minted once, at bootstrap, to the machine that sets the vault up. It can replace the manifest, mint other tokens, revoke devices and issue invites.</li>
+      <li><strong>write</strong> is bound to one device id. It can append to that device's log only, and it can read sync state, so a day-to-day device needs nothing else.</li>
+      <li><strong>read</strong> can pull state, ops and the manifest. Nothing more.</li>
+      <li><strong>SETUP_KEY</strong> is the only secret the Worker itself holds. It authorises exactly one call per vault, the bootstrap that uploads the first manifest and returns the admin token. Rotating it changes nothing for existing tokens.</li>
+    </ul>
+    <p>
+      Tokens are stored hashed. A leaked write token lets an attacker extend one device's
+      chain with frames that device has already signed, which is to say, replay what the
+      relay already has. It can't forge a frame, because the signature check needs the
+      device's private key, and that never leaves the device.
+    </p>
   </div>
 </section>
 
-<!-- ═══ 10 · remaining ═══ -->
-<section class="ch" data-ch>
-  <div class="ch-in">
-    <div class="kick rv">M3 — honest state</div>
-    <h2 class="rv d1">Working today / still owed.</h2>
-    <div class="row rv d2" style="margin-top:8px">
-      <div class="card">
-        <ul class="todo">
-          <li class="done">per-vault Durable Object relay on Cloudflare free tier</li>
-          <li class="done"><code>mypassman sync</code> — pull/push/manifest CAS</li>
-          <li class="done"><code>mypassman pair</code> — invite→join→approve→finish</li>
-          <li class="done">daemon live-merge — pulled ops appear without re-unlock</li>
-          <li class="done">sig/seq/equivocation checks server-side</li>
-        </ul>
-      </div>
-      <div class="card">
-        <ul class="todo">
-          <li>compaction + snapshots (endpoints ready, client never writes)</li>
-          <li>conflict UI — merges are silent last-writer-wins</li>
-          <li>gossip-vector verification</li>
-          <li>restored-from-backup device healing</li>
-          <li>the nasty test matrix: skewed clocks, torn writes, races</li>
-        </ul>
+<!-- ═══════════════════════════ 5. FOUR MOVES ═══════════════════════════ -->
+<section class="chapter" id="moves">
+  <div class="chapter-head">
+    <span class="chapter-num">In order:</span>
+    <h2>One sync is four moves, and you never have to unlock.</h2>
+  </div>
+  <div class="prose">
+    <p>
+      Everything that crosses the wire is ciphertext or a signature, so
+      <code>mypassman sync</code> reads the logs as bytes and never decrypts anything.
+      Run it whenever. Running it twice in a row is harmless, because every move is
+      idempotent.
+    </p>
+  </div>
+  <div class="moves">
+    <div class="move">
+      <div>
+        <h4>Ask where everyone is</h4>
+        <p>One cheap probe returns the manifest's snapshot epoch and the highest seq the relay holds for each device.</p>
+        <div class="http"><span class="m">GET</span> /v/&lt;vault&gt;/state → { snapshot_epoch, heads: [{device, head}] }</div>
       </div>
     </div>
-    <p class="body rv d3" style="margin-top:20px">Deploy: <code>wrangler secret put SETUP_KEY && wrangler deploy</code>, then <code>mypassman sync init &lt;url&gt; --setup-key …</code>. Full flow in <code>syncd/README.md</code>.</p>
+    <div class="move">
+      <div>
+        <h4>Pull what other devices wrote</h4>
+        <p>For each foreign device whose head is past your local copy of its log, fetch frames since your count in pages of up to 256. Frames are appended to <code>ops/&lt;device&gt;.log</code> verbatim. If a page ever ends mid-frame, the client refuses to write a torn log.</p>
+        <div class="http"><span class="m">GET</span> /v/&lt;vault&gt;/ops?device=…&amp;since=N&amp;limit=256 → raw frames, x-head, x-more</div>
+      </div>
+    </div>
+    <div class="move">
+      <div>
+        <h4>Push what you wrote</h4>
+        <p>Send your own frames past the relay's head for your device. If the relay holds <em>more</em> of your ops than you do, this device lost state, most likely a restored backup, and the client says so rather than fork the chain.</p>
+        <div class="http"><span class="m">POST</span> /v/&lt;vault&gt;/ops?device=&lt;me&gt; ← raw frames</div>
+      </div>
+    </div>
+    <div class="move">
+      <div>
+        <h4>Reconcile the manifest</h4>
+        <p>Fetch the relay's manifest. If the bytes differ from yours, the higher snapshot epoch wins. At equal epochs the version listing more devices wins, and an exact tie goes to the relay. If yours wins and you hold an admin token, push it with the relay's hash as the CAS base. A 409 means someone else got there first: run sync again.</p>
+        <div class="http"><span class="m">GET</span> /v/&lt;vault&gt;/manifest &nbsp; <span class="m">PUT</span> /v/&lt;vault&gt;/manifest { manifest, base_hash }</div>
+      </div>
+    </div>
   </div>
 </section>
+
+<!-- ═══════════════════════════ 6. PAIRING ═══════════════════════════ -->
+<section class="chapter" id="pair">
+  <div class="chapter-head">
+    <span class="chapter-num">Adding a device:</span>
+    <h2>Approval is a signature, not a checkbox.</h2>
+  </div>
+  <div class="prose">
+    <p>
+      A new phone has no keys and no tokens. It has to become a line in the owner-signed
+      manifest, and only a device that can unlock the vault can write that line. The
+      relay's job here is to carry a request and hold the door. It never decides who gets in.
+    </p>
+  </div>
+
+  <div class="stage" id="pairing">
+    <div class="stage-bar">
+      <span class="title">Pairing a new phone</span>
+      <button class="btn quiet small" id="pair-reset">Start over</button>
+      <button class="btn quiet small" id="pair-back">Back</button>
+      <button class="btn small" id="pair-next">Next step</button>
+    </div>
+    <div class="lanes">
+      <div class="lane laptop" id="pl-owner">
+        <div class="lane-head"><span class="name">MacBook</span><span class="sub">owner, holds admin token</span></div>
+        <div class="http" id="pair-owner-cmd" style="background:#fff;color:var(--ink)"></div>
+        <div id="pair-owner-body" style="margin-top:12px;font-size:15px;color:var(--ink-2)"></div>
+      </div>
+      <div class="lane relay" id="pl-relay">
+        <div class="lane-head"><span class="name">syncd</span><span class="sub">invites, pending, tokens</span></div>
+        <div class="http" id="pair-http">idle</div>
+        <div class="checks" id="pair-checks"></div>
+        <div class="manifest-chip" id="pair-tables"></div>
+      </div>
+      <div class="lane phone" id="pl-new">
+        <div class="lane-head"><span class="name">iPhone</span><span class="sub">new, fresh directory</span></div>
+        <div class="http" id="pair-new-cmd" style="background:#fff;color:var(--ink)"></div>
+        <div id="pair-new-body" style="margin-top:12px;font-size:15px;color:var(--ink-2)"></div>
+      </div>
+    </div>
+    <div class="caption"><span class="step-ix" id="pair-ix"></span><span id="pair-cap"></span></div>
+  </div>
+
+  <div class="prose">
+    <p>
+      Notice what the pending table is <em>not</em>. It is a queue of requests, so the owner
+      can list them by name and key fingerprint. Declining just deletes a row. Approving
+      does nothing to the table at all: it appends a device entry to the manifest, signs it
+      with the owner key, and pushes it. The relay's only test at <code>pair finish</code> is
+      whether the device now appears, active, in that signed manifest. Until it does, the
+      answer is 409.
+    </p>
+    <p>
+      The invite is printed as <code>&lt;vault_id&gt;.&lt;code&gt;</code> because the code alone can't
+      route: the vault id is what selects which Durable Object holds the vault. The code
+      lives fifteen minutes, is stored hashed, and is burned the moment it is exchanged for
+      tokens.
+    </p>
+  </div>
+</section>
+
+<!-- ═══════════════════════════ 7. DAEMON ═══════════════════════════ -->
+<section class="chapter" id="daemon">
+  <div class="chapter-head">
+    <span class="chapter-num">Meanwhile, on the same machine:</span>
+    <h2>The unlocked daemon notices without being told.</h2>
+  </div>
+  <div class="prose">
+    <p>
+      On a Mac the vault is usually held open by a daemon so the app and the browser
+      extension don't have to prompt for a password every time. Sync runs as a separate,
+      short-lived process that only appends bytes to files. Those two never talk. Instead,
+      the daemon treats the disk as the source of truth and re-checks it before every
+      request it answers.
+    </p>
+  </div>
+
+  <div class="stage" id="daemon-stage">
+    <div class="stage-bar">
+      <span class="title">One request to a running daemon</span>
+      <button class="btn quiet small" id="dm-reset">Start over</button>
+      <button class="btn small" id="dm-next">Next step</button>
+    </div>
+    <div class="lanes">
+      <div class="lane laptop">
+        <div class="lane-head"><span class="name">daemon memory</span><span class="sub">unlocked, DEK in RAM</span></div>
+        <div class="mem" id="dm-mem"></div>
+      </div>
+      <div class="lane" style="background:var(--paper)">
+        <div class="lane-head"><span class="name" style="color:var(--ink-2)">vault on disk</span><span class="sub">~/Vaults/personal</span></div>
+        <div class="logs" id="dm-disk"></div>
+      </div>
+      <div class="lane phone">
+        <div class="lane-head"><span class="name">client</span><span class="sub">app, extension or CLI</span></div>
+        <div class="req" id="dm-req">No request yet.</div>
+      </div>
+    </div>
+    <div class="caption"><span class="step-ix" id="dm-ix"></span><span id="dm-cap"></span></div>
+  </div>
+
+  <div class="prose">
+    <p>
+      The verification is incremental. The daemon remembers, for every foreign log, how
+      many ops it has applied and the hash of the last one. When a log grows, it verifies
+      only the new suffix, chaining it onto that remembered hash. If a log ever
+      <em>shrinks</em>, or the suffix doesn't chain, the daemon refuses and asks to be
+      restarted rather than guess.
+    </p>
+    <p>
+      It also reloads the manifest whenever foreign logs exist, because pairing and
+      revocation arrive as a new manifest on disk. A device that was added since unlock
+      becomes trusted. A device that was revoked stops merging, even for ops already in
+      its file. The reload is refused if the vault id, owner key or key epoch changed, since
+      that would mean the DEK in memory is stale.
+    </p>
+  </div>
+</section>
+
+<!-- ═══════════════════════════ 8. THREAT MODEL ═══════════════════════════ -->
+<section class="chapter" id="threat">
+  <div class="chapter-head">
+    <span class="chapter-num">Finally,</span>
+    <h2>Give the relay to an adversary. Try things.</h2>
+  </div>
+  <div class="prose">
+    <p>
+      Assume the Worker, the Durable Object and the account behind them are fully
+      compromised. Pick something the attacker might attempt and see which check stops
+      it, or, in a couple of cases, what they actually get.
+    </p>
+  </div>
+
+  <div class="stage attacks">
+    <div class="attack-list" id="attack-list" role="tablist"></div>
+    <div class="attack-out" id="attack-out" role="tabpanel"></div>
+  </div>
+</section>
+
+<footer class="foot">
+  The code behind this page: <span class="mono">syncd/src/vault.ts</span> (the Durable Object),
+  <span class="mono">syncd/src/wire.ts</span> (frame and manifest parsing),
+  <span class="mono">crates/cli/sync.rs</span> (the client and pairing),
+  <span class="mono">crates/cli/daemon.rs</span> (live merge), and DESIGN.md section 8.
+  M3 is partial: compaction, conflict copies, gossip vectors and restored-device handling are still open.
+</footer>
 
 </main>
 
 <script>
-/* ── chapter nav ─────────────────────────────────────────── */
-const chs = [...document.querySelectorAll('[data-ch]')];
-const nav = document.getElementById('pnav');
-chs.forEach((c, i) => {
-  const d = document.createElement('button');
-  d.className = 'dot'; d.title = 'section ' + (i + 1);
-  d.onclick = () => c.scrollIntoView({ behavior: 'smooth' });
-  nav.appendChild(d);
-});
-const seen = new Set();
-const io = new IntersectionObserver((es) => {
-  es.forEach(e => {
-    const i = chs.indexOf(e.target);
-    if (e.isIntersecting) {
-      e.target.classList.add('vis'); seen.add(i);
-      [...nav.children].forEach((d, j) => {
-        d.classList.toggle('on', j === i);
-        d.classList.toggle('seen', seen.has(j) && j !== i);
-      });
+(() => {
+'use strict';
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+/* ───────────── contents rail ───────────── */
+{
+  const links = $$('.rail a');
+  const secs = links.map(a => $(a.getAttribute('href')));
+  const io = new IntersectionObserver(es => {
+    es.forEach(e => { if (e.isIntersecting) {
+      links.forEach(l => l.classList.toggle('on', l.getAttribute('href') === '#' + e.target.id));
+    }});
+  }, { rootMargin: '-40% 0px -50% 0px' });
+  secs.forEach(s => s && io.observe(s));
+}
+
+/* ───────────── 1. vault tree ───────────── */
+{
+  const detail = {
+    manifest: `
+      <h4>MANIFEST</h4>
+      <p>Sixty-four bytes of owner signature, then a TLV body. The signature is made with the owner signing key, which rides inside every wrap slot, so only someone who has unlocked the vault can produce a valid manifest.</p>
+      <dl class="kv">
+        <dt>vault_id</dt><dd>16 random bytes. Names the vault everywhere, including which Durable Object holds it.</dd>
+        <dt>wrap slots</dt><dd>The data key and owner key, wrapped once per unlock method: password, Touch ID, recovery kit.</dd>
+        <dt>key_epoch</dt><dd>Bumped on revocation, when the data key rotates. Ops are bound to it.</dd>
+        <dt>snapshot_epoch</dt><dd>Monotonic. The relay refuses any manifest whose epochs go backwards.</dd>
+        <dt>device registry</dt><dd>One entry per device: id, ed25519 public key, name, active flag. This is the whole access list.</dd>
+        <dt>owner_vk</dt><dd>The public half of the owner key, so the signature can be checked without unlocking.</dd>
+      </dl>`,
+    loga: `
+      <h4>ops/a1f0c9e2….log</h4>
+      <p>The MacBook's log. Only the MacBook ever appends here, because only it holds the key that signs these frames. Everyone else, including the relay, holds a byte-for-byte copy.</p>
+      <p>Frames are numbered 1, 2, 3 with no gaps, and each one seals the hash of the one before it. Truncating the tail is the only tamper that leaves the file valid, and the relay's per-device head plus the manifest's epoch are what notice that.</p>`,
+    logb: `
+      <h4>ops/5e9d21ab….log</h4>
+      <p>The iPhone's log, as it appears on the MacBook. It arrived via sync, appended verbatim, and the MacBook's daemon verified each frame against the iPhone's public key from the registry before merging its contents.</p>
+      <p>Because seq spaces are per device, the iPhone could write op 1 while the MacBook wrote op 3, both offline, and nothing needed to agree in advance.</p>`,
+    devkey: `
+      <h4>devices/&lt;vault_id&gt;.dev</h4>
+      <p>Forty-eight bytes: the device id and the ed25519 seed. Created with mode 0600 and never inside the vault folder. This is what makes a frame <em>this device's</em> frame.</p>
+      <p>Two devices of one vault can live on one machine by pointing <code>MPM_DATA</code> at another directory, which is how the restore drills and tests run.</p>`,
+    creds: `
+      <h4>sync/&lt;vault_id&gt;.conf</h4>
+      <p>Plain <code>key=value</code> lines: the relay URL and whichever of admin, read and write tokens this device holds. Between <code>pair join</code> and <code>pair finish</code> it holds the invite code instead.</p>
+      <p>Same posture as the device key. A write token is strictly less powerful than the signing key it accompanies, so it earns the same protection and no more.</p>`
+  };
+  const panel = $('#tree-detail');
+  const show = k => { panel.innerHTML = detail[k]; $$('.tree .file').forEach(b => b.classList.toggle('on', b.dataset.t === k)); };
+  $$('.tree .file').forEach(b => b.addEventListener('click', () => show(b.dataset.t)));
+  show('manifest');
+}
+
+/* ───────────── 2. frame anatomy ───────────── */
+{
+  const out = $('#anat-detail');
+  const view = $('#anat-view');
+  const inside = $('#inside');
+  const text = {
+    seq: {
+      t: 'seq (8 bytes, little-endian)',
+      relay: 'The position of this op in its device\'s log. The relay reads it to enforce that each push starts exactly at head + 1 and that a replay of an existing seq carries identical bytes.',
+      dev: 'Same for you. Locally it is also the index used to find where verification left off.'
+    },
+    nonce: {
+      t: 'nonce (24 bytes)',
+      relay: 'Random, per op, for XChaCha20-Poly1305. Random rather than a counter, because two devices legitimately produce sibling versions of a record and a counter would risk reuse across a fork.',
+      dev: 'You need it to open the ciphertext. It carries no meaning on its own.'
+    },
+    sig: {
+      t: 'ed25519 signature (64 bytes)',
+      relay: 'Signed by the writing device over the context string, the seq, the nonce and the ciphertext. The relay looks up the device\'s public key in the manifest registry and verifies. No secret is needed, which is the point.',
+      dev: 'You verify it too, against the same registry, before decrypting anything from another device.'
+    },
+    ctlen: {
+      t: 'ct_len (4 bytes, little-endian)',
+      relay: 'How many ciphertext bytes follow. Capped at a megabyte before anything is buffered, so a hostile frame can\'t ask for memory it hasn\'t earned.',
+      dev: 'Lets a reader walk a file of concatenated frames without a separate index.'
+    },
+    ct: {
+      t: 'ciphertext',
+      relay: 'Opaque. The relay stores it and hands it back. It learns the length and nothing else. Record ids, timestamps, even the op type are all inside.',
+      dev: 'Opened with the vault\'s data key and additional data binding vault id, format, key epoch, device id and seq. Inside is a TLV: the previous op\'s hash, the hybrid logical clock, the op type, the record id, the kind and name, and the record\'s fields, which are encrypted a second time with a per-record key.'
     }
+  };
+  let cur = 'seq';
+  const render = () => {
+    const dev = view.checked;
+    const d = text[cur];
+    out.innerHTML = `<h4>${esc(d.t)}</h4><p>${esc(dev ? d.dev : d.relay)}</p>`;
+    $$('.seg').forEach(s => s.classList.toggle('on', s.dataset.k === cur));
+    $('.seg.ct').classList.toggle('open', dev);
+    $('.seg.ct').innerHTML = dev
+      ? '<span class="lbl">plaintext TLV<span class="len">visible with the data key</span></span>'
+      : '<span class="lbl">ciphertext<span class="len">len bytes</span></span>';
+    inside.classList.toggle('show', dev && cur === 'ct');
+  };
+  $$('.seg').forEach(s => {
+    s.addEventListener('mouseenter', () => { cur = s.dataset.k; render(); });
+    s.addEventListener('focus', () => { cur = s.dataset.k; render(); });
+    s.addEventListener('click', () => { cur = s.dataset.k; render(); });
   });
-}, { threshold: .35 });
-chs.forEach(c => io.observe(c));
-document.querySelectorAll('[data-next]').forEach(b => {
-  b.onclick = () => {
-    const i = chs.indexOf(b.closest('[data-ch]'));
-    chs[i + 1]?.scrollIntoView({ behavior: 'smooth' });
-  };
-});
-const hx = n => [...crypto.getRandomValues(new Uint8Array(n))].map(b => b.toString(16).padStart(2, '0')).join('');
-
-/* ── op frame birth ──────────────────────────────────────── */
-const birthSeqs = [
-  ['seq', '5'], ['non', hx(6)], ['sig', hx(8) + '…'], ['ct', hx(10) + '… (' + (180 + Math.floor(Math.random() * 300)) + ' bytes)'],
-];
-const caps = [
-  'my position in A\'s chain',
-  'fresh randomness — never reused',
-  'A\'s device key signs seq·nonce·ct',
-  'the item, sealed — includes prev_op_hash',
-];
-let birthed = false;
-document.getElementById('birthBtn').onclick = () => {
-  document.querySelectorAll('#frame .seg').forEach(s => s.classList.remove('in'));
-  document.getElementById('frameCap').textContent = '';
-  const vals = { seq: String(5 + Math.floor(Math.random() * 4)), non: hx(6), sig: hx(8) + '…', ct: hx(14) + '…  (' + (180 + Math.floor(Math.random() * 300)) + ' bytes ciphertext)' };
-  document.getElementById('vSeq').textContent = vals.seq;
-  document.getElementById('vNon').textContent = vals.non;
-  document.getElementById('vSig').textContent = vals.sig;
-  document.getElementById('vCt').textContent = vals.ct;
-  const segs = document.querySelectorAll('#frame .seg');
-  segs.forEach((s, i) => setTimeout(() => {
-    s.classList.add('in');
-    document.getElementById('birthCap').textContent = ['seq — ' + caps[0], 'nonce — ' + caps[1], 'sig — ' + caps[2], 'ct — ' + caps[3]][i];
-  }, 350 + i * 480));
-  setTimeout(() => {
-    document.getElementById('frameCap').textContent = '→ appended to ops/A.log · durably fsynced · ready to push';
-  }, 350 + segs.length * 480);
-};
-
-/* ── live simulator ──────────────────────────────────────── */
-const items = ['github', 'bank of mom', 'aws root', 'ssh deploy', 'figma', 'wifi gate', 'stripe', 'notion', 'postgres prod', 'doorman pin'];
-let itemIdx = 0;
-const st = {
-  A: { ops: [], view: [] },          // ops in A's own log
-  B: { ops: [], pulledA: [], view: [] }, // B's own ops + pulled A frames
-  srv: { A: 0, B: 0 },               // remote heads = stored op count per device
-};
-const $ = id => document.getElementById(id);
-const devCol = { A: '#22d3ee', B: '#fbbf24' };
-
-function renderSim() {
-  // heads
-  $('hA').textContent = st.A.ops.length;
-  $('hB').textContent = st.B.ops.length;
-  $('srvA').textContent = st.srv.A;
-  $('srvB').textContent = st.srv.B;
-  // logs
-  $('logA').innerHTML = st.A.ops.length
-    ? st.A.ops.map(o => `<div class="oprow"><span><span class="d a">A</span> seq ${o.seq}</span><span style="color:var(--faint)">${o.item} · ${o.h}</span></div>`).join('')
-    : '<div class="empty">empty</div>';
-  const blog = [...st.B.pulledA.map(o => `<div class="oprow" style="opacity:.85"><span><span class="d a">A</span> seq ${o.seq}</span><span style="color:var(--faint)">${o.item} · pulled</span></div>`),
-                ...st.B.ops.map(o => `<div class="oprow"><span><span class="d b">B</span> seq ${o.seq}</span><span style="color:var(--faint)">${o.item} · ${o.h}</span></div>`)];
-  $('logB').innerHTML = blog.length ? blog.join('') : '<div class="empty">empty</div>';
-  // server store
-  const srows = [...Array(st.srv.A)].map((_, i) => `<div class="oprow"><span><span class="d a">A</span> seq ${i + 1}</span><span class="mono" style="color:var(--s)">ct ${hx(4)}…</span></div>`)
-    .concat([...Array(st.srv.B)].map((_, i) => `<div class="oprow"><span><span class="d b">B</span> seq ${i + 1}</span><span class="mono" style="color:var(--s)">ct ${hx(4)}…</span></div>`));
-  $('logS').innerHTML = srows.length ? srows.join('') : '<div class="empty">no ops stored</div>';
-  // views — merge: union of items both devices' logs (only ops THIS device holds)
-  const mkView = (own, pulled) => {
-    const items = [...pulled.map(o => o.item), ...own.map(o => o.item)];
-    return items.length ? [...new Set(items)].map(n => `<div class="itemrow"><span class="k">item</span>${n}</div>`).join('') : '<div class="empty">—</div>';
-  };
-  $('viewA').innerHTML = mkView(st.A.ops, st.A.pulledB || []);
-  $('viewB').innerHTML = mkView(st.B.ops, st.B.pulledA);
-}
-st.A.pulledB = [];
-st.B.pulledA = [];
-
-function fly(fromEl, toEl, label, cls, done) {
-  const sim = $('sim'), a = fromEl.getBoundingClientRect(), b = toEl.getBoundingClientRect(), r = sim.getBoundingClientRect();
-  const p = document.createElement('div');
-  p.className = 'pkt ' + cls;
-  p.textContent = label;
-  p.style.left = (a.left - r.left + 30) + 'px';
-  p.style.top = (a.top - r.top + 40) + 'px';
-  sim.appendChild(p);
-  requestAnimationFrame(() => requestAnimationFrame(() => {
-    p.style.left = (b.left - r.left + b.width / 2 - 40) + 'px';
-    p.style.top = (b.top - r.top + 50) + 'px';
-  }));
-  setTimeout(() => { p.style.opacity = '0'; setTimeout(() => p.remove(), 300); done && done(); }, 850);
+  view.addEventListener('change', render);
+  render();
 }
 
-function slog(html) {
-  const l = $('simLog');
-  l.innerHTML = `<span class="t">$ </span>` + html;
+/* ───────────── shared helpers for staged stories ───────────── */
+function frameEl(f, opts = {}) {
+  const el = document.createElement('span');
+  el.className = 'frame' + (opts.ct ? ' ct' : '') + (opts.fresh ? ' new' : '') + (opts.dim ? ' dim' : '');
+  el.innerHTML = `<span class="sealdot"></span><span class="seq">${f.seq}</span>` +
+    (opts.ct ? `<span>${f.bytes}B</span>` : `<span class="hlc">hlc ${f.hlc}</span>`);
+  el.title = opts.ct ? `seq ${f.seq}, ${f.bytes} bytes, signature verified` : `seq ${f.seq}: ${f.desc}`;
+  return el;
+}
+function checksHtml(items) {
+  return items.map(c => `<div class="check ${c.s || 'pending'}"><span class="mark">${c.s === 'ok' ? '✓' : c.s === 'bad' ? '✕' : ''}</span><span>${esc(c.t)}</span></div>`).join('');
+}
+function fly(fromEl, toEl, label, done) {
+  if (!fromEl || !toEl || reduced) { done && done(); return; }
+  const a = fromEl.getBoundingClientRect(), b = toEl.getBoundingClientRect();
+  const el = document.createElement('span');
+  el.className = 'fly';
+  el.innerHTML = `<span class="sealdot"></span>${esc(label)}`;
+  el.style.left = a.left + 'px'; el.style.top = a.top + 'px';
+  document.body.appendChild(el);
+  requestAnimationFrame(() => {
+    el.style.transform = `translate(${b.left - a.left}px, ${b.top - a.top}px)`;
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); done && done(); }, 900);
+  });
+}
+function laneBusy(id) {
+  $$('.lane').forEach(l => l.classList.remove('busy'));
+  if (id) $(id).classList.add('busy');
 }
 
-$('addA').onclick = () => {
-  const item = items[itemIdx++ % items.length];
-  const op = { seq: st.A.ops.length + 1, item, h: hx(3) };
-  st.A.ops.push(op);
-  fly($('addA'), $('logA'), `op A:${op.seq}`, 'a');
-  slog(`A appended <b>op ${op.seq}</b> ("${item}") — local only until you sync`);
-  renderSim();
-};
-$('addB').onclick = () => {
-  const item = items[itemIdx++ % items.length];
-  const op = { seq: st.B.ops.length + 1, item, h: hx(3) };
-  st.B.ops.push(op);
-  fly($('addB'), $('logB'), `op B:${op.seq}`, 'b');
-  slog(`B appended <b>op ${op.seq}</b> ("${item}") — local only until you sync`);
-  renderSim();
-};
-$('syncA').onclick = async () => {
-  const pushed = st.A.ops.length - st.srv.A;
-  if (pushed > 0) {
-    fly($('colA'), $('colS'), `push ${pushed} op${pushed > 1 ? 's' : ''}`, 'a');
-    await new Promise(r => setTimeout(r, 850));
-    st.srv.A = st.A.ops.length;
-    renderSim();
-    slog(`A pushed ${pushed} op(s) — server verified sigs, heads A→${st.srv.A}`);
-  }
-  const pulled = st.srv.B - st.A.pulledB.length;
-  if (pulled > 0) {
-    fly($('colS'), $('colA'), `pull ${pulled} op${pulled > 1 ? 's' : ''}`, 'b');
-    await new Promise(r => setTimeout(r, 850));
-    st.A.pulledB = st.B.ops.slice(0, st.srv.B);
-    renderSim();
-    slog(`A pulled B's ops — verified + merged. <span class="hl">new items visible</span>`);
-  }
-  if (!pushed && !pulled) slog('A: nothing to do — heads already match');
-  renderSim();
-};
-$('syncB').onclick = async () => {
-  const pushed = st.B.ops.length - st.srv.B;
-  if (pushed > 0) {
-    fly($('colB'), $('colS'), `push ${pushed} op${pushed > 1 ? 's' : ''}`, 'b');
-    await new Promise(r => setTimeout(r, 850));
-    st.srv.B = st.B.ops.length;
-    renderSim();
-    slog(`B pushed ${pushed} op(s) — verified + stored`);
-  }
-  const pulled = st.srv.A - st.B.pulledA.length;
-  if (pulled > 0) {
-    fly($('colS'), $('colB'), `pull ${pulled} op${pulled > 1 ? 's' : ''}`, 'a');
-    await new Promise(r => setTimeout(r, 850));
-    st.B.pulledA = st.A.ops.slice(0, st.srv.A);
-    renderSim();
-    slog(`B pulled A's ops — <span class="hl">"${st.B.pulledA.at(-1).item}" appeared in B's vault</span>`);
-  }
-  if (!pushed && !pulled) slog('B: nothing to do — heads already match');
-  renderSim();
-};
-renderSim();
-
-/* ── pairing sequence ────────────────────────────────────── */
-const steps = [
-  { w: 'a', t: 'A runs `pair invite` → server mints a 15-min code', sA: 'sent invite', sS: 'invites[] +1' },
-  { w: 'b', t: 'B runs `pair join <url> <vault_id.code>` — sends {id, pubkey, name}', sB: 'keypair generated', sS: 'pending[] +1' },
-  { w: 's', t: 'server: code valid → queue B in pending, hand back the manifest', sB: 'has manifest + cfg(invite)' },
-  { w: 'b', t: 'B proves the password unwraps a slot (owner_vk matches) — still can\'t write ops', sB: 'password verified ✓' },
-  { w: 'a', t: 'A: `pair pending` shows B → `pair approve` re-signs manifest with B inside, pushes (CAS)', sA: 'signed manifest +B', sS: 'manifest now lists B ✓' },
-  { w: 'b', t: 'B: `pair finish` — server sees B in the manifest → mints device-bound read+write tokens, burns invite', sB: 'read+write tokens ✓' },
-  { w: 'b', t: 'B: first `sync` pulls every op → unlocks the full vault', sB: 'full vault, enrolled', sS: 'invite burned' },
-];
-const pl = document.getElementById('plines');
-steps.forEach((s, i) => {
-  const d = document.createElement('div');
-  d.className = 'pline';
-  d.innerHTML = `<span class="n">${i + 1}</span><span class="who ${s.w}">${{ a: 'owner A', b: 'device B', s: 'syncd' }[s.w]}</span><span>${s.t}</span>`;
-  pl.appendChild(d);
-});
-let pi = -1, playing = false;
-document.getElementById('pairPlay').onclick = () => {
-  if (playing) return;
-  playing = true; pi = -1;
-  pl.querySelectorAll('.pline').forEach(x => x.classList.remove('on', 'done'));
-  $('stA').innerHTML = '<span class="have">admin token · owner key</span>';
-  $('stB').innerHTML = '<span class="want">no vault yet</span>';
-  $('stS').innerHTML = '<span class="want">manifest · ops</span>';
-  const tick = () => {
-    pi++;
-    if (pi >= steps.length) { playing = false; return; }
-    pl.children[pi].classList.add('on');
-    if (pi > 0) pl.children[pi - 1].classList.replace('on', 'done');
-    const s = steps[pi];
-    if (s.sA) $('stA').innerHTML = `<span class="have">${s.sA}</span>`;
-    if (s.sB) $('stB').innerHTML = `<span class="have">${s.sB}</span>`;
-    if (s.sS) $('stS').innerHTML = `<span class="have">${s.sS}</span>`;
-    setTimeout(tick, 1900);
+/* ───────────── 3. two-device sync simulation ───────────── */
+{
+  const LAPTOP = 'a1f0c9e2', PHONE = '5e9d21ab';
+  // Every op that could exist in this story. Each device's view is computed
+  // from the SET of ops it holds, so convergence is demonstrated, not scripted.
+  const OPS = {
+    l1: { dev: LAPTOP, seq: 1, hlc: 101, bytes: 212, desc: 'create record', rec: 'github', name: 'GitHub', user: 'chus', pw: 'hunter2' },
+    l2: { dev: LAPTOP, seq: 2, hlc: 118, bytes: 220, desc: 'set username', rec: 'github', name: 'GitHub', user: 'chrischriscris', pw: 'hunter2' },
+    l3: { dev: LAPTOP, seq: 3, hlc: 140, bytes: 228, desc: 'rename', rec: 'github', name: 'GitHub (work)', user: 'chrischriscris', pw: 'hunter2' },
+    p1: { dev: PHONE,  seq: 1, hlc: 155, bytes: 236, desc: 'new password', rec: 'github', name: 'GitHub', user: 'chrischriscris', pw: 'kL9#vq2!Rz' },
   };
-  tick();
-};
+  const initial = () => ({
+    laptop: { own: ['l1', 'l2'], foreign: [] },
+    phone:  { own: [], foreign: ['l1', 'l2'] },
+    relay:  { laptop: ['l1', 'l2'], phone: [] },
+    http: 'idle', checks: [], fresh: new Set(), busy: null, banner: '',
+    order: { laptop: null, phone: null }, // explicit merge order for the replay demo
+  });
+  let S = initial();
+  let step = 0;
 
-/* ── views toggle ────────────────────────────────────────── */
-document.querySelectorAll('.vtoggle button').forEach(b => {
-  b.onclick = () => {
-    document.querySelectorAll('.vtoggle button').forEach(x => x.classList.remove('on'));
-    b.classList.add('on');
-    document.querySelectorAll('.view').forEach(v => v.classList.remove('on'));
-    $('v-' + b.dataset.v).classList.add('on');
+  // (hlc, origin_device, origin_seq) as a lexicographic tuple, like apply_pt
+  const later = (a, b) => a.hlc !== b.hlc ? a.hlc > b.hlc : a.dev !== b.dev ? a.dev > b.dev : a.seq >= b.seq;
+  const view = (ids, order) => {
+    // merge: per record, max (hlc, device, seq). Any application order gives
+    // the same answer; `order` only changes the narration.
+    const ops = (order || ids).map(k => OPS[k]);
+    const recs = {};
+    for (const op of ops) {
+      const e = recs[op.rec];
+      if (!e || later(op, e)) recs[op.rec] = op;
+    }
+    return recs;
   };
-});
+  const recordHtml = (recs, blind, flash) => Object.values(recs).map(r => `
+    <div class="record ${blind ? 'blind' : ''} ${flash ? 'flash' : ''}">
+      <div class="rname">${esc(r.name)}</div>
+      <dl><dt>user</dt><dd>${esc(r.user)}</dd><dt>password</dt><dd>${esc(r.pw)}</dd></dl>
+      <div class="origin">winning op: ${r.dev === LAPTOP ? 'MacBook' : 'iPhone'} seq ${r.seq}, hlc ${r.hlc}</div>
+    </div>`).join('') || '<div class="empty">no records</div>';
+
+  const logHtml = (holder, who, ids, blind) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'log';
+    wrap.innerHTML = `<div class="log-name"><span class="who" style="color:${who === LAPTOP ? 'var(--laptop)' : 'var(--phone)'}">ops/${who}….log</span><span>${ids.length} op${ids.length === 1 ? '' : 's'}</span></div><div class="frames"></div>`;
+    const fr = $('.frames', wrap);
+    if (!ids.length) fr.innerHTML = '<span class="empty">empty</span>';
+    ids.forEach(k => fr.appendChild(frameEl(OPS[k], { ct: blind, fresh: S.fresh.has(holder + k) })));
+    return wrap;
+  };
+
+  const render = (flash) => {
+    const blind = $('#sim-blind').checked;
+    for (const d of ['laptop', 'phone']) {
+      const me = d === 'laptop' ? LAPTOP : PHONE, other = d === 'laptop' ? PHONE : LAPTOP;
+      const all = [...S[d].own, ...S[d].foreign];
+      $('#rec-' + d).innerHTML = recordHtml(view(all, S.order[d]), blind, flash === d);
+      const logs = $('#logs-' + d); logs.innerHTML = '';
+      logs.appendChild(logHtml(d, me, S[d].own, blind));
+      logs.appendChild(logHtml(d, other, S[d].foreign, blind));
+    }
+    const rl = $('#logs-relay'); rl.innerHTML = '';
+    rl.appendChild(logHtml('relay', LAPTOP, S.relay.laptop, true));
+    rl.appendChild(logHtml('relay', PHONE, S.relay.phone, true));
+    $('#relay-http').innerHTML = S.http;
+    $('#relay-checks').innerHTML = checksHtml(S.checks);
+    $('#relay-manifest').innerHTML = `<span>manifest</span><b>snapshot_epoch 3</b><b>2 devices</b><b>sha256 9c41…e07a</b>`;
+    laneBusy(S.busy);
+    const b = $('#sim-banner'); b.textContent = S.banner; b.classList.toggle('show', !!S.banner);
+    $('#sim-back').disabled = step === 0;
+    $('#sim-next').disabled = step >= STEPS.length - 1;
+    $('#sim-ix').textContent = step === 0 ? 'start' : `step ${step} of ${STEPS.length - 1}`;
+    $('#sim-cap').innerHTML = STEPS[step].cap;
+    S.fresh.clear();
+  };
+
+  const STEPS = [
+    { cap: `<b>Where we start.</b> Both devices hold the same record, written by the MacBook in two ops. The iPhone has a byte-for-byte copy of the MacBook's log and an empty log of its own. The relay holds the two frames and the manifest, and nothing it can read.`,
+      run: () => {} },
+    { cap: `<b>The MacBook, offline, renames the record.</b> That is op 3 in its own log, hlc 140, sealed onto the hash of op 2. Nobody was asked. The iPhone knows nothing yet.`,
+      run: () => { S.laptop.own.push('l3'); S.fresh.add('laptopl3'); S.busy = '#lane-laptop'; }, flash: 'laptop' },
+    { cap: `<b>The iPhone, also offline, changes the password.</b> Its first ever op, seq 1, hlc 155. Both devices have now edited the same record without coordinating. Different seq spaces are what make that safe.`,
+      run: () => { S.phone.own.push('p1'); S.fresh.add('phonep1'); S.busy = '#lane-phone'; }, flash: 'phone' },
+    { cap: `<b>The MacBook runs sync. Move one: ask for state.</b> The relay answers with the manifest epoch and per-device heads. MacBook's head is 2, the iPhone has no ops there yet. Nothing foreign to pull.`,
+      run: () => { S.busy = '#lane-relay'; S.http = `<span class="m">GET</span> /state<br>{ snapshot_epoch: 3, heads: [{ ${LAPTOP}…: 2 }] }`; S.checks = [{ t: 'read scope on token', s: 'ok' }]; } },
+    { cap: `<b>Move three: push op 3.</b> One frame crosses. The relay runs its four checks and stores the bytes at (MacBook, 3). It has no idea this is a rename. Move four finds the manifest unchanged.`,
+      run: () => { S.busy = '#lane-relay'; S.http = `<span class="m">POST</span> /ops?device=${LAPTOP}…  (1 frame, 228 B)`;
+        S.checks = [
+          { t: 'write token is bound to this device', s: 'ok' },
+          { t: 'device is in the registry and active', s: 'ok' },
+          { t: 'ed25519 signature verifies against its public key', s: 'ok' },
+          { t: 'seq 3 = head 2 + 1, no gap, no equivocation', s: 'ok' },
+        ];
+        S.relay.laptop.push('l3'); S.fresh.add('relayl3'); },
+      fly: ['#logs-laptop .frame:nth-child(3)', '#logs-relay .frames', 'seq 3'] },
+    { cap: `<b>The iPhone runs sync. State says MacBook's head is 3</b> and it only holds 2, so it pulls <code>since=2</code>. One raw frame comes back and is appended to its copy of the MacBook log without being decoded. Then it merges: for this record, hlc 155 beats hlc 140, so <b>its own password change keeps the record</b> and the MacBook's rename loses. Newest whole record wins. Field-level merging and conflict copies are still on the M3 list.`,
+      run: () => { S.busy = '#lane-phone'; S.http = `<span class="m">GET</span> /state<br><span class="m">GET</span> /ops?device=${LAPTOP}…&amp;since=2&amp;limit=256<br>x-head: 3, x-more: 0`; S.checks = [{ t: 'read scope on token', s: 'ok' }];
+        S.phone.foreign.push('l3'); S.fresh.add('phonel3'); },
+      fly: ['#logs-relay .frame:nth-child(3)', '#logs-phone .log:nth-child(2) .frames', 'seq 3'], flash: 'phone' },
+    { cap: `<b>The iPhone pushes its op 1.</b> Same four checks, now against the iPhone's public key. The relay's copy of the vault is complete, and still entirely ciphertext.`,
+      run: () => { S.busy = '#lane-relay'; S.http = `<span class="m">POST</span> /ops?device=${PHONE}…  (1 frame, 236 B)`;
+        S.checks = [
+          { t: 'write token is bound to this device', s: 'ok' },
+          { t: 'device is in the registry and active', s: 'ok' },
+          { t: 'ed25519 signature verifies against its public key', s: 'ok' },
+          { t: 'seq 1 = head 0 + 1', s: 'ok' },
+        ];
+        S.relay.phone.push('p1'); S.fresh.add('relayp1'); },
+      fly: ['#logs-phone .log:first-child .frame', '#logs-relay .log:nth-child(2) .frames', 'seq 1'] },
+    { cap: `<b>The MacBook syncs again.</b> State shows the iPhone at head 1 and the MacBook holds 0 of it, so it pulls <code>since=0</code>, appends the frame, verifies the signature and the chain, decrypts, and runs the same comparison. Same answer: hlc 155 wins. <b>Both devices now show identical state</b>, and neither ever saw the other's plaintext pass through the relay.`,
+      run: () => { S.busy = '#lane-laptop'; S.http = `<span class="m">GET</span> /state<br><span class="m">GET</span> /ops?device=${PHONE}…&amp;since=0&amp;limit=256<br>x-head: 1, x-more: 0`; S.checks = [{ t: 'read scope on token', s: 'ok' }];
+        S.laptop.foreign.push('p1'); S.fresh.add('laptopp1'); S.banner = 'Converged. Both devices computed the same record from the same set of four ops.'; },
+      fly: ['#logs-relay .log:nth-child(2) .frame', '#logs-laptop .log:nth-child(2) .frames', 'seq 1'], flash: 'laptop' },
+    { cap: `<b>Replay, other order.</b> Suppose the MacBook had received the iPhone's op <em>before</em> writing its own rename. The comparison is a total order on (hlc, device, seq), so the record lands in exactly the same place. The merge depends on which ops exist, not on when they arrived. That is what lets sync run any time, twice, or after a week offline.`,
+      run: () => { S.busy = null; S.http = 'idle'; S.checks = []; S.order.laptop = ['l1', 'l2', 'p1', 'l3']; S.order.phone = ['p1', 'l1', 'l2', 'l3']; S.banner = 'Same four ops, applied in a different order on each device. Same record.'; },
+      flash: 'laptop' },
+  ];
+
+  const goto = (n, animate) => {
+    S = initial(); step = Math.max(0, Math.min(n, STEPS.length - 1));
+    for (let i = 1; i <= step; i++) {
+      const st = STEPS[i];
+      const isLast = i === step;
+      if (!isLast) { st.run(); S.fresh.clear(); }
+    }
+    const st = STEPS[step];
+    if (step > 0 && animate && st.fly) {
+      // measure source and target in the DOM as currently shown, then apply
+      const from = $(st.fly[0]), to = $(st.fly[1]);
+      st.run();
+      fly(from, to, st.fly[2], () => render(st.flash));
+    } else {
+      if (step > 0) st.run();
+      render(animate ? st.flash : null);
+    }
+  };
+  $('#sim-next').addEventListener('click', () => goto(step + 1, true));
+  $('#sim-back').addEventListener('click', () => goto(step - 1, false));
+  $('#sim-reset').addEventListener('click', () => goto(0, false));
+  $('#sim-blind').addEventListener('change', () => render());
+  goto(0, false);
+}
+
+/* ───────────── 6. pairing storyboard ───────────── */
+{
+  const CODE = 'KQ7M-4TXB', VID = '3fa2b8c1e94d07a6f21c5d8e3b0a19e0';
+  const tables = (inv, pend, tok, devs) => `<span>invites</span><b>${inv}</b><span>pending</span><b>${pend}</b><span>tokens</span><b>${tok}</b><span>manifest devices</span><b>${devs}</b>`;
+  const STEPS = [
+    { cap: `<b>Before.</b> The MacBook is enrolled and holds the admin token from bootstrap. The iPhone has the app installed and an empty vault directory. The manifest lists one device.`,
+      owner: { cmd: '', body: 'Enrolled. Registry: MacBook.' }, relay: { http: 'idle', checks: [], t: tables(0, 0, 3, 1) }, nw: { cmd: '', body: 'Nothing here yet. No keys, no vault.' }, busy: null },
+    { cap: `<b>The owner asks for an invite.</b> The relay mints an eight-character code, stores only its hash with a fifteen-minute expiry, and returns it. The CLI prints it prefixed with the vault id, because the relay needs the id to find the right Durable Object.`,
+      owner: { cmd: '$ mypassman pair invite', body: `invite: <span class="mono">${VID.slice(0,8)}…${VID.slice(-4)}.${CODE}</span><br>valid 900s. Carry it to the new device.` },
+      relay: { http: `<span class="m">POST</span> /enroll/invite  (admin)`, checks: [{ t: 'admin scope', s: 'ok' }, { t: 'fewer than 8 live invites', s: 'ok' }], t: tables(1, 0, 3, 1) }, nw: { cmd: '', body: 'Waiting.' }, busy: '#pl-owner' },
+    { cap: `<b>The iPhone joins.</b> It generates its own device key, keeps the private half in a 0600 file outside the vault, and submits its id, public key and a name under the invite code. The relay files that in the pending queue and hands back the current manifest. The phone uses the manifest to check the master password against the wrap slot locally, so a typo surfaces now, not after approval. It is <em>not</em> enrolled.`,
+      owner: { cmd: '', body: 'Unaware, so far.' },
+      relay: { http: `<span class="m">POST</span> /enroll/join  (invite code)<br>{ device: 5e9d21ab…, vk: 7c…, name: "iphone" }`, checks: [{ t: 'code hash found and not expired', s: 'ok' }, { t: 'fewer than 16 pending', s: 'ok' }], t: tables(1, 1, 3, 1) },
+      nw: { cmd: `$ mypassman pair join https://… ${VID.slice(0,8)}….${CODE} --name iphone`, body: 'Device key generated. Manifest written. Password confirmed against the wrap slot.<br>Waiting for the owner to approve.' }, busy: '#pl-new' },
+    { cap: `<b>The owner looks at who is knocking.</b> The queue shows the phone's name and the fingerprint of its public key. This is the moment to compare fingerprints out of band if you care to.`,
+      owner: { cmd: '$ mypassman pair pending', body: `<span class="mono">5e9d21ab…  iphone  vk 7c3e…a91f  2 min ago</span>` },
+      relay: { http: `<span class="m">GET</span> /enroll/pending  (admin)`, checks: [{ t: 'admin scope', s: 'ok' }], t: tables(1, 1, 3, 1) }, nw: { cmd: '', body: 'Waiting for the owner to approve.' }, busy: '#pl-owner' },
+    { cap: `<b>The phone is impatient.</b> Running finish before the owner has approved gets a 409. The relay's only test is whether the device is present and active in the owner-signed manifest it holds. No flag, no admin click, nothing the relay could fake.`,
+      owner: { cmd: '', body: 'Registry: MacBook. Looking at the queue.' },
+      relay: { http: `<span class="m">POST</span> /enroll/finish  (invite code)<br>→ 409 not approved yet`, checks: [{ t: 'code hash found and not expired', s: 'ok' }, { t: 'device present and active in signed manifest', s: 'bad' }], t: tables(1, 1, 3, 1) },
+      nw: { cmd: '$ mypassman pair finish', body: '<span style="color:var(--reject)">not approved yet. The enrolled device must sign you into the manifest.</span>' }, busy: '#pl-relay' },
+    { cap: `<b>Approval.</b> The MacBook unlocks, appends a device entry with the phone's id and public key to the manifest, signs the whole thing with the owner key, writes it locally, then pushes it with the relay's current hash as the CAS base. The relay checks the signature and the epochs and swaps. <b>That signature is the approval.</b> The pending table was not touched.`,
+      owner: { cmd: '$ mypassman pair approve 5e9d', body: 'Unlocked. Registry: MacBook, iPhone. Manifest re-signed and pushed.<br>Tell the phone to run <span class="mono">pair finish</span>.' },
+      relay: { http: `<span class="m">PUT</span> /manifest  (admin)<br>{ manifest: 40…, base_hash: 9c41…e07a }`, checks: [{ t: 'base_hash matches stored sha256', s: 'ok' }, { t: 'vault_id unchanged', s: 'ok' }, { t: 'owner signature verifies', s: 'ok' }, { t: 'key_epoch and snapshot_epoch did not decrease', s: 'ok' }], t: tables(1, 1, 3, 2) },
+      nw: { cmd: '', body: 'Waiting for the owner to approve.' }, busy: '#pl-owner' },
+    { cap: `<b>Finish, after approval.</b> The same check now passes. The relay mints a read token and a write token, both bound to the phone's device id, burns the invite and clears the queue row. The phone stores the tokens in place of the code.`,
+      owner: { cmd: '', body: 'Registry: MacBook, iPhone.' },
+      relay: { http: `<span class="m">POST</span> /enroll/finish  (invite code)<br>{ read: mpm_…_r, write: mpm_…_w, manifest }`, checks: [{ t: 'code hash found and not expired', s: 'ok' }, { t: 'device present and active in signed manifest', s: 'ok' }, { t: 'invite burned, pending row removed', s: 'ok' }], t: tables(0, 0, 5, 2) },
+      nw: { cmd: '$ mypassman pair finish', body: 'Paired. Tokens saved to <span class="mono">sync/3fa2….conf</span>.<br>Pulling ops.' }, busy: '#pl-new' },
+    { cap: `<b>First sync.</b> The phone pulls every foreign log from seq 0, verifies each frame against the registry it now trusts, and unlocks with the password it already proved. From here on it is an ordinary device: its own log, its own seq space, its own key.`,
+      owner: { cmd: '', body: 'Next sync will pull the phone\'s log as it appears.' },
+      relay: { http: `<span class="m">GET</span> /state<br><span class="m">GET</span> /ops?device=a1f0c9e2…&amp;since=0`, checks: [{ t: 'read scope (write token can read)', s: 'ok' }], t: tables(0, 0, 5, 2) },
+      nw: { cmd: '$ mypassman sync', body: 'synced: pulled 2 ops, pushed 0, manifest unchanged.' }, busy: '#pl-new' },
+  ];
+  let step = 0;
+  const render = () => {
+    const s = STEPS[step];
+    $('#pair-owner-cmd').innerHTML = s.owner.cmd ? esc(s.owner.cmd) : '<span style="color:var(--ink-3)">idle</span>';
+    $('#pair-owner-body').innerHTML = s.owner.body;
+    $('#pair-new-cmd').innerHTML = s.nw.cmd ? esc(s.nw.cmd) : '<span style="color:var(--ink-3)">idle</span>';
+    $('#pair-new-body').innerHTML = s.nw.body;
+    $('#pair-http').innerHTML = s.relay.http;
+    $('#pair-checks').innerHTML = checksHtml(s.relay.checks);
+    $('#pair-tables').innerHTML = s.relay.t;
+    $('#pair-ix').textContent = step === 0 ? 'start' : `step ${step} of ${STEPS.length - 1}`;
+    $('#pair-cap').innerHTML = s.cap;
+    $('#pair-back').disabled = step === 0;
+    $('#pair-next').disabled = step === STEPS.length - 1;
+    $$('#pairing .lane').forEach(l => l.classList.remove('busy'));
+    if (s.busy) $(s.busy).classList.add('busy');
+  };
+  $('#pair-next').addEventListener('click', () => { step = Math.min(step + 1, STEPS.length - 1); render(); });
+  $('#pair-back').addEventListener('click', () => { step = Math.max(step - 1, 0); render(); });
+  $('#pair-reset').addEventListener('click', () => { step = 0; render(); });
+  render();
+}
+
+/* ───────────── 7. daemon live-merge ───────────── */
+{
+  const LAPTOP = 'a1f0c9e2', PHONE = '5e9d21ab';
+  const mk = (seq, hlc) => ({ seq, hlc, desc: 'op', bytes: 220 });
+  const STEPS = [
+    { cap: `<b>Idle.</b> The daemon unlocked an hour ago. It remembers its own head, and for the iPhone's log, the count of ops it applied and the hash of the last one. The DEK is in memory and nowhere else.`,
+      mem: [['own head', 'seq 3'], ['iphone applied', '2 ops, tip 4b1e…'], ['manifest', 'epoch 3, 2 devices']], disk: { l: 3, p: 2, fresh: 0 }, req: 'No request yet.', hot: [] },
+    { cap: `<b>Sync runs as its own process</b> and appends two frames to the iPhone's log on disk. The daemon is asleep and was not notified. Nothing in its memory changed.`,
+      mem: [['own head', 'seq 3'], ['iphone applied', '2 ops, tip 4b1e…'], ['manifest', 'epoch 3, 2 devices']], disk: { l: 3, p: 4, fresh: 2 }, req: 'No request yet.', hot: [] },
+    { cap: `<b>A request arrives.</b> The browser extension asks for the GitHub login. Before answering, the daemon takes the vault lock and re-reads its <em>own</em> log first, in case a CLI invocation appended while it slept. Same device, same seq space, so this must never fork.`,
+      mem: [['own head', 'seq 3, unchanged'], ['iphone applied', '2 ops, tip 4b1e…'], ['manifest', 'epoch 3, 2 devices']], disk: { l: 3, p: 4, fresh: 0 }, req: '<b>get</b> record GitHub', hot: [0], reqHot: true },
+    { cap: `<b>Foreign logs exist, so reload the manifest.</b> A pairing or a revocation would have landed on disk as a new manifest. Same vault id, same owner key, same key epoch, snapshot epoch not lower: accepted. Any of those failing means the DEK in memory is stale and the daemon asks to be restarted.`,
+      mem: [['own head', 'seq 3'], ['iphone applied', '2 ops, tip 4b1e…'], ['manifest', 'epoch 3, 2 devices, reloaded']], disk: { l: 3, p: 4, fresh: 0 }, req: '<b>get</b> record GitHub', hot: [2], reqHot: true },
+    { cap: `<b>The iPhone's log is longer than remembered.</b> Four on disk, two applied. The daemon verifies just ops 3 and 4: signature against the registry, seq continuity from 3, and op 3's sealed prev_op_hash must equal the remembered tip 4b1e. Then it decrypts and merges them with the usual max-HLC rule.`,
+      mem: [['own head', 'seq 3'], ['iphone applied', '4 ops, tip 9d07…'], ['manifest', 'epoch 3, 2 devices']], disk: { l: 3, p: 4, fresh: 0, verifying: [3, 4] }, req: '<b>get</b> record GitHub', hot: [1], reqHot: true },
+    { cap: `<b>Answer.</b> The record returned reflects the iPhone's edits from a minute ago, and nobody typed a password. The next request repeats the whole check, which costs one stat and two reads when nothing changed.`,
+      mem: [['own head', 'seq 3'], ['iphone applied', '4 ops, tip 9d07…'], ['manifest', 'epoch 3, 2 devices']], disk: { l: 3, p: 4, fresh: 0 }, req: '<b>get</b> record GitHub<br><span style="color:var(--laptop)">200, includes iPhone op 4</span>', hot: [], reqHot: false },
+    { cap: `<b>What if the log had shrunk?</b> Say the file on disk shows one op where the daemon applied four. That is not a state sync can produce, so the daemon refuses every request until restarted rather than silently forget ops. Same posture as a chain that fails to link.`,
+      mem: [['own head', 'seq 3'], ['iphone applied', '4 ops, tip 9d07…'], ['error', 'foreign log shrank under the daemon. Restart it.']], disk: { l: 3, p: 1, fresh: 0 }, req: '<b>get</b> record GitHub<br><span style="color:var(--reject)">refused</span>', hot: [], warn: 2, reqHot: true },
+  ];
+  let step = 0;
+  const render = () => {
+    const s = STEPS[step];
+    $('#dm-mem').innerHTML = s.mem.map((r, i) => `<div class="memrow ${s.hot.includes(i) ? 'hot' : ''} ${s.warn === i ? 'warn' : ''}"><span class="k">${esc(r[0])}</span><span>${esc(r[1])}</span></div>`).join('');
+    const disk = $('#dm-disk'); disk.innerHTML = '';
+    for (const [who, n, c] of [[LAPTOP, s.disk.l, 'var(--laptop)'], [PHONE, s.disk.p, 'var(--phone)']]) {
+      const w = document.createElement('div'); w.className = 'log';
+      w.innerHTML = `<div class="log-name"><span class="who" style="color:${c}">ops/${who}….log</span><span>${n} op${n === 1 ? '' : 's'}</span></div><div class="frames"></div>`;
+      const fr = $('.frames', w);
+      for (let i = 1; i <= n; i++) {
+        const fresh = who === PHONE && s.disk.fresh && i > n - s.disk.fresh;
+        const el = frameEl(mk(i, 100 + i * 7), { ct: true, fresh });
+        if (s.disk.verifying && who === PHONE && s.disk.verifying.includes(i)) el.style.outline = '2px solid var(--seal)';
+        fr.appendChild(el);
+      }
+      disk.appendChild(w);
+    }
+    const rq = $('#dm-req'); rq.innerHTML = s.req; rq.classList.toggle('hot', !!s.reqHot);
+    $('#dm-ix').textContent = step === 0 ? 'start' : `step ${step} of ${STEPS.length - 1}`;
+    $('#dm-cap').innerHTML = s.cap;
+    $('#dm-next').disabled = step === STEPS.length - 1;
+  };
+  $('#dm-next').addEventListener('click', () => { step = Math.min(step + 1, STEPS.length - 1); render(); });
+  $('#dm-reset').addEventListener('click', () => { step = 0; render(); });
+  render();
+}
+
+/* ───────────── 8. attack panel ───────────── */
+{
+  const A = [
+    { k: 'read', label: 'Read a password', v: ['blocked', 'Nothing to read'],
+      body: `<p>Every op body is XChaCha20-Poly1305 ciphertext under the vault's data key, which exists only inside unlocked devices. The record fields inside are encrypted a second time with a per-record key. The manifest's wrap slots are Argon2id-wrapped, and the relay never sees a password proof.</p><p>Record ids, timestamps and op types are all inside the ciphertext, so the relay can't even tell which ops touch the same record.</p>`,
+      checks: [{ t: 'plaintext anywhere in storage', s: 'bad' }], where: 'wire.ts parseOpFrames: header only. vault.ts appendOps stores f.raw.' },
+    { k: 'forge', label: 'Forge an op', v: ['blocked', 'Signature fails'],
+      body: `<p>A frame must carry an ed25519 signature over its seq, nonce and ciphertext, made with the private key of a device listed in the manifest. The relay holds only public keys. Even a compromised relay with every token can't manufacture a frame that any client will accept, and clients verify independently, never trusting the relay's own check.</p><p>Bonus: the ciphertext's additional data binds the vault id, key epoch, device id and seq, so a genuine frame can't be replayed into another slot or another vault either.</p>`,
+      checks: [{ t: 'ed25519 signature verifies against registry key', s: 'bad' }], where: 'wire.ts opSigVerify · core Op::open on the client' },
+    { k: 'reorder', label: 'Reorder or drop ops in the middle', v: ['blocked', 'Chain breaks'],
+      body: `<p>Seq numbers are checked for continuity on push, so a gap can't be stored. And each op seals the hash of its predecessor inside the ciphertext, which the client checks on every frame it merges. Swap two frames, or remove one, and the next frame's prev_op_hash no longer matches. The client stops at the break and refuses that log.</p>`,
+      checks: [{ t: 'seq == head + 1 on append', s: 'ok' }, { t: 'prev_op_hash links to previous frame (client)', s: 'bad' }], where: 'vault.ts appendOps · core verify_foreign_from' },
+    { k: 'equiv', label: 'Serve two versions of the same op', v: ['blocked', 'Equivocation'],
+      body: `<p>If a push carries a seq the relay already has, the bytes must be identical, otherwise it is refused as equivocation. A relay that itself serves different bytes to different devices is caught the same way: the two devices' copies of that log diverge at a seq, and their prev_op_hash chains stop agreeing at the next frame.</p>`,
+      checks: [{ t: 'same seq, identical bytes: idempotent replay', s: 'ok' }, { t: 'same seq, different bytes', s: 'bad' }], where: 'vault.ts appendOps eqBytes' },
+    { k: 'rollback', label: 'Roll back the manifest', v: ['blocked', 'Epochs only go up'],
+      body: `<p>The relay refuses any manifest whose key epoch or snapshot epoch is lower than the one stored, and every replacement needs the current sha256 as a CAS base. A compromised relay could of course serve an older manifest it kept. The client compares epochs before adopting anything, keeps its own copy when it is ahead, and treats local retention as authoritative. The epoch is also printed in the recovery kit and UI so a human can spot a stale server.</p>`,
+      checks: [{ t: 'owner signature verifies', s: 'ok' }, { t: 'key_epoch or snapshot_epoch decreased', s: 'bad' }, { t: 'base_hash matches stored sha256', s: 'ok' }], where: 'vault.ts putManifest · sync.rs manifest reconcile' },
+    { k: 'enroll', label: 'Enroll a device of its own', v: ['blocked', 'Needs the owner key'],
+      body: `<p>Membership is the device registry inside the owner-signed manifest. The relay can add rows to its pending table all day, but a device only becomes trusted when a manifest carrying its public key is signed by the owner key, which rides inside the wrap slots and is only ever unwrapped on an unlocked device. Clients verify every foreign frame against <em>their</em> copy of the registry, not the relay's word.</p>`,
+      checks: [{ t: 'device in owner-signed manifest', s: 'bad' }], where: 'vault.ts enrollFinish · core verify_foreign_from NotEnrolled' },
+    { k: 'meta', label: 'Watch the traffic', v: ['leaks', 'Metadata, yes'],
+      body: `<p>This is what the relay does learn. Which device ids exist, how many ops each has written, how large each frame is, and when syncs happen. From timing it can guess when you are at your laptop versus your phone. It can't tell what changed, which record, or even whether two ops touch the same record.</p><p>Tokens are stored hashed, so a database dump doesn't yield working credentials either.</p>`,
+      checks: [{ t: 'device ids and per-device op counts', s: 'ok' }, { t: 'frame sizes and sync timing', s: 'ok' }, { t: 'record ids, op types, contents', s: 'bad' }], where: 'inherent to a relay' },
+    { k: 'withhold', label: 'Withhold new ops', v: ['limit', 'Delay is possible'],
+      body: `<p>A relay can refuse to serve, or serve an old but valid head. That is a denial of service, and it is a fundamental limit of any single relay. What the design does is make it detectable: per-device heads are signed into snapshots, epochs are monotonic and pinned client-side, and gossip vectors between devices are on the M3 list so two devices that meet directly can tell that the relay is holding back.</p>`,
+      checks: [{ t: 'prevented', s: 'bad' }, { t: 'detectable via epochs and device liveness', s: 'ok' }], where: 'DESIGN.md: rollback and starvation detection' },
+  ];
+  const list = $('#attack-list'), out = $('#attack-out');
+  let cur = 'read';
+  const render = () => {
+    list.innerHTML = A.map(a => `<button role="tab" class="${a.k === cur ? 'on' : ''}" data-k="${a.k}">${esc(a.label)}</button>`).join('');
+    const a = A.find(x => x.k === cur);
+    out.innerHTML = `<h4>${esc(a.label)}</h4><span class="verdict ${a.v[0]}">${esc(a.v[1])}</span>${a.body}<div class="checks">${checksHtml(a.checks)}</div><div class="where">${esc(a.where)}</div>`;
+    $$('button', list).forEach(b => b.addEventListener('click', () => { cur = b.dataset.k; render(); }));
+  };
+  render();
+}
+})();
 </script>
 </body>
 </html>

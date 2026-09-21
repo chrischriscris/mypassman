@@ -245,7 +245,11 @@ enum SyncCmd {
 enum PairCmd {
     /// Mint a short-lived invite for a new device (owner side).
     /// Prints <vault_id>.<code> — the vault id routes the join request.
-    Invite,
+    Invite {
+        /// also print a QR encoding `mpm://pair?server=…&invite=…`
+        #[arg(long)]
+        qr: bool,
+    },
     /// List devices waiting for approval
     Pending,
     /// Approve a pending device (id prefix) — re-signs and pushes the manifest
@@ -2758,7 +2762,7 @@ fn main() {
             None => sync::cmd_sync(&dir),
         },
         Cmd::Pair { sub } => match sub {
-            PairCmd::Invite => sync::cmd_pair_invite(&dir),
+            PairCmd::Invite { qr } => sync::cmd_pair_invite(&dir, *qr),
             PairCmd::Pending => sync::cmd_pair_pending(&dir),
             PairCmd::Approve { device } => sync::cmd_pair_approve(&dir, rec, device),
             PairCmd::Decline { device } => sync::cmd_pair_decline(&dir, device),

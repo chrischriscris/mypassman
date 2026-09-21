@@ -60,16 +60,17 @@ fn sock_dir() -> Result<PathBuf, String> {
     Ok(base.join("mypassman").join("sock"))
 }
 
-/// Socket for a vault: needs vault_id from the manifest (cheap read — the
-/// id is inside the signed body but we only use it as a filename here).
+/// Socket for a vault dir: keyed by the canonical path, not vault_id —
+/// two dirs can hold the same vault (two devices on one machine) and must
+/// NOT share a daemon: each dir signs ops as its own device, so routing
+/// dir B to dir A's daemon would silently attribute B's writes to A.
 #[cfg(unix)]
 fn sock_path(dir: &Path) -> Option<PathBuf> {
-    let m = mpm_store::load_manifest(dir).ok()?;
-    Some(
-        sock_dir()
-            .ok()?
-            .join(format!("{}.sock", mpm_store::hex(&m.vault_id))),
-    )
+    let canon = std::fs::canonicalize(dir).ok()?;
+    let key = blake3::hash(canon.to_string_lossy().as_bytes()).to_hex();
+    // sun_path is ~104 bytes on unix — keep the name short like the old
+    // vault_id-based one (128-bit tag is plenty to avoid collisions).
+    Some(sock_dir().ok()?.join(format!("{}.sock", &key[..32])))
 }
 
 // ── framing ──────────────────────────────────────────────────────────
@@ -213,6 +214,21 @@ pub fn run(dir: &Path, rec: bool, idle_ttl: u64) -> Result<(), String> {
         if let Some(tip) = lr.ops.last() {
             foreign.insert(dev, (lr.ops.len() as u64, tip.hash()));
         }
+    }
+    // background sync: opportunistic ciphertext exchange — never needs the
+    // unlocked vault (sync transports ciphertext only), so it runs while we
+    // serve. Pulled foreign ops land on disk and merge into the index on
+    // the next request via refresh_foreign. MPM_SYNC_EVERY=0 disables.
+    {
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(sync_interval()));
+            if let Err(e) = crate::sync::cmd_sync(&dir) {
+                if !e.contains("no sync config") {
+                    eprintln!("daemon: background sync: {e}");
+                }
+            }
+        });
     }
     let mut last = Instant::now();
     let ttl = Duration::from_secs(idle_ttl);
@@ -800,4 +816,13 @@ pub fn lock(dir: &Path) -> Result<bool, String> {
 /// Is a daemon answering PING for this vault?
 pub fn alive(dir: &Path) -> bool {
     matches!(call(dir, OP_PING, &[]), Ok(Some(_)))
+}
+
+/// Background sync period (seconds). `MPM_SYNC_EVERY` overrides; 0 disables.
+#[cfg(unix)]
+fn sync_interval() -> u64 {
+    std::env::var("MPM_SYNC_EVERY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300)
 }

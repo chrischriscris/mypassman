@@ -175,13 +175,18 @@ export class VaultSync extends DurableObject<Env> {
 
   // ── RPC surface ────────────────────────────────────────────────────
 
-  /** First manifest write. Worker already authenticated via SETUP_KEY. */
-  async bootstrap(manifest: ArrayBuffer): Promise<{ token: string }> {
+  /** First manifest write. Worker already authenticated via SETUP_KEY.
+   *  `vaultId` is the DO's name — the manifest's embedded vault_id must
+   *  match it so a bootstrap can't land under the wrong vault. */
+  async bootstrap(vaultId: string, manifest: ArrayBuffer): Promise<{ token: string }> {
     if (manifest.byteLength > 64 * 1024) throw http(413, "manifest too large");
     if (this.manifestBytes()) throw http(409, "vault already exists");
     const info = parseManifest(new Uint8Array(manifest));
     if (!(await verifyManifest(new Uint8Array(manifest), info))) {
       throw http(400, "manifest self-signature invalid");
+    }
+    if (hex(info.vaultId) !== vaultId.toLowerCase()) {
+      throw http(400, "manifest vault_id does not match the path");
     }
     this.ctx.storage.transactionSync(() => {
       this.sql.exec(`INSERT INTO meta (k, v) VALUES ('manifest', ?)`, manifest);
@@ -214,6 +219,11 @@ export class VaultSync extends DurableObject<Env> {
     const info = parseManifest(new Uint8Array(manifest));
     const cur = this.requireManifest();
     if (hex(info.vaultId) !== hex(cur.vaultId)) throw http(400, "vault_id mismatch");
+    // the self-signature proves nothing without pinning — an admin token
+    // holder could otherwise push a manifest signed by *their* key
+    if (hex(info.ownerVk) !== hex(cur.ownerVk)) {
+      throw http(400, "owner key mismatch — owner keys do not rotate");
+    }
     if (!(await verifyManifest(new Uint8Array(manifest), info))) {
       throw http(400, "manifest signature invalid");
     }
@@ -359,6 +369,10 @@ export class VaultSync extends DurableObject<Env> {
   ): Promise<{ token: string }> {
     await this.authorize(auth, "admin");
     if (!["read", "write", "admin"].includes(scope)) throw http(400, "bad scope");
+    if (device !== null) {
+      if (!/^[0-9a-f]{32}$/i.test(device)) throw http(400, "bad device id");
+      device = device.toLowerCase();
+    }
     return { token: await this.mintToken(scope, device, ttlS) };
   }
 
@@ -438,8 +452,12 @@ export class VaultSync extends DurableObject<Env> {
   }
 
   /** The code → tokens exchange. Approval is NOT a server flag — it's the
-   *  device appearing in the owner-signed manifest. The new device gets
-   *  read + write tokens bound to its id; the invite is burned. */
+   *  device appearing in the owner-signed manifest — AND the code only
+   *  redeems for the device that joined under it: finish requires a
+   *  pending row whose vk matches the approved registry vk. Without that
+   *  check an invite holder could mint tokens bound to any already-active
+   *  device. The new device gets read + write tokens bound to its id; the
+   *  invite is burned. */
   async enrollFinish(
     code: string | null,
     deviceId: string,
@@ -450,6 +468,15 @@ export class VaultSync extends DurableObject<Env> {
     const entry = m.devices.find((d) => hex(d.id) === dev);
     if (!entry || !entry.active) {
       throw http(409, "not approved yet — the enrolled device must sign you into the manifest");
+    }
+    const pend = this.sql
+      .exec<{ vk: ArrayBuffer }>(`SELECT vk FROM pending WHERE device = ?`, dev)
+      .toArray()[0];
+    if (!pend) {
+      throw http(409, "no pending join for this device — re-run pair join under a fresh invite");
+    }
+    if (hex(VaultSync.bytes(pend.vk)) !== hex(entry.vk)) {
+      throw http(409, "pending key does not match the approved registry key");
     }
     const read = await this.mintToken("read", dev, null);
     const write = await this.mintToken("write", dev, null);

@@ -65,8 +65,25 @@ pub struct VaultStore {
 }
 
 impl VaultStore {
-    pub fn open(path: &std::path::Path) -> rusqlite::Result<Self> {
-        let conn = Connection::open(path)?;
+    /// `create` is for bootstrap only — callers pass false for every other
+    /// route so a request for a nonexistent vault can't mint a db file.
+    /// New db files are chmod 0600: the manifest inside carries wrap slots.
+    pub fn open(path: &std::path::Path, create: bool) -> rusqlite::Result<Self> {
+        let existed = path.exists();
+        let conn = if create {
+            Connection::open(path)?
+        } else {
+            Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?
+        };
+        #[cfg(unix)]
+        if create && !existed {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000i64)?;
         conn.execute_batch(
@@ -163,35 +180,49 @@ impl VaultStore {
         Ok(hash)
     }
 
-    fn mint_token(&self, scope: Scope, device: Option<&str>, ttl_s: Option<i64>) -> VResult<String> {
-        let count: i64 = self
-            .conn
+    fn mint_token(
+        &self,
+        scope: Scope,
+        device: Option<&str>,
+        ttl_s: Option<i64>,
+    ) -> VResult<String> {
+        Self::mint_token_on(&self.conn, scope, device, ttl_s)
+    }
+
+    fn mint_token_on(
+        conn: &Connection,
+        scope: Scope,
+        device: Option<&str>,
+        ttl_s: Option<i64>,
+    ) -> VResult<String> {
+        let count: i64 = conn
             .query_row("SELECT count(*) FROM tokens", [], |r| r.get(0))
             .map_err(|_| Ve(500, "db".into()))?;
         if count >= MAX_TOKENS {
             return ve(429, "token cap reached");
         }
         let token = format!("{}_{}", new_token(), scope.as_str().as_bytes()[0] as char);
-        let expires = ttl_s.map(|t| now_s() + t);
-        self.conn
-            .execute(
-                "INSERT INTO tokens (hash, scope, device, created, expires) VALUES (?1,?2,?3,?4,?5)",
-                params![
-                    sha256_hex(token.as_bytes()),
-                    scope.as_str(),
-                    device,
-                    now_s(),
-                    expires
-                ],
-            )
-            .map_err(|_| Ve(500, "db".into()))?;
+        let expires = ttl_s.map(|t| now_s().saturating_add(t));
+        conn.execute(
+            "INSERT INTO tokens (hash, scope, device, created, expires) VALUES (?1,?2,?3,?4,?5)",
+            params![
+                sha256_hex(token.as_bytes()),
+                scope.as_str(),
+                device,
+                now_s(),
+                expires
+            ],
+        )
+        .map_err(|_| Ve(500, "db".into()))?;
         Ok(token)
     }
 
     // ── bootstrap / manifest ──────────────────────────────────────────
 
     /// First manifest write. Router already authenticated via setup key.
-    pub fn bootstrap(&self, manifest: &[u8]) -> VResult<String> {
+    /// `vault_id` is the path id — the manifest's embedded vault_id must
+    /// match it so a bootstrap can't land under the wrong vault.
+    pub fn bootstrap(&self, vault_id: &str, manifest: &[u8]) -> VResult<String> {
         if manifest.len() > MAX_MANIFEST {
             return ve(413, "manifest too large");
         }
@@ -199,14 +230,23 @@ impl VaultStore {
             return ve(409, "vault already exists");
         }
         // from_file parses AND verifies the owner self-signature
-        Manifest::from_file(manifest).map_err(|_| ve_err(400, "manifest self-signature invalid"))?;
-        self.conn
-            .execute(
-                "INSERT INTO meta (k, v) VALUES ('manifest', ?1)",
-                params![manifest],
-            )
+        let m = Manifest::from_file(manifest)
+            .map_err(|_| ve_err(400, "manifest self-signature invalid"))?;
+        if hex(&m.vault_id) != vault_id.to_ascii_lowercase() {
+            return ve(400, "manifest vault_id does not match the path");
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
             .map_err(|_| Ve(500, "db".into()))?;
-        self.mint_token(Scope::Admin, None, None)
+        tx.execute(
+            "INSERT INTO meta (k, v) VALUES ('manifest', ?1)",
+            params![manifest],
+        )
+        .map_err(|_| Ve(500, "db".into()))?;
+        let token = Self::mint_token_on(&tx, Scope::Admin, None, None)?;
+        tx.commit().map_err(|_| Ve(500, "db".into()))?;
+        Ok(token)
     }
 
     fn manifest_bytes(&self) -> VResult<Option<Vec<u8>>> {
@@ -249,14 +289,16 @@ impl VaultStore {
         if m.vault_id != cur.vault_id {
             return ve(400, "vault_id mismatch");
         }
+        // the self-signature proves nothing without pinning — an admin token
+        // holder could otherwise push a manifest signed by *their* key
+        if m.owner_vk != cur.owner_vk {
+            return ve(400, "owner key mismatch — owner keys do not rotate");
+        }
         if m.key_epoch < cur.key_epoch || m.snapshot_epoch < cur.snapshot_epoch {
             return ve(409, "epoch regression — refusing older manifest");
         }
         self.conn
-            .execute(
-                "UPDATE meta SET v = ?1 WHERE k = 'manifest'",
-                params![body],
-            )
+            .execute("UPDATE meta SET v = ?1 WHERE k = 'manifest'", params![body])
             .map_err(|_| Ve(500, "db".into()))?;
         Ok(m.snapshot_epoch)
     }
@@ -348,21 +390,24 @@ impl VaultStore {
             return ve(403, "device revoked");
         }
 
-        // decode + sig-verify all frames BEFORE opening the txn
-        let mut frames: Vec<(u64, &[u8])> = Vec::new();
+        // decode all frames first (cheap), cap the batch BEFORE paying
+        // for signature verification — matches the TS backend's order
+        let mut frames: Vec<(mpm_core::Op, &[u8])> = Vec::new();
         let mut rest = body;
         while !rest.is_empty() {
             let (op, n) = mpm_core::Op::decode(rest).map_err(|e| Ve(400, format!("op: {e}")))?;
+            frames.push((op, &rest[..n]));
+            if frames.len() > MAX_OPS_BATCH {
+                return ve(413, "too many ops in batch");
+            }
+            rest = &rest[n..];
+        }
+        for (op, _) in &frames {
             let pre = mpm_core::aad::op_sig_preimage(op.seq, &op.nonce, &op.ct);
             let sig = ed25519_dalek::Signature::from_bytes(&op.sig);
             if mpm_crypto::keys::verify(&entry.vk, &pre, &sig).is_err() {
                 return ve(403, format!("op {}: bad device signature", op.seq));
             }
-            frames.push((op.seq, &rest[..n]));
-            rest = &rest[n..];
-        }
-        if frames.len() > MAX_OPS_BATCH {
-            return ve(413, "too many ops in batch");
         }
 
         let tx = self
@@ -377,12 +422,13 @@ impl VaultStore {
             )
             .map_err(|_| Ve(500, "db".into()))?
             .unwrap_or(0) as u64;
-        for (seq, raw) in &frames {
-            if *seq <= head {
+        for (op, raw) in &frames {
+            let seq = op.seq;
+            if seq <= head {
                 let cur: Option<Vec<u8>> = tx
                     .query_row(
                         "SELECT body FROM ops WHERE device = ?1 AND seq = ?2",
-                        params![dev, *seq as i64],
+                        params![dev, seq as i64],
                         |r| r.get(0),
                     )
                     .optional()
@@ -397,15 +443,15 @@ impl VaultStore {
                     }
                 }
             }
-            if *seq != head + 1 {
+            if seq != head + 1 {
                 return ve(409, format!("op {seq}: gap — expected {}", head + 1));
             }
             tx.execute(
                 "INSERT INTO ops (device, seq, body) VALUES (?1,?2,?3)",
-                params![dev, *seq as i64, *raw],
+                params![dev, seq as i64, *raw],
             )
             .map_err(|_| Ve(500, "db".into()))?;
-            head = *seq;
+            head = seq;
         }
         tx.commit().map_err(|_| Ve(500, "db".into()))?;
         Ok(head)
@@ -480,7 +526,16 @@ impl VaultStore {
     ) -> VResult<String> {
         self.authorize(bearer, Scope::Admin, None)?;
         let scope = Scope::from_str(scope).ok_or(Ve(400, "bad scope".into()))?;
-        self.mint_token(scope, device, ttl_s)
+        let device = match device {
+            Some(d) => {
+                if !valid_dev(d) {
+                    return ve(400, "bad device id");
+                }
+                Some(d.to_ascii_lowercase())
+            }
+            None => None,
+        };
+        self.mint_token(scope, device.as_deref(), ttl_s)
     }
 
     /// Revocation companion: drop every token bound to a device. The real
@@ -542,7 +597,7 @@ impl VaultStore {
         if vk.len() != 32 {
             return ve(400, "bad vk");
         }
-        if name.is_empty() || name.len() > 64 {
+        if name.is_empty() || name.chars().count() > 64 {
             return ve(400, "bad device name");
         }
         let dev = device_id.to_ascii_lowercase();
@@ -619,16 +674,48 @@ impl VaultStore {
         let entry = m.devices.iter().find(|d| hex(&d.id) == dev);
         match entry {
             Some(e) if e.active => {}
-            _ => return ve(409, "not approved yet — the enrolled device must sign you into the manifest"),
+            _ => {
+                return ve(
+                    409,
+                    "not approved yet — the enrolled device must sign you into the manifest",
+                )
+            }
         }
-        let read = self.mint_token(Scope::Read, Some(&dev), None)?;
-        let write = self.mint_token(Scope::Write, Some(&dev), None)?;
-        self.conn
-            .execute("DELETE FROM invites WHERE hash = ?1", params![hash])
+        // the code redeems only for the device that joined under it: a
+        // pending row must exist and its vk must be the one the owner
+        // signed into the registry. Otherwise an invite holder could mint
+        // tokens bound to any already-active device.
+        let entry_vk = entry.unwrap().vk;
+        let pending_vk: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT vk FROM pending WHERE device = ?1",
+                params![dev],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|_| Ve(500, "db".into()))?;
+        match pending_vk {
+            Some(vk) if vk == entry_vk => {}
+            Some(_) => return ve(409, "pending key does not match the approved registry key"),
+            None => {
+                return ve(
+                    409,
+                    "no pending join for this device — re-run pair join under a fresh invite",
+                )
+            }
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|_| Ve(500, "db".into()))?;
+        let read = Self::mint_token_on(&tx, Scope::Read, Some(&dev), None)?;
+        let write = Self::mint_token_on(&tx, Scope::Write, Some(&dev), None)?;
+        tx.execute("DELETE FROM invites WHERE hash = ?1", params![hash])
             .ok();
-        self.conn
-            .execute("DELETE FROM pending WHERE device = ?1", params![dev])
+        tx.execute("DELETE FROM pending WHERE device = ?1", params![dev])
             .ok();
+        tx.commit().map_err(|_| Ve(500, "db".into()))?;
         Ok((read, write, bytes, m.snapshot_epoch))
     }
 }
@@ -643,7 +730,7 @@ pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 pub fn unhex(s: &str) -> Result<Vec<u8>, ()> {
-    if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(());
     }
     Ok((0..s.len())
@@ -665,6 +752,9 @@ fn new_code() -> String {
     const A: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let mut r = [0u8; 8];
     rand_core::OsRng.fill_bytes(&mut r);
-    let s: String = r.iter().map(|b| A[(*b as usize) % A.len()] as char).collect();
+    let s: String = r
+        .iter()
+        .map(|b| A[(*b as usize) % A.len()] as char)
+        .collect();
     format!("{}-{}", &s[..4], &s[4..])
 }

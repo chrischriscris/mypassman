@@ -532,7 +532,7 @@ fn append_frames(dir: &Path, device: &[u8; 16], frames: &[u8]) -> Result<(), Str
 // ── pairing ─────────────────────────────────────────────────────────
 
 /// `mypassman pair invite` — owner mints a short-lived enrollment code.
-pub fn cmd_pair_invite(dir: &Path) -> Result<(), String> {
+pub fn cmd_pair_invite(dir: &Path, qr: bool) -> Result<(), String> {
     let m = mpm_store::load_manifest(dir).map_err(|e| e.to_string())?;
     let cfg = load_cfg(&m.vault_id)?.ok_or("no sync config — run `mypassman sync init`")?;
     let admin = cfg
@@ -550,13 +550,41 @@ pub fn cmd_pair_invite(dir: &Path) -> Result<(), String> {
     let v = json(&r.body)?;
     // invite = vault_id.code — the code alone can't route (the vault_id
     // selects which Durable Object holds it)
-    println!("{}.{}", mpm_store::hex(&m.vault_id), jstr(&v, "code")?);
+    let invite = format!("{}.{}", mpm_store::hex(&m.vault_id), jstr(&v, "code")?);
+    println!("{invite}");
+    if qr {
+        // deep link for phone apps: mpm://pair?server=<url>&invite=<v>.<c>
+        let link = format!(
+            "mpm://pair?server={}&invite={}",
+            pct_encode(&cfg.url),
+            invite
+        );
+        let code = qrcode::QrCode::new(link.as_bytes()).map_err(|e| format!("qr: {e}"))?;
+        eprintln!(
+            "{}",
+            code.render::<qrcode::render::unicode::Dense1x2>()
+                .quiet_zone(true)
+                .build()
+        );
+    }
     eprintln!(
         "valid {}s — on the new device: `mypassman pair join {} <invite>`",
         jnum(&v, "ttl_s")?,
         cfg.url
     );
     Ok(())
+}
+
+/// Minimal percent-encoding for the server URL inside the mpm:// link.
+fn pct_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// `mypassman pair pending` — list devices waiting for approval.

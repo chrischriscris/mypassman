@@ -23,13 +23,28 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use vault::{unhex, Ve, VaultStore};
+use vault::{unhex, VaultStore, Ve};
 
 struct AppState {
     dir: PathBuf,
     setup_key: Option<String>,
     /// One lock per vault id — DO-style serialization of vault requests.
-    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Weak refs so per-vault mutexes don't pin memory forever; dead
+    /// entries are pruned once the map grows past 4096.
+    locks: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+}
+
+fn sha256_raw(b: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    let d = sha2::Sha256::digest(b);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&d);
+    out
+}
+
+/// Constant-time equality for fixed-size digests — no early exit.
+fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 struct ApiErr(Ve);
@@ -54,46 +69,68 @@ fn err<T>(status: u16, msg: impl Into<String>) -> R<T> {
 
 fn bearer(h: &HeaderMap) -> Option<String> {
     let v = h.get(header::AUTHORIZATION)?.to_str().ok()?;
-    (v.len() >= 7 && v[..7].eq_ignore_ascii_case("bearer "))
-        .then(|| v[7..].trim().to_string())
+    (v.len() >= 7 && v[..7].eq_ignore_ascii_case("bearer ")).then(|| v[7..].trim().to_string())
 }
 
 impl AppState {
-    /// Validate the vault id and serialize all work for that vault.
+    /// Validate the vault id, serialize all work for that vault, and run
+    /// the (blocking) store call on the blocking pool. `create` is for
+    /// bootstrap only — every other route 404s on a vault file that
+    /// doesn't exist, so unauthenticated requests can't mint databases
+    /// or grow the lock map.
     async fn with_vault<T>(
         &self,
         vault_id: &str,
-        f: impl FnOnce(&VaultStore) -> Result<T, Ve>,
-    ) -> R<T> {
+        create: bool,
+        f: impl FnOnce(&VaultStore) -> Result<T, Ve> + Send + 'static,
+    ) -> R<T>
+    where
+        T: Send + 'static,
+    {
         if vault_id.len() != 32 || !vault_id.bytes().all(|b| b.is_ascii_hexdigit()) {
             return err(404, "not found");
         }
         let id = vault_id.to_ascii_lowercase();
+        let path = self.dir.join(format!("{id}.db"));
+        if !create && !path.exists() {
+            return err(404, "not found");
+        }
         let lock = {
             let mut m = self.locks.lock().unwrap();
-            m.entry(id.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
+            if m.len() > 4096 {
+                m.retain(|_, w| w.strong_count() > 0);
+            }
+            match m.get(&id).and_then(|w| w.upgrade()) {
+                Some(l) => l,
+                None => {
+                    let l = Arc::new(tokio::sync::Mutex::new(()));
+                    m.insert(id.clone(), Arc::downgrade(&l));
+                    l
+                }
+            }
         };
         let _g = lock.lock().await;
-        let store = VaultStore::open(&self.dir.join(format!("{id}.db")))
-            .map_err(|_| ApiErr(Ve(500, "store open".into())))?;
-        f(&store).map_err(ApiErr)
+        tokio::task::spawn_blocking(move || {
+            let store =
+                VaultStore::open(&path, create).map_err(|_| Ve(500, "store open".into()))?;
+            f(&store)
+        })
+        .await
+        .map_err(|_| ApiErr(Ve(500, "task".into())))?
+        .map_err(ApiErr)
     }
 }
 
 fn jstr<'a>(v: &'a Value, k: &str) -> R<&'a str> {
-    v.get(k).and_then(Value::as_str).ok_or(ApiErr(Ve(
-        400,
-        format!("missing field {k}"),
-    )))
+    v.get(k)
+        .and_then(Value::as_str)
+        .ok_or(ApiErr(Ve(400, format!("missing field {k}"))))
 }
 
 #[tokio::main]
 async fn main() {
-    let mut dir = PathBuf::from(
-        std::env::var("MPM_SYNC_DATA").unwrap_or_else(|_| "syncd-data".into()),
-    );
+    let mut dir =
+        PathBuf::from(std::env::var("MPM_SYNC_DATA").unwrap_or_else(|_| "syncd-data".into()));
     let mut bind = std::env::var("MPM_SYNC_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into());
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -124,7 +161,14 @@ async fn main() {
         }
     }
     std::fs::create_dir_all(&dir).expect("create data dir");
-    let setup_key = std::env::var("MPM_SETUP_KEY").ok().filter(|k| !k.is_empty());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let setup_key = std::env::var("MPM_SETUP_KEY")
+        .ok()
+        .filter(|k| !k.is_empty());
     if setup_key.is_none() {
         eprintln!("warning: MPM_SETUP_KEY unset — vault bootstrap disabled");
     }
@@ -141,10 +185,7 @@ async fn main() {
         .route("/v/{vault}/manifest", get(get_manifest).put(put_manifest))
         .route("/v/{vault}/state", get(vault_state))
         .route("/v/{vault}/ops", get(get_ops).post(post_ops))
-        .route(
-            "/v/{vault}/snapshot",
-            get(get_snapshot).put(put_snapshot),
-        )
+        .route("/v/{vault}/snapshot", get(get_snapshot).put(put_snapshot))
         .route("/v/{vault}/tokens", post(mint_token))
         .route("/v/{vault}/revoke", post(revoke))
         .route("/v/{vault}/enroll/invite", post(enroll_invite))
@@ -173,14 +214,20 @@ async fn bootstrap(
     h: HeaderMap,
     body: Bytes,
 ) -> R<Json<Value>> {
-    let ok = s
-        .setup_key
-        .as_deref()
-        .is_some_and(|k| h.get("x-setup-key").and_then(|v| v.to_str().ok()) == Some(k));
+    let ok = s.setup_key.as_deref().is_some_and(|k| {
+        h.get("x-setup-key")
+            .and_then(|v| v.to_str().ok())
+            // digest + xor-fold: the setup key is a long-lived shared
+            // secret — don't hand a timing oracle to the network
+            .is_some_and(|v| ct_eq(&sha256_raw(v.as_bytes()), &sha256_raw(k.as_bytes())))
+    });
     if !ok {
         return err(401, "bad setup key");
     }
-    let token = s.with_vault(&vault, |st| st.bootstrap(&body)).await?;
+    let id = vault.clone();
+    let token = s
+        .with_vault(&vault, true, move |st| st.bootstrap(&id, &body))
+        .await?;
     Ok(Json(json!({ "token": token })))
 }
 
@@ -193,9 +240,11 @@ async fn get_manifest(
 ) -> R<Json<Value>> {
     let auth = bearer(&h);
     let (bytes, epoch) = s
-        .with_vault(&vault, |st| st.get_manifest(auth.as_deref()))
+        .with_vault(&vault, false, move |st| st.get_manifest(auth.as_deref()))
         .await?;
-    Ok(Json(json!({ "manifest": vault::hex(&bytes), "snapshot_epoch": epoch })))
+    Ok(Json(
+        json!({ "manifest": vault::hex(&bytes), "snapshot_epoch": epoch }),
+    ))
 }
 
 async fn put_manifest(
@@ -206,10 +255,13 @@ async fn put_manifest(
 ) -> R<Json<Value>> {
     let auth = bearer(&h);
     let v: Value = serde_json::from_slice(&body).map_err(|_| ApiErr(Ve(400, "bad json".into())))?;
-    let manifest = unhex(jstr(&v, "manifest")?).map_err(|_| ApiErr(Ve(400, "bad manifest hex".into())))?;
+    let manifest =
+        unhex(jstr(&v, "manifest")?).map_err(|_| ApiErr(Ve(400, "bad manifest hex".into())))?;
     let base_hash = jstr(&v, "base_hash")?.to_string();
     let epoch = s
-        .with_vault(&vault, |st| st.put_manifest(auth.as_deref(), &manifest, &base_hash))
+        .with_vault(&vault, false, move |st| {
+            st.put_manifest(auth.as_deref(), &manifest, &base_hash)
+        })
         .await?;
     Ok(Json(json!({ "snapshot_epoch": epoch })))
 }
@@ -220,7 +272,9 @@ async fn vault_state(
     h: HeaderMap,
 ) -> R<Json<Value>> {
     let auth = bearer(&h);
-    let (epoch, heads) = s.with_vault(&vault, |st| st.state(auth.as_deref())).await?;
+    let (epoch, heads) = s
+        .with_vault(&vault, false, move |st| st.state(auth.as_deref()))
+        .await?;
     Ok(Json(json!({
         "snapshot_epoch": epoch,
         "heads": heads.iter().map(|(d, h)| json!({"device": d, "head": h})).collect::<Vec<_>>(),
@@ -245,8 +299,13 @@ async fn get_ops(
     let auth = bearer(&h);
     let dev = q.device.unwrap_or_default();
     let (frames, head, more) = s
-        .with_vault(&vault, |st| {
-            st.get_ops(auth.as_deref(), &dev, q.since.unwrap_or(0), q.limit.unwrap_or(256))
+        .with_vault(&vault, false, move |st| {
+            st.get_ops(
+                auth.as_deref(),
+                &dev,
+                q.since.unwrap_or(0),
+                q.limit.unwrap_or(256),
+            )
         })
         .await?;
     Ok((
@@ -273,12 +332,24 @@ async fn post_ops(
     let auth = bearer(&h);
     let dev = q.device.unwrap_or_default();
     let head = s
-        .with_vault(&vault, |st| st.append_ops(auth.as_deref(), &dev, &body))
+        .with_vault(&vault, false, move |st| {
+            st.append_ops(auth.as_deref(), &dev, &body)
+        })
         .await?;
     Ok(Json(json!({ "head": head })))
 }
 
 // ── snapshots ─────────────────────────────────────────────────────────
+
+fn parse_epoch(q: &HashMap<String, String>) -> R<Option<u64>> {
+    match q.get("epoch") {
+        None => Ok(None),
+        Some(e) => e
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| ApiErr(Ve(400, "bad epoch".into()))),
+    }
+}
 
 async fn get_snapshot(
     State(s): State<Arc<AppState>>,
@@ -287,16 +358,16 @@ async fn get_snapshot(
     h: HeaderMap,
 ) -> R<Response> {
     let auth = bearer(&h);
-    let epoch = q.get("epoch").and_then(|e| e.parse::<u64>().ok());
+    let epoch = parse_epoch(&q)?;
     match s
-        .with_vault(&vault, |st| st.get_snapshot(auth.as_deref(), epoch))
+        .with_vault(&vault, false, move |st| {
+            st.get_snapshot(auth.as_deref(), epoch)
+        })
         .await
     {
-        Ok(body) => Ok((
-            [(header::CONTENT_TYPE, "application/octet-stream")],
-            body,
-        )
-            .into_response()),
+        Ok(body) => {
+            Ok(([(header::CONTENT_TYPE, "application/octet-stream")], body).into_response())
+        }
         Err(ApiErr(Ve(404, _))) => err(404, "no snapshot"),
         Err(e) => Err(e),
     }
@@ -310,12 +381,11 @@ async fn put_snapshot(
     body: Bytes,
 ) -> R<Json<Value>> {
     let auth = bearer(&h);
-    let epoch = q
-        .get("epoch")
-        .and_then(|e| e.parse::<u64>().ok())
-        .unwrap_or(0);
-    s.with_vault(&vault, |st| st.put_snapshot(auth.as_deref(), epoch, &body))
-        .await?;
+    let epoch = parse_epoch(&q)?.unwrap_or(0);
+    s.with_vault(&vault, false, move |st| {
+        st.put_snapshot(auth.as_deref(), epoch, &body)
+    })
+    .await?;
     Ok(Json(json!({ "epoch": epoch })))
 }
 
@@ -333,7 +403,7 @@ async fn mint_token(
     let device = v.get("device").and_then(Value::as_str).map(str::to_string);
     let ttl = v.get("ttl_s").and_then(Value::as_i64);
     let token = s
-        .with_vault(&vault, |st| {
+        .with_vault(&vault, false, move |st| {
             st.mint_scoped_token(auth.as_deref(), &scope, device.as_deref(), ttl)
         })
         .await?;
@@ -350,7 +420,9 @@ async fn revoke(
     let v: Value = serde_json::from_slice(&body).map_err(|_| ApiErr(Ve(400, "bad json".into())))?;
     let device = jstr(&v, "device")?.to_string();
     let removed = s
-        .with_vault(&vault, |st| st.revoke_device(auth.as_deref(), &device))
+        .with_vault(&vault, false, move |st| {
+            st.revoke_device(auth.as_deref(), &device)
+        })
         .await?;
     Ok(Json(json!({ "removed": removed })))
 }
@@ -364,7 +436,7 @@ async fn enroll_invite(
 ) -> R<Json<Value>> {
     let auth = bearer(&h);
     let (code, ttl) = s
-        .with_vault(&vault, |st| st.enroll_invite(auth.as_deref()))
+        .with_vault(&vault, false, move |st| st.enroll_invite(auth.as_deref()))
         .await?;
     Ok(Json(json!({ "code": code, "ttl_s": ttl })))
 }
@@ -383,9 +455,13 @@ async fn enroll_join(
         jstr(&v, "name")?.to_string(),
     );
     let (bytes, epoch) = s
-        .with_vault(&vault, |st| st.enroll_join(auth.as_deref(), &device, &vk, &name))
+        .with_vault(&vault, false, move |st| {
+            st.enroll_join(auth.as_deref(), &device, &vk, &name)
+        })
         .await?;
-    Ok(Json(json!({ "manifest": vault::hex(&bytes), "snapshot_epoch": epoch })))
+    Ok(Json(
+        json!({ "manifest": vault::hex(&bytes), "snapshot_epoch": epoch }),
+    ))
 }
 
 async fn enroll_pending(
@@ -395,7 +471,7 @@ async fn enroll_pending(
 ) -> R<Json<Value>> {
     let auth = bearer(&h);
     let rows = s
-        .with_vault(&vault, |st| st.enroll_pending(auth.as_deref()))
+        .with_vault(&vault, false, move |st| st.enroll_pending(auth.as_deref()))
         .await?;
     Ok(Json(json!(rows
         .iter()
@@ -412,8 +488,10 @@ async fn enroll_decline(
     let auth = bearer(&h);
     let v: Value = serde_json::from_slice(&body).map_err(|_| ApiErr(Ve(400, "bad json".into())))?;
     let device = jstr(&v, "device")?.to_string();
-    s.with_vault(&vault, |st| st.enroll_decline(auth.as_deref(), &device))
-        .await?;
+    s.with_vault(&vault, false, move |st| {
+        st.enroll_decline(auth.as_deref(), &device)
+    })
+    .await?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -427,7 +505,9 @@ async fn enroll_finish(
     let v: Value = serde_json::from_slice(&body).map_err(|_| ApiErr(Ve(400, "bad json".into())))?;
     let device = jstr(&v, "device")?.to_string();
     let (read, write, bytes, epoch) = s
-        .with_vault(&vault, |st| st.enroll_finish(auth.as_deref(), &device))
+        .with_vault(&vault, false, move |st| {
+            st.enroll_finish(auth.as_deref(), &device)
+        })
         .await?;
     Ok(Json(json!({
         "read": read,
