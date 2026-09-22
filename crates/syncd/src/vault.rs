@@ -22,6 +22,7 @@ pub const INVITE_TTL_S: i64 = 15 * 60;
 pub const MAX_SNAPSHOTS: i64 = 8;
 
 /// Errors carry an HTTP status — the router maps them straight through.
+#[derive(Debug)]
 pub struct Ve(pub u16, pub String);
 pub fn ve<T>(status: u16, msg: impl Into<String>) -> Result<T, Ve> {
     Err(Ve(status, msg.into()))
@@ -102,10 +103,19 @@ impl VaultStore {
                expires INTEGER NOT NULL) STRICT;
              CREATE TABLE IF NOT EXISTS pending (
                device TEXT PRIMARY KEY, vk BLOB NOT NULL, name TEXT NOT NULL,
-               created INTEGER NOT NULL) STRICT;
+               created INTEGER NOT NULL,
+               invite TEXT NOT NULL DEFAULT '') STRICT;
              CREATE TABLE IF NOT EXISTS snapshots (
                epoch INTEGER PRIMARY KEY, body BLOB NOT NULL) STRICT;",
         )?;
+        let has_invite: bool = conn
+            .prepare("SELECT name FROM pragma_table_info('pending')")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .flatten()
+            .any(|c| c == "invite");
+        if !has_invite {
+            conn.execute_batch("ALTER TABLE pending ADD COLUMN invite TEXT NOT NULL DEFAULT ''")?;
+        }
         Ok(Self { conn })
     }
 
@@ -200,6 +210,8 @@ impl VaultStore {
         device: Option<&str>,
         ttl_s: Option<i64>,
     ) -> VResult<String> {
+        conn.execute("DELETE FROM tokens WHERE expires < ?1", params![now_s()])
+            .map_err(|_| Ve(500, "db".into()))?;
         let count: i64 = conn
             .query_row("SELECT count(*) FROM tokens", [], |r| r.get(0))
             .map_err(|_| Ve(500, "db".into()))?;
@@ -607,7 +619,7 @@ impl VaultStore {
         vk_hex: &str,
         name: &str,
     ) -> VResult<(Vec<u8>, u64)> {
-        self.require_invite(code)?;
+        let invite_hash = self.require_invite(code)?;
         if !valid_dev(device_id) {
             return ve(400, "bad device id");
         }
@@ -617,6 +629,12 @@ impl VaultStore {
         }
         if name.is_empty() || name.chars().count() > 64 {
             return ve(400, "bad device name");
+        }
+        // Cc control chars (ESC/BEL/newlines/C1) end up rendered on the
+        // owner's terminal by `pair pending` — refuse them at the door.
+        // (Cf/emoji stay legal: ZWJ sequences are legitimate names.)
+        if name.chars().any(|c| c.is_control()) {
+            return ve(400, "device name has control characters");
         }
         let dev = device_id.to_ascii_lowercase();
         self.conn
@@ -646,6 +664,22 @@ impl VaultStore {
                 );
             }
         }
+        // one invite binds to one device: a code that already joined
+        // device A must not mint pending rows for B, C, … — otherwise a
+        // single invite fills the pending table. Same-device retries
+        // (refreshing name/created) stay allowed.
+        let bound: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT device FROM pending WHERE invite = ?1 AND device != ?2",
+                params![invite_hash, dev],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|_| Ve(500, "db".into()))?;
+        if bound.is_some() {
+            return ve(409, "invite already joined a different device");
+        }
         let count: i64 = self
             .conn
             .query_row("SELECT count(*) FROM pending", [], |r| r.get(0))
@@ -655,9 +689,10 @@ impl VaultStore {
         }
         self.conn
             .execute(
-                "INSERT INTO pending (device, vk, name, created) VALUES (?1,?2,?3,?4)
-                 ON CONFLICT(device) DO UPDATE SET name=excluded.name, created=excluded.created",
-                params![dev, vk, name, now_s()],
+                "INSERT INTO pending (device, vk, name, created, invite) VALUES (?1,?2,?3,?4,?5)
+                 ON CONFLICT(device) DO UPDATE SET name=excluded.name,
+                   created=excluded.created, invite=excluded.invite",
+                params![dev, vk, name, now_s(), invite_hash],
             )
             .map_err(|_| Ve(500, "db".into()))?;
         let (bytes, m) = self.require_manifest()?;
@@ -728,8 +763,8 @@ impl VaultStore {
         let pending_vk: Option<Vec<u8>> = self
             .conn
             .query_row(
-                "SELECT vk FROM pending WHERE device = ?1",
-                params![dev],
+                "SELECT vk FROM pending WHERE device = ?1 AND invite = ?2",
+                params![dev, hash],
                 |r| r.get(0),
             )
             .optional()

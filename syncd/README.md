@@ -68,7 +68,7 @@ GET  /v/:vault/state            read    → {snapshot_epoch, heads[]}
 GET  /v/:vault/ops?device&since read    → raw frames (x-head, x-more)
 POST /v/:vault/ops?device       write   raw frames — sig+seq verified per op
 GET  /v/:vault/snapshot?epoch   read    → bytes | 404
-PUT  /v/:vault/snapshot?epoch   admin   immutable
+PUT  /v/:vault/snapshot?epoch   write   immutable
 POST /v/:vault/tokens           admin   {scope, device?, ttl_s?} → {token}
 POST /v/:vault/revoke           admin   {device} — burns its tokens
 POST /v/:vault/enroll/invite    admin   → {code, ttl_s}

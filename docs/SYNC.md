@@ -117,10 +117,10 @@ owner device          relay                 new device
 | route | auth | semantics |
 |---|---|---|
 | `POST enroll/invite` | admin | → `{"code": "XXXX-XXXX", "ttl_s": 900}`. Codes: 8 chars, no confusables, sha256-stored, single-finish. |
-| `POST enroll/join` | **invite code as bearer** | `{device, vk, name}` → `{manifest, snapshot_epoch}`. Upserts into `pending`. Code is NOT consumed (finish needs it). |
+| `POST enroll/join` | **invite code as bearer** | `{device, vk, name}` → `{manifest, snapshot_epoch}`. Upserts into `pending`. Code is NOT consumed (finish needs it). One code binds to one device id: a join for a different device under the same code → 409; same-device retries are fine. `name` is ≤64 chars and may not contain control characters. |
 | `GET enroll/pending` | admin | `[{device, vk, name, created}]` |
 | `POST enroll/decline` | admin | `{device}` → drop pending row |
-| `POST enroll/finish` | **invite code as bearer** | `{device}` → iff device is active in manifest: `{read, write, manifest, snapshot_epoch}` + invite burned; else 409 "not approved yet" |
+| `POST enroll/finish` | **invite code as bearer** | `{device}` → iff device is active in manifest AND a pending row exists under this same code: `{read, write, manifest, snapshot_epoch}` + invite burned; else 409 |
 
 Client invite encoding: `<vault_id_hex>.<code>` — the vault id is needed
 to route before the device knows anything.

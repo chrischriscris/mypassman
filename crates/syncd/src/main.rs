@@ -401,7 +401,12 @@ async fn mint_token(
     body: Bytes,
 ) -> R<Json<Value>> {
     let auth = bearer(&h);
-    let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+    // empty body mints a default read token; malformed json is a 400
+    let v: Value = if body.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice(&body).map_err(|_| ApiErr(Ve(400, "bad json".into())))?
+    };
     let scope = jstr(&v, "scope").unwrap_or("read").to_string();
     let device = v.get("device").and_then(Value::as_str).map(str::to_string);
     let ttl = v.get("ttl_s").and_then(Value::as_i64);

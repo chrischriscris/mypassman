@@ -82,9 +82,13 @@ export class VaultSync extends DurableObject<Env> {
       sql.exec(
         `CREATE TABLE IF NOT EXISTS pending (
            device TEXT PRIMARY KEY, vk BLOB NOT NULL, name TEXT NOT NULL,
-           created INTEGER NOT NULL
+           created INTEGER NOT NULL, invite TEXT NOT NULL DEFAULT ''
          ) STRICT`,
       );
+      const pendingCols = sql.exec(`SELECT name FROM pragma_table_info('pending')`).toArray();
+      if (!pendingCols.some((c) => c.name === "invite")) {
+        sql.exec(`ALTER TABLE pending ADD COLUMN invite TEXT NOT NULL DEFAULT ''`);
+      }
       sql.exec(
         `CREATE TABLE IF NOT EXISTS snapshots (
            epoch INTEGER PRIMARY KEY, body BLOB NOT NULL
@@ -159,6 +163,7 @@ export class VaultSync extends DurableObject<Env> {
   }
 
   private async mintToken(scope: Scope, device: string | null, ttlS: number | null): Promise<string> {
+    this.sql.exec(`DELETE FROM tokens WHERE expires < ?`, nowS());
     const count = this.sql.exec(`SELECT count(*) AS n FROM tokens`).one().n as number;
     if (count >= MAX_TOKENS) throw http(429, "token cap reached");
     const token = `${newToken()}_${scope[0]}`;
@@ -432,19 +437,34 @@ export class VaultSync extends DurableObject<Env> {
     vk: string,
     name: string,
   ): Promise<{ manifest: ArrayBuffer; snapshot_epoch: number }> {
-    await this.requireInvite(code);
+    const inviteHash = await this.requireInvite(code);
     if (!/^[0-9a-f]{32}$/i.test(deviceId)) throw http(400, "bad device id");
     const vkb = unhex(vk);
     if (vkb.length !== 32) throw http(400, "bad vk");
     if (!name || name.length > 64) throw http(400, "bad device name");
+    // Cc control chars (ESC/BEL/newlines/C1) end up rendered on the
+    // owner's terminal by `pair pending` — refuse them at the door.
+    // (Cf/emoji stay legal: ZWJ sequences are legitimate names.)
+    if (/\p{Cc}/u.test(name)) throw http(400, "device name has control characters");
     const dev = deviceId.toLowerCase();
     this.sql.exec(`DELETE FROM pending WHERE created < ?`, nowS() - INVITE_TTL_S);
+    // one invite binds to one device: a code that already joined device
+    // A must not mint pending rows for B, C, … — otherwise a single
+    // invite fills the pending table. Same-device retries are fine.
+    const bound = this.sql
+      .exec<{ device: string }>(
+        `SELECT device FROM pending WHERE invite = ? AND device != ?`,
+        inviteHash,
+        dev,
+      )
+      .toArray()[0];
+    if (bound) throw http(409, "invite already joined a different device");
     // A retry may refresh the row, but a DIFFERENT vk for the same device
     // id means squatting — an invite must never overwrite another joiner's
     // key under a name the owner might recognize.
     const existing = this.sql
       .exec<{ vk: ArrayBuffer }>(`SELECT vk FROM pending WHERE device = ?`, dev)
-      .one();
+      .toArray()[0];
     if (existing && hex(VaultSync.bytes(existing.vk)) !== vk.toLowerCase())
       throw http(409, "device id already pending under a different key — decline it first");
     if (!existing) {
@@ -452,11 +472,12 @@ export class VaultSync extends DurableObject<Env> {
       if (count >= MAX_PENDING) throw http(429, "too many pending devices");
     }
     this.sql.exec(
-      `INSERT OR REPLACE INTO pending (device, vk, name, created) VALUES (?,?,?,?)`,
+      `INSERT OR REPLACE INTO pending (device, vk, name, created, invite) VALUES (?,?,?,?,?)`,
       dev,
       vkb.slice().buffer,
       name,
       nowS(),
+      inviteHash,
     );
     const b = this.manifestBytes();
     if (!b) throw http(404, "vault not bootstrapped");
@@ -499,7 +520,11 @@ export class VaultSync extends DurableObject<Env> {
       throw http(409, "not approved yet — the enrolled device must sign you into the manifest");
     }
     const pend = this.sql
-      .exec<{ vk: ArrayBuffer }>(`SELECT vk FROM pending WHERE device = ?`, dev)
+      .exec<{ vk: ArrayBuffer }>(
+        `SELECT vk FROM pending WHERE device = ? AND invite = ?`,
+        dev,
+        hash,
+      )
       .toArray()[0];
     if (!pend) {
       throw http(409, "no pending join for this device — re-run pair join under a fresh invite");
