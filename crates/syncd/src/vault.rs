@@ -12,6 +12,9 @@ pub const MAX_MANIFEST: usize = 64 * 1024;
 pub const MAX_BODY: usize = 1 << 20;
 pub const MAX_OPS_BATCH: usize = 256;
 pub const PAGE_MAX: u64 = 256;
+/// Aggregate byte budget for one GET /ops page — mirrors the push cap so
+/// a page can never exceed what a single write batch may carry.
+pub const PAGE_MAX_BYTES: usize = 1 << 20;
 pub const MAX_TOKENS: i64 = 64;
 pub const MAX_PENDING: i64 = 16;
 pub const MAX_INVITES: i64 = 8;
@@ -352,9 +355,22 @@ impl VaultStore {
             .map_err(|_| Ve(500, "db".into()))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|_| Ve(500, "db".into()))?;
-        let more = rows.len() as u64 > lim;
+        // Bound the page by BOTH count and bytes: the lim+1 probe row
+        // flags truncation, and a frame that would overflow the byte
+        // budget is deferred to the next page (more=1) so the cursor
+        // stays correct. A single stored frame always fits — ingest
+        // capped bodies at 1 MiB — but an empty `out` is never blocked.
+        let mut more = false;
         let mut out = Vec::new();
-        for (_, body) in &rows[..rows.len().min(lim as usize)] {
+        for (i, (_, body)) in rows.iter().enumerate() {
+            if i as u64 == lim {
+                more = true;
+                break;
+            }
+            if !out.is_empty() && out.len() + body.len() > PAGE_MAX_BYTES {
+                more = true;
+                break;
+            }
             out.extend_from_slice(body);
         }
         let head: u64 = self
@@ -782,4 +798,156 @@ fn new_code() -> String {
         .map(|b| A[(*b as usize) % A.len()] as char)
         .collect();
     format!("{}-{}", &s[..4], &s[4..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mpm_crypto::keys::{DeviceKey, KeyBundle};
+
+    fn tmpdir() -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "mpm-syncd-test-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Bootstrapped store + enrolled device + write token for it.
+    fn boot() -> (VaultStore, String, String, DeviceKey) {
+        let dir = tmpdir();
+        let bundle = KeyBundle::generate();
+        let dev = DeviceKey::generate();
+        let mut m = Manifest::new(
+            mpm_crypto::kdf::KdfParams::default(),
+            [0u8; 32],
+            bundle.owner_verifying_key(),
+        );
+        m.devices.push(mpm_core::DeviceEntry {
+            id: dev.id,
+            vk: dev.verifying_key(),
+            name: "t".into(),
+            active: true,
+            enrolled_at: 0,
+            revoked_seq: None,
+            extra: Vec::new(),
+        });
+        let manifest = m.to_file(&bundle.owner_signing_key());
+        let vault_id = hex(&m.vault_id);
+        let store = VaultStore::open(&dir.join("v.db"), true).unwrap();
+        let admin = store.bootstrap(&vault_id, &manifest).unwrap();
+        let dev_hex = hex(&dev.id);
+        let wtok = store
+            .mint_scoped_token(Some(&admin), "write", Some(&dev_hex), None)
+            .unwrap();
+        (store, wtok, dev_hex, dev)
+    }
+
+    /// Signed frame with a padded ciphertext — the relay only needs the
+    /// signature valid and seq continuity; contents are opaque to it.
+    fn frame(dev: &DeviceKey, seq: u64, ct_len: usize) -> mpm_core::Op {
+        let ct = vec![0xAB; ct_len];
+        let pre = mpm_core::aad::op_sig_preimage(seq, &[0u8; 24], &ct);
+        mpm_core::Op {
+            seq,
+            nonce: [0u8; 24],
+            sig: dev.sign(&pre).to_bytes(),
+            ct,
+        }
+    }
+
+    fn push(store: &VaultStore, tok: &str, dev_hex: &str, frames: &[mpm_core::Op]) {
+        let mut body = Vec::new();
+        for f in frames {
+            body.extend_from_slice(&f.encode());
+        }
+        store.append_ops(Some(tok), dev_hex, &body).unwrap();
+    }
+
+    /// PERF-01: a GET page is bounded by aggregate bytes, not just frame
+    /// count — the frame that would overflow defers to the next page.
+    #[test]
+    fn get_ops_page_bounded_by_bytes() {
+        let (store, tok, dev_hex, dev) = boot();
+        // five ~400 KiB frames, one push each (push cap is 1 MiB)
+        for seq in 1..=5u64 {
+            push(&store, &tok, &dev_hex, &[frame(&dev, seq, 400 * 1024)]);
+        }
+        let mut since = 0u64;
+        let mut pages = 0;
+        loop {
+            let (body, head, more) = store.get_ops(Some(&tok), &dev_hex, since, 256).unwrap();
+            assert!(body.len() <= PAGE_MAX_BYTES, "page over byte budget");
+            assert_eq!(head, 5);
+            pages += 1;
+            // two ~400 KiB frames fit under the cap; the third defers
+            let mut seqs = Vec::new();
+            let mut rest = &body[..];
+            while !rest.is_empty() {
+                let (op, n) = mpm_core::Op::decode(rest).unwrap();
+                seqs.push(op.seq);
+                rest = &rest[n..];
+            }
+            assert_eq!(seqs, vec![since + 1, since + 2][..seqs.len().min(2)]);
+            assert!(seqs.len() <= 2);
+            since = *seqs.last().unwrap();
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(since, 5);
+        assert_eq!(pages, 3); // 2 + 2 + 1
+                              // past the tail: empty page, no more
+        let (body, _, more) = store.get_ops(Some(&tok), &dev_hex, since, 256).unwrap();
+        assert!(body.is_empty() && !more);
+    }
+
+    /// Count cap still binds: 300 small frames page at 256 then 44.
+    #[test]
+    fn get_ops_page_bounded_by_count() {
+        let (store, tok, dev_hex, dev) = boot();
+        let mut batch = Vec::new();
+        for seq in 1..=256u64 {
+            batch.push(frame(&dev, seq, 64));
+        }
+        push(&store, &tok, &dev_hex, &batch);
+        let mut batch2 = Vec::new();
+        for seq in 257..=300u64 {
+            batch2.push(frame(&dev, seq, 64));
+        }
+        push(&store, &tok, &dev_hex, &batch2);
+
+        let (p1, head, more1) = store.get_ops(Some(&tok), &dev_hex, 0, 256).unwrap();
+        assert!(more1 && head == 300);
+        assert_eq!(p1.len(), 256 * (mpm_core::op::OP_HEADER_LEN + 64));
+        let (p2, _, more2) = store.get_ops(Some(&tok), &dev_hex, 256, 256).unwrap();
+        assert!(!more2);
+        assert_eq!(p2.len(), 44 * (mpm_core::op::OP_HEADER_LEN + 64));
+    }
+
+    /// Boundary: a frame that lands exactly on the byte budget is kept;
+    /// the one after it defers. `more` follows the cursor, not the cap.
+    #[test]
+    fn get_ops_byte_boundary_exact() {
+        let (store, tok, dev_hex, dev) = boot();
+        // f1+f2 = exactly PAGE_MAX_BYTES; f3 overflows → page 1 = f1+f2
+        let f1 = frame(&dev, 1, PAGE_MAX_BYTES / 2 - mpm_core::op::OP_HEADER_LEN);
+        let f2 = frame(&dev, 2, PAGE_MAX_BYTES / 2 - mpm_core::op::OP_HEADER_LEN);
+        let f3 = frame(&dev, 3, 64);
+        // each push body must stay ≤ MAX_BODY — f1+f2 is exactly the cap
+        push(&store, &tok, &dev_hex, &[f1, f2]);
+        push(&store, &tok, &dev_hex, &[f3]);
+        let (p1, _, more1) = store.get_ops(Some(&tok), &dev_hex, 0, 256).unwrap();
+        assert_eq!(p1.len(), PAGE_MAX_BYTES);
+        assert!(more1);
+        let (p2, _, more2) = store.get_ops(Some(&tok), &dev_hex, 2, 256).unwrap();
+        assert!(!more2 && !p2.is_empty());
+    }
 }

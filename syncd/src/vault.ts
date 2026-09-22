@@ -31,6 +31,8 @@ type Scope = "read" | "write" | "admin" | "enroll";
 const MAX_BODY = 1 << 20; // 1 MiB request bodies
 const MAX_OPS_BATCH = 256;
 const PAGE_MAX = 256;
+// Aggregate byte budget for one GET /ops page — mirrors the push cap.
+const PAGE_MAX_BYTES = 1 << 20;
 const MAX_TOKENS = 64;
 const MAX_PENDING = 16;
 const MAX_INVITES = 8;
@@ -270,9 +272,24 @@ export class VaultSync extends DurableObject<Env> {
         lim + 1, // one extra row = "more" flag without a second query
       )
       .toArray();
-    const more = rows.length > lim;
-    const page = more ? rows.slice(0, lim) : rows;
-    const total = page.reduce((n, r) => n + r.body.byteLength, 0);
+    // Bound the page by BOTH count and bytes: the lim+1 probe row flags
+    // truncation; a frame that would overflow the byte budget defers to
+    // the next page (more=1), keeping the seq cursor correct.
+    const page: Array<{ seq: number; body: ArrayBuffer }> = [];
+    let total = 0;
+    let more = false;
+    for (const [i, r] of rows.entries()) {
+      if (i === lim) {
+        more = true;
+        break;
+      }
+      if (page.length > 0 && total + r.body.byteLength > PAGE_MAX_BYTES) {
+        more = true;
+        break;
+      }
+      page.push(r);
+      total += r.body.byteLength;
+    }
     const frames = new Uint8Array(total);
     let off = 0;
     for (const r of page) {

@@ -62,9 +62,12 @@ Cheap probe — the client's first call every sync.
 ### `GET /v/<v>/ops?device=<hex>&since=<seq>&limit=<n>`
 
 `application/octet-stream` response: raw concatenated op frames, seq >
-`since`, ascending, ≤ `limit` (clamped 1..256). Headers: `x-head`
-(device's global head seq), `x-more` (`1` if truncated). Clients append
-frames verbatim to the local log — no decode/re-encode.
+`since`, ascending, ≤ `limit` (clamped 1..256) AND ≤ 1 MiB aggregate —
+whichever bound hits first ends the page and sets `x-more`, so a frame
+that would overflow the byte budget simply defers to the next page.
+Headers: `x-head` (device's global head seq), `x-more` (`1` if
+truncated). Clients append frames verbatim to the local log — no
+decode/re-encode.
 
 ### `POST /v/<v>/ops?device=<hex>` — append frames (write token)
 
