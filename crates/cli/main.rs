@@ -256,9 +256,11 @@ enum SyncCmd {
     Init {
         /// syncd base URL, e.g. https://syncd.example.com or http://localhost:8787
         url: String,
-        /// the SETUP_KEY wrangler secret from the deployment
+        /// the SETUP_KEY wrangler secret from the deployment — prefer
+        /// $MPM_SETUP_KEY or the interactive prompt; argv lands in shell
+        /// history and `ps` output
         #[arg(long)]
-        setup_key: String,
+        setup_key: Option<String>,
     },
 }
 
@@ -277,11 +279,12 @@ enum PairCmd {
     Approve { device: String },
     /// Decline a pending join request (id prefix)
     Decline { device: String },
-    /// On the new device: request enrollment with <url> <invite>
-    /// (invite = <vault_id>.<code> printed by `pair invite`)
+    /// On the new device: request enrollment with <url> [invite]
+    /// (invite = <vault_id>.<code> printed by `pair invite`); when omitted
+    /// it's read from $MPM_INVITE or prompted — argv leaks to `ps`/history
     Join {
         url: String,
-        invite: String,
+        invite: Option<String>,
         /// label the approver sees, e.g. "work macbook"
         #[arg(long, default_value = "new device")]
         name: String,
@@ -399,7 +402,7 @@ pub(crate) fn read_password(prompt: &str) -> Zeroizing<String> {
     Zeroizing::new(s.trim_end().to_string())
 }
 
-fn read_line(prompt: &str) -> String {
+pub(crate) fn read_line(prompt: &str) -> String {
     eprint!("{prompt}: ");
     let mut s = String::new();
     std::io::Write::flush(&mut std::io::stderr()).ok();
@@ -1276,7 +1279,7 @@ fn refuse_if_torn(dir: &Path, vault: &mpm_core::Vault) -> Result<(), String> {
 
 /// Terminal-safe name for printing — a hostile import could embed escape
 /// sequences in a name; we only ever print it sanitized.
-fn disp(s: &str) -> String {
+pub(crate) fn disp(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect()
@@ -2165,7 +2168,7 @@ fn cmd_devices(dir: &Path, rec: bool) -> Result<(), String> {
         println!(
             "{:<34} {:<20} {:<8} {}",
             mpm_store::hex(&d.id),
-            d.name,
+            disp(&d.name),
             if d.active { "active" } else { "revoked" },
             d.enrolled_at
         );
@@ -3235,7 +3238,9 @@ fn main() {
             BioCmd::Off => cmd_bio_off(&dir, rec),
         },
         Cmd::Sync { sub } => match sub {
-            Some(SyncCmd::Init { url, setup_key }) => sync::cmd_sync_init(&dir, url, setup_key),
+            Some(SyncCmd::Init { url, setup_key }) => {
+                sync::cmd_sync_init(&dir, url, setup_key.as_deref())
+            }
             None => sync::cmd_sync(&dir),
         },
         Cmd::Pair { sub } => match sub {
@@ -3243,7 +3248,9 @@ fn main() {
             PairCmd::Pending => sync::cmd_pair_pending(&dir),
             PairCmd::Approve { device } => sync::cmd_pair_approve(&dir, rec, device),
             PairCmd::Decline { device } => sync::cmd_pair_decline(&dir, device),
-            PairCmd::Join { url, invite, name } => sync::cmd_pair_join(&dir, url, invite, name),
+            PairCmd::Join { url, invite, name } => {
+                sync::cmd_pair_join(&dir, url, invite.as_deref(), name)
+            }
             PairCmd::Finish => sync::cmd_pair_finish(&dir),
             PairCmd::Revoke { device, keep_keys } => {
                 sync::cmd_pair_revoke(&dir, rec, device, *keep_keys)

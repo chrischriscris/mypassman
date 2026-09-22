@@ -107,7 +107,7 @@ you fork the repo: point it at `syncd/`.
 
 ```sh
 mypassman init                                   # local vault
-mypassman sync init https://sync.example.com --setup-key <secret>
+MPM_SETUP_KEY=<secret> mypassman sync init https://sync.example.com
 mypassman sync                                   # pushes manifest + ops
 ```
 
@@ -115,6 +115,11 @@ mypassman sync                                   # pushes manifest + ops
 the returned admin token (0600, under the platform data dir — override
 with `MPM_DATA`). The setup key is only ever needed for the *first*
 device of a *new* vault — rotate it freely; it can't read vaults.
+
+Secrets shouldn't ride argv (shell history, `ps`): `--setup-key` still
+works for scripts, but `MPM_SETUP_KEY` or the interactive prompt is the
+better default. `pair join` likewise accepts the invite positionally or
+via `MPM_INVITE`/prompt.
 
 After that, all enrollment is invite-based (`pair invite` / `pair join`
 / `pair approve` / `pair finish`) — no setup key involved.

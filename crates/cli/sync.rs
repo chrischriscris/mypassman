@@ -364,7 +364,18 @@ fn tok<'a>(cfg: &'a SyncCfg, scoped: &'a Option<String>, what: &str) -> Result<&
 /// `mypassman sync init <url> --setup-key <k>` — first device bootstraps
 /// the vault onto a fresh syncd deployment; stores admin + device-bound
 /// read/write tokens.
-pub fn cmd_sync_init(dir: &Path, url: &str, setup_key: &str) -> Result<(), String> {
+pub fn cmd_sync_init(dir: &Path, url: &str, setup_key: Option<&str>) -> Result<(), String> {
+    // argv → $MPM_SETUP_KEY → prompt: argv lands in shell history/`ps`
+    let owned;
+    let setup_key = match setup_key {
+        Some(k) => k,
+        None => {
+            owned = std::env::var("MPM_SETUP_KEY")
+                .inspect(|_| std::env::remove_var("MPM_SETUP_KEY"))
+                .unwrap_or_else(|_| crate::read_line("setup key"));
+            owned.as_str()
+        }
+    };
     let m = mpm_store::load_manifest(dir).map_err(|e| e.to_string())?;
     let raw = std::fs::read(dir.join(mpm_store::MANIFEST)).map_err(|e| e.to_string())?;
     let dev = mpm_store::load_device_key(&m.vault_id).map_err(|e| e.to_string())?;
@@ -904,7 +915,7 @@ pub fn cmd_pair_pending(dir: &Path) -> Result<(), String> {
         println!(
             "{:<34} {:<24} {:<14} {}",
             jstr(p, "device")?,
-            jstr(p, "name")?,
+            crate::disp(&jstr(p, "name")?),
             jstr(p, "vk")?
                 .get(..16)
                 .map(str::to_string)
@@ -1002,7 +1013,8 @@ pub fn cmd_pair_approve(dir: &Path, rec: bool, prefix: &str) -> Result<(), Strin
     )?;
     check(r.status, &r.body)?;
     eprintln!(
-        "approved '{dev_name}' ({}) — run `mypassman pair finish` on that device",
+        "approved '{}' ({}) — run `mypassman pair finish` on that device",
+        crate::disp(&dev_name),
         mpm_store::hex(&dev_id)
     );
     Ok(())
@@ -1056,7 +1068,24 @@ pub fn cmd_pair_decline(dir: &Path, prefix: &str) -> Result<(), String> {
 /// the password slot + owner_vk anchor. We DON'T call unlock(): the
 /// device isn't in the registry yet, so Vault::new would NotEnrolled —
 /// approval is what `pair finish` waits for.
-pub fn cmd_pair_join(dir: &Path, url: &str, invite: &str, name: &str) -> Result<(), String> {
+pub fn cmd_pair_join(
+    dir: &Path,
+    url: &str,
+    invite: Option<&str>,
+    name: &str,
+) -> Result<(), String> {
+    // argv → $MPM_INVITE → prompt: the code is a bearer credential until
+    // finish burns it, so keep it out of shell history/`ps`
+    let owned;
+    let invite = match invite {
+        Some(i) => i,
+        None => {
+            owned = std::env::var("MPM_INVITE")
+                .inspect(|_| std::env::remove_var("MPM_INVITE"))
+                .unwrap_or_else(|_| crate::read_line("invite (<vault_id>.<code>)"));
+            owned.as_str()
+        }
+    };
     if dir.join(mpm_store::MANIFEST).exists() {
         return Err("vault already exists here — pair join is for a fresh directory".into());
     }
@@ -1142,7 +1171,11 @@ pub fn cmd_pair_join(dir: &Path, url: &str, invite: &str, name: &str) -> Result<
         },
     )?;
 
-    eprintln!("requested as '{name}' ({})", mpm_store::hex(&dev.id));
+    eprintln!(
+        "requested as '{}' ({})",
+        crate::disp(name),
+        mpm_store::hex(&dev.id)
+    );
     eprintln!(
         "my vk fingerprint: {}",
         &mpm_store::hex(&dev.verifying_key())[..16]
@@ -1251,7 +1284,7 @@ pub fn cmd_pair_revoke(dir: &Path, rec: bool, prefix: &str, keep_keys: bool) -> 
         return Err("refusing to revoke this device — run it from another enrolled device".into());
     }
     if !dev.active {
-        return Err(format!("'{}' is already revoked", dev.name));
+        return Err(format!("'{}' is already revoked", crate::disp(&dev.name)));
     }
     let dev_hex = mpm_store::hex(&dev.id);
     let dev_name = dev.name.clone();
@@ -1467,7 +1500,7 @@ pub fn cmd_pair_revoke(dir: &Path, rec: bool, prefix: &str, keep_keys: bool) -> 
         &[("content-type", "application/json")],
     )?;
     check(r.status, &r.body)?;
-    eprintln!("revoked '{dev_name}' ({dev_hex})");
+    eprintln!("revoked '{}' ({dev_hex})", crate::disp(&dev_name));
     eprintln!("note: it keeps whatever it already synced — rotate exposed secrets if needed");
     Ok(())
 }
