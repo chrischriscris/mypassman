@@ -188,12 +188,14 @@ impl Manifest {
 
         let mut r = Reader::new(body);
         let mut ord = tlv::OrderGuard::default();
+        let mut seen_vault_id = false;
         while let Some((t, v)) = r.next_field()? {
             ord.check(t, &[T_WRAP_SLOT, T_DEVICE])?;
             match t {
                 T_VAULT_ID => {
                     Reader::want_fixed(t, v, VAULT_ID_LEN)?;
                     m.vault_id = v.try_into().unwrap();
+                    seen_vault_id = true;
                 }
                 T_FORMAT_V => m.format_v = tlv::u16v(t, v)?,
                 T_MIN_READER => m.min_reader_v = tlv::u16v(t, v)?,
@@ -226,6 +228,11 @@ impl Manifest {
         // silently drop on re-sign — refuse rather than degrade it
         if m.min_reader_v > FORMAT_VERSION {
             return Err(CoreError::UnsupportedVersion(m.min_reader_v));
+        }
+        // vault_id is mandatory — the relay parser has always required it;
+        // an absent one previously parsed as all-zeros (PROTO-01)
+        if !seen_vault_id {
+            return Err(CoreError::Tlv("vault_id"));
         }
         // Self-signature check: the embedded owner_vk must have signed body.
         let signature = Signature::from_bytes(&m.sig);
