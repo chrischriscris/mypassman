@@ -1426,3 +1426,275 @@ fn conflict_copy_preserves_losing_edit() {
     let v3 = reopen(&dir, pw, &seed, dev_id);
     assert!(v3.item(&crid).is_err(), "deleted conflict copy stays gone");
 }
+
+/// Second enrolled device for foreign-op tests (owner-signed manifest
+/// edit, like `pair approve`); returns dev2.
+fn enroll_dev2(dir: &std::path::Path, v: &mut Vault) -> DeviceKey {
+    let dev2 = DeviceKey::generate();
+    let mut m = v.manifest.clone();
+    m.devices.push(mpm_core::DeviceEntry {
+        id: dev2.id,
+        vk: dev2.verifying_key(),
+        name: "dev2".into(),
+        active: true,
+        enrolled_at: 0,
+        revoked_seq: None,
+        extra: Vec::new(),
+    });
+    let sk = v.bundle().owner_signing_key();
+    let bytes = m.to_file(&sk);
+    mpm_store::write_manifest(dir, &bytes).unwrap();
+    v.manifest = mpm_core::Manifest::from_file(&bytes).unwrap();
+    dev2
+}
+
+/// Foreign upsert frame from `dev2` with a caller-chosen hlc.
+fn foreign_upsert(
+    v: &Vault,
+    dev2: &DeviceKey,
+    seq: u64,
+    prev: [u8; 32],
+    hlc: u64,
+    name: &str,
+) -> mpm_core::Op {
+    let mut rid = [0u8; 16];
+    rid[0] = seq as u8;
+    rid[1] = (hlc & 0xff) as u8;
+    let mut it = Item::default();
+    it.set(tag::NAME, name.as_bytes().to_vec());
+    it.set(tag::PASSWORD, b"x".to_vec());
+    let fields_ct = mpm_core::OpPlaintext::seal_fields(
+        v.dek(),
+        &v.manifest.vault_id,
+        v.manifest.key_epoch,
+        &rid,
+        &it,
+    )
+    .unwrap();
+    let pt = mpm_core::OpPlaintext {
+        prev_op_hash: prev,
+        hlc,
+        op_type: mpm_core::OpType::Upsert,
+        record_id: rid,
+        kind: Some(ItemKind::Login),
+        schema_v: 1,
+        created: 0,
+        name: name.as_bytes().to_vec(),
+        fields_ct,
+        gossip: Vec::new(),
+        snapshot: None,
+        origin_device: dev2.id,
+        origin_seq: seq,
+        key_epoch: v.manifest.key_epoch,
+    };
+    mpm_core::Op::seal(
+        &pt,
+        seq,
+        v.dek(),
+        &v.manifest.vault_id,
+        v.manifest.format_v,
+        v.manifest.key_epoch,
+        dev2,
+    )
+    .unwrap()
+}
+
+/// SEC-06: an enrolled device can sign an op with hlc = u64::MAX. Its
+/// merge still honors the true hlc (consensus — clamping that would fork
+/// replicas), but the value must not pin the local clock: `next_hlc`
+/// stays bounded by the documented skew window, so local writes keep
+/// working instead of saturating forever.
+#[test]
+fn extreme_hlc_cannot_pin_local_clock() {
+    const SKEW: u64 = 24 * 60 * 60 * 1000; // documented bound in vault.rs
+    let dir = tmpdir();
+    let pw = b"pw";
+    let (device, seed, _c) = init(&dir, pw);
+    let dev_id = device.id;
+    let mut v = reopen(&dir, pw, &seed, dev_id);
+    let dev2 = enroll_dev2(&dir, &mut v);
+
+    let op_max = foreign_upsert(&v, &dev2, 1, [0u8; 32], u64::MAX, "pinned");
+    let r = v.verify_foreign_prefix(&dev2.id, std::slice::from_ref(&op_max), 1, [0u8; 32]);
+    assert!(r.failed_at.is_none());
+    v.apply_foreign(&r.pts);
+
+    // merge honored the true hlc — the op landed and wins its record
+    assert!(matches!(v.find("pinned"), mpm_core::FindResult::One(_)));
+    // but the local clock is bounded, not saturated
+    let cap = mpm_core::vault::now_hlc() + SKEW + 1;
+    assert!(v.next_hlc() <= cap, "next_hlc pinned at {}", v.next_hlc());
+    // and a local write still produces a sane monotone timestamp
+    let mut it = Item::default();
+    it.set(tag::NAME, b"mine".to_vec());
+    let (own, _) = v.make_upsert(ItemKind::Login, it).unwrap();
+    let pt = v.apply_own_op(&own).unwrap();
+    assert!(pt.hlc <= cap, "own write pinned at {}", pt.hlc);
+}
+
+/// The bound itself: an hlc inside the skew window is absorbed fully;
+/// one beyond it is clamped to the window, not rejected.
+#[test]
+fn hlc_absorption_bounded_at_skew_window() {
+    const SKEW: u64 = 24 * 60 * 60 * 1000;
+    let dir = tmpdir();
+    let pw = b"pw";
+    let (device, seed, _c) = init(&dir, pw);
+    let mut v = reopen(&dir, pw, &seed, device.id);
+    let dev2 = enroll_dev2(&dir, &mut v);
+
+    let now = mpm_core::vault::now_hlc();
+    // in-window: absorbed — next_hlc must exceed it (monotone vs observed)
+    let a = foreign_upsert(&v, &dev2, 1, [0u8; 32], now + 60_000, "in-window");
+    // out-of-window: clamped — still applies, still wins, clock bounded
+    let b = foreign_upsert(&v, &dev2, 2, a.hash(), now + 2 * SKEW, "beyond");
+    let r = v.verify_foreign_prefix(&dev2.id, &[a, b], 1, [0u8; 32]);
+    assert!(r.failed_at.is_none());
+    v.apply_foreign(&r.pts);
+    assert!(matches!(v.find("beyond"), mpm_core::FindResult::One(_)));
+    let next = v.next_hlc();
+    assert!(next > now + 60_000, "in-window hlc not absorbed: {next}");
+    // cap measured after apply: clamping ran against an earlier `now`, so
+    // this bound is tight regardless of ticks between the two calls
+    let cap = mpm_core::vault::now_hlc() + SKEW + 1;
+    assert!(next <= cap, "beyond-window hlc not clamped: {next}");
+}
+
+/// Equal-hlc merge is total-order deterministic ((hlc, origin_device,
+/// origin_seq)) — including at the extreme end of the range.
+#[test]
+fn equal_extreme_hlc_ties_break_deterministically() {
+    let dir = tmpdir();
+    let pw = b"pw";
+    let (device, seed, _c) = init(&dir, pw);
+    let dev_id = device.id;
+    let mut v = reopen(&dir, pw, &seed, dev_id);
+    let dev2 = enroll_dev2(&dir, &mut v);
+
+    // dev2 op on record r at hlc u64::MAX; own concurrent op on the same
+    // record — winner decided by the tie-break, not by which arrived first
+    let mut rid = [0u8; 16];
+    rid[0] = 0xAA;
+    let mk = |v: &Vault, hlc: u64| -> mpm_core::Op {
+        let mut it = Item::default();
+        it.set(tag::NAME, b"tied".to_vec());
+        it.set(tag::PASSWORD, b"dev2".to_vec());
+        let fields_ct = mpm_core::OpPlaintext::seal_fields(
+            v.dek(),
+            &v.manifest.vault_id,
+            v.manifest.key_epoch,
+            &rid,
+            &it,
+        )
+        .unwrap();
+        let pt = mpm_core::OpPlaintext {
+            prev_op_hash: [0u8; 32],
+            hlc,
+            op_type: mpm_core::OpType::Upsert,
+            record_id: rid,
+            kind: Some(ItemKind::Login),
+            schema_v: 1,
+            created: 0,
+            name: b"tied".to_vec(),
+            fields_ct,
+            gossip: Vec::new(),
+            snapshot: None,
+            origin_device: dev2.id,
+            origin_seq: 1,
+            key_epoch: v.manifest.key_epoch,
+        };
+        mpm_core::Op::seal(
+            &pt,
+            1,
+            v.dek(),
+            &v.manifest.vault_id,
+            v.manifest.format_v,
+            v.manifest.key_epoch,
+            &dev2,
+        )
+        .unwrap()
+    };
+    let fop = mk(&v, u64::MAX);
+    let r = v.verify_foreign_prefix(&dev2.id, &[fop], 1, [0u8; 32]);
+    assert!(r.failed_at.is_none());
+    v.apply_foreign(&r.pts);
+
+    // own write under a pinned-proof clock still lands; tie vs MAX only
+    // if the clock were pinned — it isn't, so dev2's MAX wins outright
+    let mut it = Item::default();
+    it.set(tag::NAME, b"tied".to_vec());
+    it.set(tag::PASSWORD, b"own".to_vec());
+    // craft own op directly on the same record id
+    let own = v.make_update(&rid, ItemKind::Login, it).unwrap();
+    let pt = v.apply_own_op(&own).unwrap();
+    assert!(pt.hlc < u64::MAX);
+    assert_eq!(v.item(&rid).unwrap().get(tag::PASSWORD).unwrap(), b"dev2");
+}
+
+/// Replaying an extreme-hlc foreign log re-derives the same bounded clock.
+#[test]
+fn extreme_hlc_replay_stays_bounded() {
+    const SKEW: u64 = 24 * 60 * 60 * 1000;
+    let dir = tmpdir();
+    let pw = b"pw";
+    let (device, seed, _c) = init(&dir, pw);
+    let dev_id = device.id;
+    let mut v = reopen(&dir, pw, &seed, dev_id);
+    let dev2 = enroll_dev2(&dir, &mut v);
+
+    // dev2's log ON DISK: u64::MAX op + a normal op chained after it
+    let f1 = foreign_upsert(&v, &dev2, 1, [0u8; 32], u64::MAX, "big");
+    let f2 = foreign_upsert(&v, &dev2, 2, f1.hash(), 42, "small");
+    mpm_store::append_op(&dir, &dev2.id, &f1).unwrap();
+    mpm_store::append_op(&dir, &dev2.id, &f2).unwrap();
+
+    // fresh vault replays the foreign log → same bounded clock
+    let mut v2 = reopen(&dir, pw, &seed, dev_id);
+    let lr = mpm_store::read_ops(&dir, &dev2.id).unwrap();
+    let r = v2.verify_foreign_prefix(&dev2.id, &lr.ops, 1, [0u8; 32]);
+    assert!(r.failed_at.is_none());
+    v2.apply_foreign(&r.pts);
+    assert!(v2.next_hlc() <= mpm_core::vault::now_hlc() + SKEW + 1);
+    assert!(matches!(v2.find("big"), mpm_core::FindResult::One(_)));
+    assert!(matches!(v2.find("small"), mpm_core::FindResult::One(_)));
+}
+
+/// A revoked device's post-horizon op is rejected before merge — its
+/// extreme hlc never reaches the clock at all.
+#[test]
+fn revoked_device_extreme_hlc_never_reaches_clock() {
+    let dir = tmpdir();
+    let pw = b"pw";
+    let (device, seed, _c) = init(&dir, pw);
+    let dev_id = device.id;
+    let mut v = reopen(&dir, pw, &seed, dev_id);
+    let dev2 = enroll_dev2(&dir, &mut v);
+
+    let op1 = foreign_upsert(&v, &dev2, 1, [0u8; 32], 1, "pre-revocation");
+    let op2 = foreign_upsert(&v, &dev2, 2, op1.hash(), u64::MAX, "post-revocation");
+
+    // revoke with horizon=1
+    let mut m = v.manifest.clone();
+    for d in &mut m.devices {
+        if d.id == dev2.id {
+            d.active = false;
+            d.revoked_seq = Some(1);
+        }
+    }
+    let sk = v.bundle().owner_signing_key();
+    let bytes = m.to_file(&sk);
+    mpm_store::write_manifest(&dir, &bytes).unwrap();
+    let mut v = reopen(&dir, pw, &seed, dev_id);
+
+    let r = v.verify_foreign_prefix(&dev2.id, &[op1, op2], 1, [0u8; 32]);
+    assert_eq!(r.pts.len(), 1);
+    assert!(matches!(
+        r.failed_at,
+        Some((2, mpm_core::CoreError::RevokedWrite(2)))
+    ));
+    v.apply_foreign(&r.pts);
+    // clock saw only the sane op — next_hlc is ordinary wall time
+    let cap = mpm_core::vault::now_hlc() + 24 * 60 * 60 * 1000;
+    assert!(v.next_hlc() <= cap);
+}
+

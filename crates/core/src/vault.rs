@@ -111,6 +111,14 @@ pub fn now_hlc() -> u64 {
         .unwrap_or(0)
 }
 
+/// How far past wall-clock an observed op may push our local HLC clock.
+/// Merge ordering still uses each op's true `hlc` — this bound only caps
+/// what `apply_pt` feeds into `max_hlc`, so an enrolled device cannot pin
+/// local timestamps at saturation (e.g. `u64::MAX`) with a single op.
+/// 24h is generous for real clock drift yet bounded enough that even a
+/// malicious value stops affecting `next_hlc` within a day of wall time.
+const MAX_HLC_SKEW_MS: u64 = 24 * 60 * 60 * 1000;
+
 impl Vault {
     pub fn new(manifest: Manifest, bundle: KeyBundle, device: DeviceKey) -> Result<Self> {
         // Anchor authenticity: the manifest must be signed by the owner key
@@ -573,7 +581,13 @@ impl Vault {
     }
 
     fn apply_pt(&mut self, pt: OpPlaintext) {
-        self.max_hlc = self.max_hlc.max(pt.hlc);
+        // Absorb into the local clock only up to the skew bound — merge
+        // ordering below still compares the op's true hlc, so clamping
+        // changes nothing consensus-visible while keeping a saturated or
+        // far-future value from pinning `next_hlc`.
+        self.max_hlc = self
+            .max_hlc
+            .max(pt.hlc.min(now_hlc().saturating_add(MAX_HLC_SKEW_MS)));
         // Only record ops touch the index — checkpoints/meta/unknown ops
         // still advance the HLC clock and chain, nothing else.
         if !matches!(pt.op_type, OpType::Upsert | OpType::Tombstone) {

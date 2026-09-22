@@ -134,6 +134,14 @@ last-writer-wins; tombstone suppresses earlier upserts. All devices
 converge to identical state for identical op sets — order-independent.
 Checkpoint ops are merge-inert (no record effect).
 
+`hlc` is milliseconds since the Unix epoch, monotone per device against
+ops that device has observed. Any `u64` value is wire-valid — replicas
+never reject an op for its timestamp — but a replica absorbs an observed
+`hlc` into its own clock only up to `now + 24h`: merge ordering always
+uses the op's true value, while a saturated or far-future timestamp
+cannot pin the local clock (which would otherwise freeze ordering at
+`u64::MAX` and deny the replica any future write that could win a tie).
+
 ## Conflict copies
 
 LWW suppresses losing writes — but a losing edit can carry data the
