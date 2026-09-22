@@ -32,6 +32,8 @@ pub enum StoreError {
     Busy,
     #[error("op log rolled back or diverged from last verified checkpoint")]
     RolledBack,
+    #[error("op log has an undecodable record followed by valid frames — corrupt, not torn")]
+    CorruptLog,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -206,8 +208,16 @@ pub fn read_ops(dir: &Path, device_id: &[u8; 16]) -> Result<LogRead> {
                 ops.push(op);
                 pos += end;
             }
-            // a torn write can only ever be the last record
+            // A torn write can only ever be the last record — but a
+            // length-corrupt middle record fails decode the same way while
+            // valid frames still follow it. A genuine torn tail leaves a
+            // single partial frame: no offset after it can hold a complete
+            // record. If one decodes later, this is corruption — fail
+            // closed rather than silently dropping a surviving suffix.
             Err(_) if pos > 0 => {
+                if (pos + 1..buf.len()).any(|o| Op::decode(&buf[o..]).is_ok()) {
+                    return Err(StoreError::CorruptLog);
+                }
                 torn_tail = true;
                 break;
             }

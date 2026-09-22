@@ -311,6 +311,55 @@ fn torn_tail_is_tolerated_and_checkpoint_detects_rollback() {
     assert!(cseq > 2);
 }
 
+/// Bare frame for decode tests — read_ops never verifies signatures.
+fn raw_frame(seq: u64, ct: &[u8]) -> mpm_core::Op {
+    mpm_core::Op {
+        seq,
+        nonce: [1u8; 24],
+        sig: [2u8; 64],
+        ct: ct.to_vec(),
+    }
+}
+
+#[test]
+fn corrupt_middle_record_fails_closed_not_torn_tail() {
+    let dir = tmpdir();
+    mpm_store::init_dir(&dir).unwrap();
+    let dev = [7u8; 16];
+    let ops = [
+        raw_frame(1, b"aaaa"),
+        raw_frame(2, &[9u8; 300]),
+        raw_frame(3, b"cccc"),
+    ];
+    let mut buf = Vec::new();
+    for op in &ops {
+        buf.extend_from_slice(&op.encode());
+    }
+    // Corrupt the middle record's declared ct_len → 0. Decode then
+    // succeeds as an empty frame, lands inside the real ciphertext, and
+    // fails — while the valid third frame still follows. A real torn
+    // tail cannot have a complete record after the failure point.
+    let off2 = ops[0].encode().len();
+    let len_at = off2 + mpm_core::op::OP_HEADER_LEN - 4;
+    buf[len_at..len_at + 4].copy_from_slice(&0u32.to_le_bytes());
+    std::fs::write(mpm_store::log_path(&dir, &dev), &buf).unwrap();
+
+    let err = mpm_store::read_ops(&dir, &dev).err().unwrap();
+    assert!(matches!(err, mpm_store::StoreError::CorruptLog), "{err}");
+}
+
+#[test]
+fn torn_first_frame_fails_closed() {
+    // File starts mid-record: nothing decodable at offset 0 is a hard
+    // error, never a "torn tail" that would silently yield an empty log.
+    let dir = tmpdir();
+    mpm_store::init_dir(&dir).unwrap();
+    let dev = [9u8; 16];
+    let enc = raw_frame(1, b"payload").encode();
+    std::fs::write(mpm_store::log_path(&dir, &dev), &enc[..enc.len() - 2]).unwrap();
+    assert!(mpm_store::read_ops(&dir, &dev).is_err());
+}
+
 #[test]
 fn recovery_enrolls_device_when_key_absent() {
     // disaster restore: vault dir present, device key file absent

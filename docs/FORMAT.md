@@ -235,7 +235,11 @@ checkpointed prefix is rejected as rollback/divergence.
 - Op can't be forged or transplanted (device sig binds seq+nonce+ct;
   replay = identical bytes = idempotent).
 - Log can't be silently truncated (per-device checkpoint + hash chain;
-  post-compaction, the chain anchors at the adopted covered head).
+  post-compaction, the chain anchors at the adopted covered head). A
+  truncated final record is a tolerated torn tail (crash mid-append);
+  an undecodable record followed by complete frames is mid-log
+  corruption and fails closed — a surviving suffix is never dropped
+  silently.
 - A checkpoint can't be forged: adoption requires the claimed covered
   heads AND winner set to match the replica's own verified replay —
   verify-or-nothing, never signature-only trust.
