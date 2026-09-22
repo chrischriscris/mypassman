@@ -67,6 +67,9 @@ enum Cmd {
         /// multi-field fills: --type username --type password (macOS)
         #[arg(long = "type")]
         r#type: Vec<String>,
+        /// (launchers) require this bundle id to be frontmost at delivery
+        #[arg(long = "expect-bundle", hide = true)]
+        expect_bundle: Option<String>,
     },
     /// List items (names + kinds only — fields stay sealed)
     #[command(alias = "ls")]
@@ -132,6 +135,9 @@ enum Cmd {
         /// type code as synthetic keystrokes — clipboard never touched (macOS)
         #[arg(long = "type")]
         r#type: bool,
+        /// (launchers) require this bundle id to be frontmost at delivery
+        #[arg(long = "expect-bundle", hide = true)]
+        expect_bundle: Option<String>,
     },
     /// Edit fields of an existing item (refuses to create — use `add`)
     Edit {
@@ -166,6 +172,9 @@ enum Cmd {
         /// verify against the item's current TOTP code instead of a field
         #[arg(long)]
         otp: bool,
+        /// require this bundle id to be frontmost at delivery
+        #[arg(long = "expect-bundle")]
+        expect_bundle: Option<String>,
     },
     /// (internal) exit 0 iff the unlock daemon answers PING — locked
     /// launchers poll this instead of `list`, which would run a doomed
@@ -1281,22 +1290,22 @@ fn autofill_preflight() -> Result<(), String> {
 /// `expected` is the value the pasteboard must still hold — the JXA
 /// helper compares-and-posts atomically so a swapped clipboard can never
 /// emit the wrong secret.
-fn paste_into_app(expected: &[u8]) -> Result<(), String> {
+fn paste_into_app(expected: &[u8], bundle: Option<&str>) -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    return autofill::paste(expected);
+    return autofill::paste(expected, bundle);
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = expected;
+        let _ = (expected, bundle);
         Err("paste autofill is macOS-only so far".into())
     }
 }
 
-fn type_into_app(parts: &[&str]) -> Result<(), String> {
+fn type_into_app(parts: &[&str], expect: Option<&str>) -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    return autofill::type_seq(parts);
+    return autofill::type_seq(parts, expect);
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = parts;
+        let _ = (parts, expect);
         Err("type autofill is macOS-only so far".into())
     }
 }
@@ -1323,8 +1332,15 @@ fn fetch_item(dir: &Path, rec: bool, name: &str) -> Result<mpm_core::Item, Strin
     vault.item(&rid).map_err(|e| e.to_string())
 }
 
-fn cmd_get(dir: &Path, rec: bool, name: &str, show: bool, out: &Out) -> Result<(), String> {
-    render_item(&fetch_item(dir, rec, name)?, show, out)
+fn cmd_get(
+    dir: &Path,
+    rec: bool,
+    name: &str,
+    show: bool,
+    out: &Out,
+    expect: Option<&str>,
+) -> Result<(), String> {
+    render_item(&fetch_item(dir, rec, name)?, show, out, expect)
 }
 
 /// `__dopaste <id> <field>` — the second half of a two-phase fill. The
@@ -1339,6 +1355,7 @@ fn cmd_dopaste(
     id: &str,
     field: Option<&String>,
     otp: bool,
+    expect: Option<&str>,
 ) -> Result<(), String> {
     // the JXA helper compares + posts atomically; Zeroizing because this
     // buffer is a secret copy that would otherwise linger after free
@@ -1359,12 +1376,17 @@ fn cmd_dopaste(
                 .to_vec(),
         )
     };
-    paste_into_app(&expected)?;
+    paste_into_app(&expected, expect)?;
     eprintln!("pasted");
     Ok(())
 }
 
-fn render_item(item: &mpm_core::Item, show: bool, out: &Out) -> Result<(), String> {
+fn render_item(
+    item: &mpm_core::Item,
+    show: bool,
+    out: &Out,
+    expect: Option<&str>,
+) -> Result<(), String> {
     let fmap = field_map();
     let inv: BTreeMap<u8, (&str, bool)> = fmap.iter().map(|(n, (t, s))| (*t, (*n, *s))).collect();
 
@@ -1387,7 +1409,7 @@ fn render_item(item: &mpm_core::Item, show: bool, out: &Out) -> Result<(), Strin
                     }
                     Out::Paste(_) => {
                         copy_to_clipboard(val)?; // concealed write + janitor, then ⌘V
-                        paste_into_app(val)?; // JXA verifies board==val first
+                        paste_into_app(val, expect)?; // JXA verifies board==val first
                         eprintln!("pasted '{field}'");
                     }
                     _ => unreachable!(),
@@ -1405,7 +1427,7 @@ fn render_item(item: &mpm_core::Item, show: bool, out: &Out) -> Result<(), Strin
                             .map_err(|_| "field isn't UTF-8 — can't type it")?,
                     );
                 }
-                type_into_app(&parts)?;
+                type_into_app(&parts, expect)?;
                 eprintln!("typed {}", fs.join(" ⇥ "));
             }
             Out::Print => unreachable!(),
@@ -1911,7 +1933,13 @@ fn totp_code(item: &mpm_core::Item) -> Result<(String, u64), String> {
 
 /// `otp <name>` — current TOTP code for any item carrying a totp_secret
 /// (a login can hold its own 2FA; a `totp` item is the standalone form).
-fn cmd_otp(dir: &Path, rec: bool, name: &str, out: &Out) -> Result<(), String> {
+fn cmd_otp(
+    dir: &Path,
+    rec: bool,
+    name: &str,
+    out: &Out,
+    expect: Option<&str>,
+) -> Result<(), String> {
     let item = match daemon::item(dir, name)? {
         daemon::DaemonItem::Found(i, _, _, _) => i,
         daemon::DaemonItem::Missing => return Err(format!("'{name}': not found")),
@@ -1929,12 +1957,12 @@ fn cmd_otp(dir: &Path, rec: bool, name: &str, out: &Out) -> Result<(), String> {
         }
         Out::Paste(_) => {
             copy_to_clipboard(code.as_bytes())?;
-            paste_into_app(code.as_bytes())?;
+            paste_into_app(code.as_bytes(), expect)?;
             eprintln!("pasted code");
         }
         Out::Type(_) => {
             autofill_preflight()?;
-            type_into_app(&[&code])?;
+            type_into_app(&[&code], expect)?;
             eprintln!("typed code");
         }
         Out::Print => println!("{code}  (valid {left}s more)"),
@@ -3092,8 +3120,9 @@ fn main() {
             copy,
             paste,
             r#type,
+            expect_bundle,
         } => pick_out(copy.as_ref(), paste.as_ref(), r#type)
-            .and_then(|out| cmd_get(&dir, rec, name, *show, &out)),
+            .and_then(|out| cmd_get(&dir, rec, name, *show, &out, expect_bundle.as_deref())),
         Cmd::List { json } => cmd_list(&dir, rec, *json),
         Cmd::Rm { name } => cmd_rm(&dir, rec, name),
         Cmd::History { name, json } => cmd_history(&dir, rec, name, *json),
@@ -3114,6 +3143,7 @@ fn main() {
             copy,
             paste,
             r#type,
+            expect_bundle,
         } => {
             let s = String::new();
             pick_out(
@@ -3125,13 +3155,25 @@ fn main() {
                     &[]
                 },
             )
-            .and_then(|out| cmd_otp(&dir, rec, name, &out))
+            .and_then(|out| cmd_otp(&dir, rec, name, &out, expect_bundle.as_deref()))
         }
         Cmd::Edit { name, fields } => cmd_edit(&dir, rec, name, fields),
         Cmd::Run { inject, cmd } => cmd_run(&dir, rec, inject, cmd),
         Cmd::Clipclear => cmd_clipclear(),
         Cmd::Preflight => autofill_preflight().map(|_| println!("ok")),
-        Cmd::Dopaste { id, field, otp } => cmd_dopaste(&dir, rec, id, field.as_ref(), *otp),
+        Cmd::Dopaste {
+            id,
+            field,
+            otp,
+            expect_bundle,
+        } => cmd_dopaste(
+            &dir,
+            rec,
+            id,
+            field.as_ref(),
+            *otp,
+            expect_bundle.as_deref(),
+        ),
         Cmd::Export { path } => cmd_export(&dir, rec, path),
         Cmd::Import {
             path,

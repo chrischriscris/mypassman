@@ -17,6 +17,7 @@ import {
   useNavigation,
 } from "@raycast/api";
 import { getFavicon, useExec } from "@raycast/utils";
+import { identifyTarget, sameTarget } from "./fill-target";
 import { ChildProcess, execFile, spawn } from "child_process";
 import { homedir } from "os";
 import { promisify } from "util";
@@ -244,12 +245,16 @@ async function fillInner(item: VaultItem, fields: string[], mode: "paste" | "typ
     t.hide();
   }
   // the app that was frontmost when Raycast opened is the fill's intended
-  // destination — verify it's still frontmost after our window closes so
-  // a focus jump can't carry a secret somewhere else
-  let intended = "";
-  try {
-    intended = (await getFrontmostApplication()).bundleId ?? "";
-  } catch {}
+  // destination — if it can't be identified the fill aborts BEFORE the
+  // secret is even read (an indeterminate destination never receives one)
+  const intended = identifyTarget(await getFrontmostApplication().catch(() => null));
+  if (!intended) {
+    return fail(
+      `Couldn't ${mode} ${what}`,
+      new Error("can't identify the target app — fill aborted before touching your secret"),
+      false,
+    );
+  }
   // Phase 1 — everything that can fail while the window is still open:
   // CGEvent permission check for typing; the concealed clipboard write
   // for paste (its keystroke goes through System Events instead).
@@ -261,38 +266,30 @@ async function fillInner(item: VaultItem, fields: string[], mode: "paste" | "typ
   } catch (e) {
     return fail(`Couldn't ${mode} ${what}`, e, false);
   }
-  // Phase 2 — close, let focus return, then post the event(s).
+  // Phase 2 — close, let focus return, then re-verify the destination
+  // before any event is posted.
   await closeMainWindow({ clearRootSearch: true });
   await waitForFocus();
-  let target = "";
-  let targetOk = true;
-  try {
-    const app = await getFrontmostApplication();
-    target = app.name;
-    // an indeterminate destination can't prove it's the intended app —
-    // missing bundleId or a failed lookup aborts rather than spraying a
-    // secret wherever focus happens to be
-    targetOk = !intended || (!!app.bundleId && app.bundleId === intended);
-  } catch {
-    targetOk = !intended;
-  }
-  if (!targetOk) {
+  const front = await getFrontmostApplication().catch(() => null);
+  if (!sameTarget(intended, front)) {
     // the copy stays sealed — the janitor clears it within the clip TTL;
     // better a missed fill than a password in the wrong window
-    return showHUD(`⚠ Focus moved to ${target || "an unknown app"} — fill aborted`);
+    return showHUD(`⚠ Focus moved to ${front?.name || "an unknown app"} — fill aborted`);
   }
   try {
+    // --expect-bundle makes the CLI re-verify the same app is frontmost at
+    // delivery time (inside the paste JXA, and before each typed field)
     if (mode === "paste") {
       // __dopaste re-verifies the pasteboard still holds this exact value
-      await run(["__dopaste", item.id, otp ? "--otp" : useFields[0]]);
+      await run(["__dopaste", item.id, otp ? "--otp" : useFields[0], "--expect-bundle", intended.bundleId]);
     } else {
       await run(
         otp
-          ? ["otp", item.id, "--type"]
-          : ["get", item.id, ...useFields.flatMap((f) => ["--type", f])],
+          ? ["otp", item.id, "--type", "--expect-bundle", intended.bundleId]
+          : ["get", item.id, ...useFields.flatMap((f) => ["--type", f]), "--expect-bundle", intended.bundleId],
       );
     }
-    await showHUD(`${what} ${mode === "paste" ? "pasted" : "typed"}${target ? ` → ${target}` : ""}`);
+    await showHUD(`${what} ${mode === "paste" ? "pasted" : "typed"}${front?.name ? ` → ${front.name}` : ""}`);
     bumpRecent(item.id);
   } catch (e) {
     await fail(`Couldn't ${mode} ${what}`, e, true);
