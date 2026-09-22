@@ -153,6 +153,44 @@ fn check_url_scheme(url: &str) -> Result<(), String> {
 /// against a malicious/buggy server streaming garbage.
 const MAX_RESP_BYTES: u64 = 64 << 20;
 
+// ── push batching ───────────────────────────────────────────────────
+
+/// Relay ingest caps (SYNC.md): one POST may carry at most 256 frames and
+/// at most 1 MiB of body. Both caps bind — a frame count alone still lets
+/// large ops overflow the body limit.
+const PUSH_MAX_FRAMES: usize = 256;
+const PUSH_MAX_BYTES: usize = 1 << 20;
+
+/// Split `ops` (ascending seqs, all ahead of the remote head) into index
+/// ranges that each fit inside BOTH push caps. A single frame larger than
+/// the body cap can never be accepted — fail it loudly instead of
+/// retrying forever.
+fn push_batch_bounds(ops: &[&Op]) -> Result<Vec<(usize, usize)>, String> {
+    let mut out = Vec::new();
+    let (mut start, mut n, mut bytes) = (0usize, 0usize, 0usize);
+    for (i, op) in ops.iter().enumerate() {
+        let flen = mpm_core::op::OP_HEADER_LEN + op.ct.len();
+        if flen > PUSH_MAX_BYTES {
+            return Err(format!(
+                "op seq {} is {} bytes on the wire — exceeds the relay's 1 MiB cap and can never sync",
+                op.seq, flen
+            ));
+        }
+        if n == PUSH_MAX_FRAMES || bytes + flen > PUSH_MAX_BYTES {
+            out.push((start, i));
+            start = i;
+            n = 0;
+            bytes = 0;
+        }
+        n += 1;
+        bytes += flen;
+    }
+    if n > 0 {
+        out.push((start, ops.len()));
+    }
+    Ok(out)
+}
+
 // ── http ────────────────────────────────────────────────────────────
 
 fn agent() -> ureq::Agent {
@@ -564,23 +602,35 @@ pub fn cmd_sync(dir: &Path) -> Result<(), String> {
         );
     }
     if own_tip > remote_head {
-        let mut body = Vec::new();
-        for op in own.ops.iter().skip_while(|o| o.seq <= remote_head) {
-            body.extend_from_slice(&op.encode());
+        let pending: Vec<&Op> = own.ops.iter().filter(|o| o.seq > remote_head).collect();
+        for (s, e) in push_batch_bounds(&pending)? {
+            let mut body = Vec::new();
+            for op in &pending[s..e] {
+                body.extend_from_slice(&op.encode());
+            }
+            let batch_last = pending[e - 1].seq;
+            let r = http(
+                "POST",
+                &api(
+                    &cfg,
+                    &m.vault_id,
+                    &format!("ops?device={}", mpm_store::hex(&me)),
+                ),
+                Some(&wtok),
+                Some(&body),
+                &[],
+            )?;
+            check(r.status, &r.body)?;
+            // the relay must report a head covering every frame we sent —
+            // anything less means it accepted a prefix it can't name
+            let head = jnum(&json(&r.body)?, "head")?;
+            if head < batch_last {
+                return Err(format!(
+                    "relay accepted a push batch but reports head {head} < {batch_last} — rerun sync"
+                ));
+            }
+            pushed = batch_last - remote_head;
         }
-        let r = http(
-            "POST",
-            &api(
-                &cfg,
-                &m.vault_id,
-                &format!("ops?device={}", mpm_store::hex(&me)),
-            ),
-            Some(&wtok),
-            Some(&body),
-            &[],
-        )?;
-        check(r.status, &r.body)?;
-        pushed = own_tip - remote_head;
     }
 
     // ── manifest reconcile ──
@@ -1412,4 +1462,77 @@ pub fn cmd_pair_revoke(dir: &Path, rec: bool, prefix: &str, keep_keys: bool) -> 
     eprintln!("revoked '{dev_name}' ({dev_hex})");
     eprintln!("note: it keeps whatever it already synced — rotate exposed secrets if needed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn op(seq: u64, ct_len: usize) -> Op {
+        Op {
+            seq,
+            nonce: [0u8; 24],
+            sig: [0u8; 64],
+            ct: vec![0u8; ct_len],
+        }
+    }
+
+    fn body_len(ops: &[&Op], (s, e): (usize, usize)) -> usize {
+        ops[s..e]
+            .iter()
+            .map(|o| mpm_core::op::OP_HEADER_LEN + o.ct.len())
+            .sum()
+    }
+
+    #[test]
+    fn push_batches_respect_frame_cap() {
+        // 300 small ops → two batches: 256 + 44
+        let ops: Vec<Op> = (1..=300).map(|s| op(s, 32)).collect();
+        let refs: Vec<&Op> = ops.iter().collect();
+        let bounds = push_batch_bounds(&refs).unwrap();
+        assert_eq!(bounds, vec![(0, 256), (256, 300)]);
+        for b in &bounds {
+            assert!(b.1 - b.0 <= PUSH_MAX_FRAMES);
+            assert!(body_len(&refs, *b) <= PUSH_MAX_BYTES);
+        }
+    }
+
+    #[test]
+    fn push_batches_respect_byte_cap() {
+        // ~256 KiB ciphertexts: the byte cap binds long before 256 frames
+        let per = PUSH_MAX_BYTES / 4 - mpm_core::op::OP_HEADER_LEN;
+        let ops: Vec<Op> = (1..=10).map(|s| op(s, per)).collect();
+        let refs: Vec<&Op> = ops.iter().collect();
+        let bounds = push_batch_bounds(&refs).unwrap();
+        // each batch holds at most 4 such frames (5 would exceed 1 MiB)
+        assert_eq!(bounds, vec![(0, 4), (4, 8), (8, 10)]);
+        for b in &bounds {
+            assert!(body_len(&refs, *b) <= PUSH_MAX_BYTES);
+        }
+    }
+
+    #[test]
+    fn push_batches_byte_cap_boundary() {
+        // a frame that fits exactly ends the batch at exactly 1 MiB
+        let big = PUSH_MAX_BYTES - mpm_core::op::OP_HEADER_LEN;
+        let ops: Vec<Op> = vec![op(1, big), op(2, 0)];
+        let refs: Vec<&Op> = ops.iter().collect();
+        let bounds = push_batch_bounds(&refs).unwrap();
+        assert_eq!(bounds, vec![(0, 1), (1, 2)]);
+        assert_eq!(body_len(&refs, bounds[0]), PUSH_MAX_BYTES);
+    }
+
+    #[test]
+    fn push_batches_reject_oversize_frame() {
+        // one frame bigger than the body cap can never sync — loud error
+        let ops: Vec<Op> = vec![op(1, 8), op(2, PUSH_MAX_BYTES), op(3, 8)];
+        let refs: Vec<&Op> = ops.iter().collect();
+        let err = push_batch_bounds(&refs).unwrap_err();
+        assert!(err.contains("seq 2"), "{err}");
+    }
+
+    #[test]
+    fn push_batches_empty() {
+        assert!(push_batch_bounds(&[]).unwrap().is_empty());
+    }
 }
