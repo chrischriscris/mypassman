@@ -7,6 +7,7 @@ pub const SIG_LEN: usize = 64;
 pub const BUNDLE_LEN: usize = KEY_LEN * 2;
 
 const BUNDLE_V2: u8 = 0x02;
+const BUNDLE_V3: u8 = 0x03;
 
 pub type SigningKeyBytes = [u8; KEY_LEN];
 pub type VerifyingKeyBytes = [u8; KEY_LEN];
@@ -79,11 +80,24 @@ impl KeyBundle {
         self.owner_signing_key().verifying_key().to_bytes()
     }
 
-    /// v2 wire: 0x02 || n(1) || (epoch u32 LE || dek 32)×n sorted || owner_seed(32)
+    /// v2 wire: 0x02 || n(u8) || (epoch u32 LE || dek 32)×n sorted || owner_seed(32)
+    /// v3 wire: 0x03 || n(u32 LE) || (epoch u32 LE || dek 32)×n sorted || owner_seed(32)
+    ///
+    /// v2's u8 count overflows at 256 DEKs — past that the bundle switches to
+    /// v3. Old binaries decode everything ≤255 exactly as before, so a bundle
+    /// only becomes version-exclusive at the count that would have locked the
+    /// old reader out anyway (CRYPTO-01).
     fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
-        let mut b = Vec::with_capacity(2 + self.deks.len() * (4 + KEY_LEN) + KEY_LEN);
-        b.push(BUNDLE_V2);
-        b.push(self.deks.len() as u8);
+        let v2 = self.deks.len() <= u8::MAX as usize;
+        let mut b =
+            Vec::with_capacity(if v2 { 2 } else { 5 } + self.deks.len() * (4 + KEY_LEN) + KEY_LEN);
+        if v2 {
+            b.push(BUNDLE_V2);
+            b.push(self.deks.len() as u8);
+        } else {
+            b.push(BUNDLE_V3);
+            b.extend_from_slice(&(self.deks.len() as u32).to_le_bytes());
+        }
         for (epoch, dek) in &self.deks {
             b.extend_from_slice(&epoch.to_le_bytes());
             b.extend_from_slice(&dek[..]);
@@ -107,16 +121,27 @@ impl KeyBundle {
                 owner_seed: Zeroizing::new(owner),
             });
         }
-        if b.len() < 2 + KEY_LEN || b[0] != BUNDLE_V2 {
+        if b.len() < 2 + KEY_LEN {
             return Err(CryptoError::BadKey);
         }
-        let n = b[1] as usize;
-        let want = 2 + n * (4 + KEY_LEN) + KEY_LEN;
+        let (n, mut pos) = match b[0] {
+            BUNDLE_V2 => (b[1] as usize, 2usize),
+            BUNDLE_V3 => {
+                if b.len() < 5 + KEY_LEN {
+                    return Err(CryptoError::BadKey);
+                }
+                (
+                    u32::from_le_bytes(b[1..5].try_into().unwrap()) as usize,
+                    5usize,
+                )
+            }
+            _ => return Err(CryptoError::BadKey),
+        };
+        let want = pos + n * (4 + KEY_LEN) + KEY_LEN;
         if b.len() != want {
             return Err(CryptoError::BadKey);
         }
         let mut deks = std::collections::BTreeMap::new();
-        let mut pos = 2;
         for _ in 0..n {
             let epoch = u32::from_le_bytes(b[pos..pos + 4].try_into().unwrap());
             let mut dek = [0u8; KEY_LEN];
@@ -206,4 +231,82 @@ impl DeviceKey {
 pub fn verify(vk_bytes: &VerifyingKeyBytes, msg: &[u8], sig: &Signature) -> Result<()> {
     let vk = VerifyingKey::from_bytes(vk_bytes).map_err(|_| CryptoError::BadKey)?;
     vk.verify(msg, sig).map_err(|_| CryptoError::BadSignature)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(bundle: &KeyBundle, aad_epoch: u32) -> KeyBundle {
+        let kek = [7u8; KEY_LEN];
+        let aad = b"test-aad";
+        let blob = bundle.wrap(&kek, aad).unwrap();
+        KeyBundle::unwrap(&kek, aad, &blob, aad_epoch).unwrap()
+    }
+
+    #[test]
+    fn bundle_v2_roundtrip() {
+        let b = roundtrip(&KeyBundle::generate(), 1);
+        assert_eq!(b.current_epoch(), 1);
+    }
+
+    /// v1 (64-byte) bundles must still decode — their DEK registers under
+    /// the wrap slot's epoch hint.
+    #[test]
+    fn bundle_v1_decodes_under_epoch_hint() {
+        let mut raw = [0u8; BUNDLE_LEN];
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut raw);
+        // v1 has no version byte — raw key material may collide with one
+        raw[0] = BUNDLE_V2;
+        let b = KeyBundle::from_bytes(&raw, 42).unwrap();
+        assert_eq!(b.current_epoch(), 42);
+        assert_eq!(b.dek_at(42).unwrap(), &raw[..KEY_LEN]);
+        assert!(b.dek_at(1).is_none());
+    }
+
+    /// CRYPTO-01: a bundle with ≤255 DEKs stays on the v2 wire — old
+    /// binaries keep reading bundles in the range they could always read.
+    #[test]
+    fn bundle_255_deks_stays_v2() {
+        let mut b = KeyBundle::generate();
+        for _ in 1..255 {
+            b.rotate();
+        }
+        assert_eq!(b.current_epoch(), 255);
+        let bytes = b.to_bytes();
+        assert_eq!(bytes[0], BUNDLE_V2);
+        let back = roundtrip(&b, 255);
+        assert_eq!(back.current_epoch(), 255);
+        assert!(back.dek_at(1).is_some());
+    }
+
+    /// CRYPTO-01: the 256th DEK overflowed v2's u8 count → unwrap failed and
+    /// every replica locked out. v3 carries the full history.
+    #[test]
+    fn bundle_256_deks_switches_to_v3() {
+        let mut b = KeyBundle::generate();
+        for _ in 1..300 {
+            b.rotate();
+        }
+        assert_eq!(b.current_epoch(), 300);
+        let bytes = b.to_bytes();
+        assert_eq!(bytes[0], BUNDLE_V3);
+        let back = roundtrip(&b, 300);
+        assert_eq!(back.current_epoch(), 300);
+        // every old ciphertext stays decryptable — nothing is dropped
+        for e in 1..=300 {
+            assert!(back.dek_at(e).is_some(), "epoch {e} lost");
+        }
+    }
+
+    #[test]
+    fn bundle_v3_rejects_truncation() {
+        let mut b = KeyBundle::generate();
+        for _ in 1..256 {
+            b.rotate();
+        }
+        let mut bytes = b.to_bytes().to_vec();
+        bytes.pop();
+        assert!(KeyBundle::from_bytes(&bytes, 1).is_err());
+    }
 }

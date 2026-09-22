@@ -39,6 +39,22 @@ Argon2id: version 0x13, params (`m_kib`, `t`, `p`) + 32-byte salt stored
 in the manifest KDF field and per-wrap-slot. AEAD is XChaCha20-Poly1305
 (24-byte nonces) throughout.
 
+KeyBundle plaintext (inside each wrap-slot blob):
+
+```
+v1 = dek(32) || owner_seed(32)                      — legacy, exactly 64 bytes
+v2 = 0x02 || n(u8)    || (epoch u32le || dek)×n     || owner_seed(32)
+v3 = 0x03 || n(u32le) || (epoch u32le || dek)×n     || owner_seed(32)
+```
+
+- `n` = number of retained DEKs (epoch → key), sorted ascending. Old
+  ciphertext opens under its own epoch's DEK, so DEKs are never dropped.
+- v1 blobs carry no version byte and are always exactly 64 bytes; the DEK
+  registers under the wrap slot's `key_epoch`.
+- Writers emit v2 while `n ≤ 255` and v3 beyond — v2's u8 count cannot
+  represent 256+ entries, so a bundle becomes v3-exclusive exactly where a
+  v2 reader would have failed anyway. Readers MUST accept all three forms.
+
 ## MANIFEST
 
 ```
