@@ -115,6 +115,14 @@ fn save_cfg(vault_id: &[u8; 16], cfg: &SyncCfg) -> Result<(), String> {
         std::fs::write(&tmp, &buf).map_err(|e| e.to_string())?;
     }
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    // fsync the directory too — the rename itself must be durable, or a
+    // crash after `pair finish` loses tokens whose invite is already burned
+    if let Some(parent) = path.parent() {
+        #[cfg(unix)]
+        std::fs::File::open(parent)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 

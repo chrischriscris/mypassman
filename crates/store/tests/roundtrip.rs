@@ -1698,3 +1698,38 @@ fn revoked_device_extreme_hlc_never_reaches_clock() {
     assert!(v.next_hlc() <= cap);
 }
 
+/// REL-01: device-key writes are atomic — a crashed save leaves a stray
+/// tmp sibling, never a torn .dev. The loader must keep reading the real
+/// file regardless of litter.
+#[test]
+fn device_key_survives_tmp_litter() {
+    let vault_id = [9u8; 16];
+    let key = DeviceKey::generate();
+    mpm_store::save_device_key(&vault_id, &key).unwrap();
+    let back = mpm_store::load_device_key(&vault_id).unwrap();
+    assert_eq!(back.id, key.id);
+    assert_eq!(back.seed_bytes(), key.seed_bytes());
+
+    // litter the devices dir with a crashed-write tmp — load must ignore it
+    let dir = std::env::var_os("MPM_DATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dirs::data_local_dir().unwrap().join("mypassman"))
+        .join("devices");
+    std::fs::write(
+        dir.join(format!("{}.999999.tmp", mpm_store::hex(&vault_id))),
+        b"torn",
+    )
+    .unwrap();
+    let back = mpm_store::load_device_key(&vault_id).unwrap();
+    assert_eq!(back.seed_bytes(), key.seed_bytes());
+
+    // a second save atomically replaces — still reads clean
+    mpm_store::save_device_key(&vault_id, &key).unwrap();
+    assert_eq!(
+        mpm_store::load_device_key(&vault_id).unwrap().seed_bytes(),
+        key.seed_bytes()
+    );
+
+    let _ = std::fs::remove_file(dir.join(format!("{}.dev", mpm_store::hex(&vault_id))));
+    let _ = std::fs::remove_file(dir.join(format!("{}.999999.tmp", mpm_store::hex(&vault_id))));
+}

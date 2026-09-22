@@ -360,6 +360,7 @@ pub fn save_base_vector(dir: &Path, covered: &[mpm_core::op::Gossip]) -> Result<
         f.sync_all()?;
     }
     fs::rename(&tmp, &path)?;
+    fsync_dir(&dir.join(SNAPS_DIR))?;
     set_private_file(&path)?;
     Ok(())
 }
@@ -431,6 +432,9 @@ fn device_key_path(vault_id: &[u8; 16]) -> Result<PathBuf> {
 }
 
 /// File layout: device_id(16) || seed(32). Mode 0600.
+/// tmp → fsync → rename → fsync dir: a crash mid-write must leave the
+/// previous key intact — a truncated .dev permanently bricks the device's
+/// signing identity for this vault (REL-01).
 pub fn save_device_key(vault_id: &[u8; 16], key: &DeviceKey) -> Result<()> {
     let dir = device_dir()?;
     private_dirs().create(&dir)?;
@@ -440,11 +444,21 @@ pub fn save_device_key(vault_id: &[u8; 16], key: &DeviceKey) -> Result<()> {
     buf.extend_from_slice(&key.id);
     buf.extend_from_slice(key.seed_bytes());
     // mode at creation: the seed must never exist at 0644, even briefly
-    let mut f = private_files().create(true).truncate(true).open(&path)?;
-    f.write_all(&buf)?;
-    f.sync_all()?;
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let res = (|| -> Result<()> {
+        {
+            let mut f = private_files().create_new(true).open(&tmp)?;
+            f.write_all(&buf)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, &path)?;
+        fsync_dir(&dir)
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
     set_private_file(&path)?;
-    Ok(())
+    res
 }
 
 pub fn load_device_key(vault_id: &[u8; 16]) -> Result<DeviceKey> {
@@ -513,6 +527,7 @@ pub fn save_checkpoint(
         f.sync_all()?;
     }
     fs::rename(&tmp, &path)?;
+    fsync_dir(&dir)?;
     set_private_file(&path)?;
     Ok(())
 }
@@ -541,6 +556,7 @@ pub fn write_checkpoint_raw(vault_id: &[u8; 16], buf: &[u8]) -> Result<()> {
         f.sync_all()?;
     }
     fs::rename(&tmp, &path)?;
+    fsync_dir(&dir)?;
     set_private_file(&path)?;
     Ok(())
 }

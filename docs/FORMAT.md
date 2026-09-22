@@ -20,10 +20,15 @@ Outside the vault dir, per device (platform local data dir,
 `$MPM_DATA` override):
 
 ```
-devices/<vault_id_hex>.<device_id_hex>   device_id(16) || ed25519 seed(32), mode 0600
-sync/<vault_id_hex>.json                 relay url + tokens, mode 0600
-checkpoints/<vault_id_hex>.ckpt          device-signed last-verified head
+devices/<vault_id_hex>.dev    device_id(16) || ed25519 seed(32), mode 0600
+devices/<vault_id_hex>.head   sig(64) || device_id(16) || seq(8) || head(32)
+                              — device-signed last-verified log tip
+sync/<vault_id_hex>.conf      relay url + tokens (key=value lines), mode 0600
 ```
+
+All single-file writes are tmp-file + fsync + rename + dir-fsync, so a
+crash mid-write leaves the previous file intact. Log appends fsync the
+file and the ops dir; a torn final frame is detected at replay.
 
 ## Keys
 
