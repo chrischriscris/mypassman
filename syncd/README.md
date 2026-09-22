@@ -82,3 +82,16 @@ POST /v/:vault/enroll/finish    invite  {device} → {read, write, manifest}
 Write tokens are device-bound: they can only extend their own chain, and the
 server verifies every op's ed25519 signature against the manifest registry —
 a leaked write token can't forge another device's ops.
+
+## Tests
+
+```sh
+npm test          # manifest fixtures + contract suite vs `wrangler dev`
+npm run test:rust # same contract suite vs ../target/debug/mpm-syncd
+```
+
+`test/contract.test.mjs` is the shared protocol contract (auth, CAS,
+enrollment, revoke, limits, pagination); it runs unchanged against both
+relays. `../fixtures/manifest/cases.tsv` is consumed by both manifest
+parsers (Rust: `../crates/core/tests/manifest_fixtures.rs`); regenerate
+it with `node test/gen-manifest-fixtures.mjs`.
