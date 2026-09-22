@@ -389,11 +389,8 @@ fn refresh_foreign(
     if devs.iter().all(|d| d == vault.device_id()) {
         return Ok(());
     }
-    // foreign logs exist → the on-disk manifest may have moved (device
-    // add/revoke via pair syncs as a manifest push). Reload it: ops from a
-    // device our in-memory copy doesn't know — or still trusts after a
-    // revocation — must verify against the CURRENT registry.
-    reload_manifest(vault, dir)?;
+    // (the manifest itself is reloaded per request in serve — foreign
+    // logs only decide whether ops need verifying against it)
     for dev in devs {
         if &dev == vault.device_id() || quarantined.contains(&dev) {
             continue;
@@ -541,6 +538,13 @@ fn serve(
     foreign: &mut HashMap<[u8; 16], (u64, [u8; 32])>,
     quarantined: &mut std::collections::HashSet<[u8; 16]>,
 ) -> Result<Vec<u8>, String> {
+    // The on-disk manifest is authoritative: another process may have
+    // added/revoked a device or rotated keys while we slept. Reload it on
+    // EVERY request — not only when foreign logs exist — or a key_epoch
+    // move would let a single-device vault keep writing under a stale DEK.
+    // An epoch/vault/owner change refuses: this process's DEK replay is
+    // stale, so the daemon must be re-unlocked (SEC-02).
+    reload_manifest(vault, dir)?;
     // catch up with any out-of-band appends before answering (the caller
     // holds the vault lock across the whole request)
     let torn = refresh(vault, dir, known).map_err(|e| {
@@ -962,4 +966,114 @@ fn sync_interval() -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(300)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::tests::{init_vault, reopen_vault, tmpdir};
+
+    fn put_payload(name: &str, pw: &str) -> Vec<u8> {
+        let mut it = Item::default();
+        it.set(mpm_core::item::tag::PASSWORD, pw.as_bytes().to_vec());
+        let mut w = Writer::new();
+        w.field(T_NAME, name.as_bytes());
+        w.field(T_KIND, &[ItemKind::Login as u8]);
+        w.field(T_ITEM, &it.encode());
+        w.finish()
+    }
+
+    /// SEC-02: another process rotates keys — the on-disk manifest's
+    /// key_epoch moves while the daemon's in-memory copy stays at the
+    /// old epoch. With only the own log present (no foreign log to trip
+    /// the old reload path), a write must still fail closed: the daemon
+    /// holds a stale DEK and must be re-unlocked, not keep sealing ops
+    /// under a retired key.
+    #[test]
+    fn daemon_fails_closed_on_manifest_key_rotation() {
+        let dir = tmpdir();
+        let (dev, seed) = init_vault(&dir);
+        let mut v = reopen_vault(&dir, &seed, dev.id);
+        let mut known = 0u64;
+        let mut foreign = HashMap::new();
+        let mut quarantined = std::collections::HashSet::new();
+
+        // baseline: a write succeeds while the manifest is current
+        let p = put_payload("a", "x");
+        serve(
+            OP_PUT,
+            &p,
+            &mut v,
+            &dir,
+            &mut known,
+            &mut foreign,
+            &mut quarantined,
+        )
+        .unwrap();
+
+        // another process rotates: the manifest on disk advances key_epoch
+        // (the real path also re-wraps every slot — the epoch move alone is
+        // what the daemon must notice)
+        let mut m = mpm_store::load_manifest(&dir).unwrap();
+        m.key_epoch += 1;
+        m.snapshot_epoch += 1;
+        let bytes = m.to_file(&v.bundle().owner_signing_key());
+        mpm_store::write_manifest(&dir, &bytes).unwrap();
+
+        // the stale daemon must refuse — both writes AND reads
+        let p = put_payload("b", "y");
+        let err = serve(
+            OP_PUT,
+            &p,
+            &mut v,
+            &dir,
+            &mut known,
+            &mut foreign,
+            &mut quarantined,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("manifest"), "{err}");
+        let err = serve(
+            OP_LIST,
+            &[],
+            &mut v,
+            &dir,
+            &mut known,
+            &mut foreign,
+            &mut quarantined,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("manifest"), "{err}");
+    }
+
+    /// Compatible manifest moves still pass: a snapshot_epoch advance or a
+    /// registry update doesn't invalidate this replica's key bundle.
+    #[test]
+    fn daemon_accepts_compatible_manifest_advance() {
+        let dir = tmpdir();
+        let (dev, seed) = init_vault(&dir);
+        let mut v = reopen_vault(&dir, &seed, dev.id);
+        let mut known = 0u64;
+        let mut foreign = HashMap::new();
+        let mut quarantined = std::collections::HashSet::new();
+
+        let mut m = mpm_store::load_manifest(&dir).unwrap();
+        m.snapshot_epoch += 1;
+        let bytes = m.to_file(&v.bundle().owner_signing_key());
+        mpm_store::write_manifest(&dir, &bytes).unwrap();
+
+        let p = put_payload("a", "x");
+        serve(
+            OP_PUT,
+            &p,
+            &mut v,
+            &dir,
+            &mut known,
+            &mut foreign,
+            &mut quarantined,
+        )
+        .unwrap();
+    }
 }
