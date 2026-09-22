@@ -2,11 +2,13 @@
 //! replaying verified op logs. Decrypt-on-demand: the index holds sealed
 //! `fields_ct`; `item()` opens the inner layer only when asked.
 
+use crate::aad;
 use crate::error::{CoreError, Result};
 use crate::item::{tag, Item, ItemKind};
 use crate::manifest::Manifest;
 use crate::op::{Gossip, Op, OpPlaintext, OpType, Snapshot};
 use crate::{DEVICE_ID_LEN, HASH_LEN, RECORD_ID_LEN};
+use ed25519_dalek::{Signature, Signer};
 use mpm_crypto::aead::{self, NONCE_LEN};
 use mpm_crypto::keys::{DeviceKey, KeyBundle};
 use mpm_crypto::subkey;
@@ -212,6 +214,30 @@ impl Vault {
             pts.push(pt);
         }
         Ok(pts)
+    }
+
+    /// Attest that THIS frame's claim passed verify-or-nothing on an
+    /// unlocked replica — owner-signed over the frame hash, so the proof
+    /// is durable (survives backup/restore under a fresh device key) and
+    /// unforgeable by anyone who can only write files in the vault dir.
+    /// The author of a checkpoint self-attests: it computed the winners
+    /// from its own verified replay, which IS the claim check.
+    pub fn attest_snapshot(&self, frame: &Op) -> [u8; 64] {
+        self.bundle
+            .owner_signing_key()
+            .sign(&aad::snapshot_ok(&self.manifest.vault_id, &frame.hash()))
+            .to_bytes()
+    }
+
+    /// Whether `att` is a valid claim attestation for THIS exact frame
+    /// under this vault's owner key.
+    pub fn snapshot_attested(&self, frame: &Op, att: &[u8; 64]) -> bool {
+        mpm_crypto::keys::verify(
+            &self.manifest.owner_vk,
+            &aad::snapshot_ok(&self.manifest.vault_id, &frame.hash()),
+            &Signature::from_bytes(att),
+        )
+        .is_ok()
     }
 
     /// Continue our own chain from the adopted anchor — call only when the

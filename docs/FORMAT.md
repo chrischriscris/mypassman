@@ -12,6 +12,7 @@ little-endian. `||` = concatenation. Code: `crates/core` (format),
   ops/<device_id_hex>.log  append-only op frames, one log per device
   snapshots/               adopted compaction state (post-compaction; may be empty)
     <author_device>.snap   raw checkpoint op frame (sealed + signed like any op)
+    <author_device>.ok     owner_sig(64) attestation that the .snap claim verified
     base.vec               adopted covered vector: (device_id, seq, head) triples
 ```
 
@@ -183,6 +184,23 @@ vector becomes each log's new hash-chain **anchor**, and covered log
 prefixes are dropped (frames with `seq > covered` kept; tmp-write +
 rename + dir fsync). `base.vec` records the adopted vector — advisory
 only; it carries ids/seqs/hashes, no secrets, and cannot forge ops.
+
+A persisted `.snap` is a cache, never an authority. On unlock it seeds
+anchors and winners only when a matching `<author_device>.ok` attestation
+verifies:
+
+```
+.ok = ed25519 sign(owner_sk, "mypassman/v1/snapok" || vault_id || frame_hash(32))
+```
+
+`frame_hash` is the hash of the exact `.snap` bytes, so the attestation
+proves some replica holding the owner key already ran verify-or-nothing
+on this frame — a vault-directory writer can copy or delete files but
+cannot mint one. A `.snap` without a valid `.ok` is queued for the full
+claim check above (and self-attests on adoption); if its covered ops are
+already dropped from disk the claim is unverifiable and the file can
+never seed state — the resulting log gap surfaces as an honest replay
+error, not silently installed anchors or winners.
 
 Post-compaction verification anchors at the covered head instead of the
 zero hash. Replay skips any on-disk op with `seq <= covered` in-memory

@@ -547,19 +547,35 @@ pub(crate) struct Replay {
 /// Checkpoint ops seen mid-replay are adopted only after their claimed
 /// winners verify against our own replay — verify-or-nothing — and
 /// adopting is what physically drops covered log prefixes.
+///
+/// A persisted `.snap` is a cache, never an authority: it seeds anchors and
+/// winners ONLY when it carries a matching claim attestation — an owner-key
+/// signature proving some replica already ran verify-or-nothing on this
+/// exact frame (`<author>.ok`). An unattested file whose covered ops are
+/// still on disk gets the full claim check below (then self-attests); one
+/// whose covered ops are already dropped is unverifiable and is removed —
+/// the gap it would have covered then surfaces as an honest replay error,
+/// never as silently installed state. (SEC-03)
 pub(crate) fn replay_state(vault: &mut Vault, dir: &Path) -> Result<Replay, String> {
-    // ── snapshot base: best stored checkpoint that still opens ──
+    // ── snapshot base: best stored checkpoint with proven claim ──
     let mut base: Option<mpm_core::op::Snapshot> = None;
     let mut base_score = 0u64;
-    for (author, frame) in mpm_store::load_snapshots(dir).map_err(|e| e.to_string())? {
+    // Unattested persisted snapshots defer to the candidate pass — same
+    // verify-or-nothing as checkpoint ops found mid-replay.
+    let mut pending_snaps: Vec<([u8; 16], mpm_core::Op)> = Vec::new();
+    for (author, frame, att) in mpm_store::load_snapshots(dir).map_err(|e| e.to_string())? {
         match vault.open_snapshot_op(&frame, &author) {
             Ok(snap) => {
-                let score: u64 = snap.covered.iter().map(|g| g.seq).sum();
-                if score > base_score {
-                    base_score = score;
-                    base = Some(snap);
+                if att.is_some_and(|a| vault.snapshot_attested(&frame, &a)) {
+                    let score: u64 = snap.covered.iter().map(|g| g.seq).sum();
+                    if score > base_score {
+                        base_score = score;
+                        base = Some(snap);
+                    } else {
+                        let _ = mpm_store::remove_snapshot(dir, &author); // dominated
+                    }
                 } else {
-                    let _ = mpm_store::remove_snapshot(dir, &author); // dominated
+                    pending_snaps.push((author, frame));
                 }
             }
             Err(e) => {
@@ -672,7 +688,17 @@ pub(crate) fn replay_state(vault: &mut Vault, dir: &Path) -> Result<Replay, Stri
     }
 
     // ── adoption pass: deepest verifiable checkpoint wins ──
+    // Persisted-but-unattested snapshots stand in the same queue: their
+    // claim is checked against this replay exactly like an in-log
+    // checkpoint op. A covered op set that no longer exists on disk makes
+    // the claim unverifiable → the file is removed, never adopted.
+    let mut pending_authors: Vec<[u8; 16]> = Vec::with_capacity(pending_snaps.len());
+    for (author, frame) in pending_snaps {
+        pending_authors.push(author);
+        candidates.push((author, frame));
+    }
     candidates.sort_by_key(|(_, op)| std::cmp::Reverse(op.seq));
+    let mut adopted_author: Option<[u8; 16]> = None;
     for (author, frame) in candidates {
         let Ok(snap) = vault.open_snapshot_op(&frame, &author) else {
             continue;
@@ -680,7 +706,8 @@ pub(crate) fn replay_state(vault: &mut Vault, dir: &Path) -> Result<Replay, Stri
         if vault.check_snapshot_claim(&snap, &tips, &all_pts).is_err() {
             continue; // not covered/verified — stays a plain op in the log
         }
-        if let Err(e) = mpm_store::save_snapshot(dir, &author, &frame.encode()) {
+        let att = vault.attest_snapshot(&frame);
+        if let Err(e) = mpm_store::save_snapshot(dir, &author, &frame.encode(), &att) {
             eprintln!("warning: snapshot save failed: {e}");
             break;
         }
@@ -688,6 +715,7 @@ pub(crate) fn replay_state(vault: &mut Vault, dir: &Path) -> Result<Replay, Stri
             eprintln!("warning: snapshot adopt failed: {e}");
             break;
         }
+        adopted_author = Some(author);
         // Physical drop under the vault lock; contended → next unlock drops.
         if let Ok(_lock) = mpm_store::lock_vault(dir) {
             let mut freed = 0usize;
@@ -700,6 +728,13 @@ pub(crate) fn replay_state(vault: &mut Vault, dir: &Path) -> Result<Replay, Stri
             }
         }
         break;
+    }
+    // Pending snaps that were not adopted are unverifiable-or-dominated
+    // cache files — drop them so they can never seed a later replay.
+    for author in pending_authors {
+        if Some(author) != adopted_author {
+            let _ = mpm_store::remove_snapshot(dir, &author);
+        }
     }
 
     flush_conflicts(vault, dir);
@@ -1819,7 +1854,10 @@ fn cmd_compact(dir: &Path, rec: bool) -> Result<(), String> {
     let frame = op.encode();
     mpm_store::append_op(dir, &own, &op).map_err(|e| e.to_string())?;
     vault.commit(&op).map_err(|e| e.to_string())?;
-    mpm_store::save_snapshot(dir, &own, &frame).map_err(|e| e.to_string())?;
+    // self-attest: the winners in this frame ARE this replica's verified
+    // replay result — the attestation records that fact durably
+    mpm_store::save_snapshot(dir, &own, &frame, &vault.attest_snapshot(&op))
+        .map_err(|e| e.to_string())?;
     let mut freed = 0usize;
     for g in &covered {
         freed +=
@@ -3222,6 +3260,304 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mpm_core::op::Gossip;
+
+    const FAST: KdfParams = KdfParams {
+        m_kib: 1024,
+        t: 1,
+        p: 1,
+    };
+
+    pub(crate) fn tmpdir() -> PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "mpm-cli-test-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Minimal on-disk vault: manifest + password slot + enrolled device.
+    /// Returns (device, seed) — device key files aren't needed because
+    /// replay_state is driven on a Vault built in memory.
+    pub(crate) fn init_vault(dir: &Path) -> (DeviceKey, [u8; 32]) {
+        mpm_store::init_dir(dir).unwrap();
+        let mut salt = [0u8; 32];
+        rand_core_fill(&mut salt);
+        let kek = kdf::derive_kek(b"pw", &salt, &FAST).unwrap();
+        let bundle = KeyBundle::generate();
+        let device = DeviceKey::generate();
+        let seed = *device.seed_bytes();
+        let mut m = Manifest::new(FAST, salt, bundle.owner_verifying_key());
+        m.wrap_slots.push(WrapSlot {
+            slot_type: SLOT_PASSWORD,
+            kdf: Some((FAST, salt)),
+            blob: bundle
+                .wrap(
+                    &kek,
+                    &mpm_core::aad::wrap_slot(&m.vault_id, m.key_epoch, SLOT_PASSWORD),
+                )
+                .unwrap(),
+            extra: Vec::new(),
+        });
+        m.devices.push(mpm_core::DeviceEntry {
+            id: device.id,
+            vk: device.verifying_key(),
+            name: "t".into(),
+            active: true,
+            enrolled_at: 0,
+            revoked_seq: None,
+            extra: Vec::new(),
+        });
+        let bytes = m.to_file(&bundle.owner_signing_key());
+        mpm_store::write_manifest(dir, &bytes).unwrap();
+        (device, seed)
+    }
+
+    pub(crate) fn reopen_vault(dir: &Path, seed: &[u8; 32], dev_id: [u8; 16]) -> Vault {
+        let m = mpm_store::load_manifest(dir).unwrap();
+        let (p, s) = m.wrap_slots[0].kdf.unwrap();
+        let kek = kdf::derive_kek(b"pw", &s, &p).unwrap();
+        let bundle = KeyBundle::unwrap(
+            &kek,
+            &mpm_core::aad::wrap_slot(&m.vault_id, m.key_epoch, SLOT_PASSWORD),
+            &m.wrap_slots[0].blob,
+            m.key_epoch,
+        )
+        .unwrap();
+        Vault::new(m, bundle, DeviceKey::from_bytes(seed, dev_id)).unwrap()
+    }
+
+    /// Add one login op per name; returns the vault with all committed.
+    fn vault_with_ops(dir: &Path, seed: &[u8; 32], dev_id: [u8; 16], names: &[&str]) -> Vault {
+        let mut v = reopen_vault(dir, seed, dev_id);
+        for n in names {
+            let mut it = Item::default();
+            it.set(tag::NAME, n.as_bytes().to_vec());
+            it.set(tag::PASSWORD, b"x".to_vec());
+            let (op, _) = v.make_upsert(ItemKind::Login, it).unwrap();
+            mpm_store::append_op(dir, &dev_id, &op).unwrap();
+            v.commit(&op).unwrap();
+        }
+        v
+    }
+
+    /// Checkpoint covering this device's whole log; winners = every
+    /// record's winning frame, or `swap` applied first (forged claims).
+    fn make_own_checkpoint(
+        v: &mut Vault,
+        dir: &Path,
+        dev_id: [u8; 16],
+        swap_winner: bool,
+    ) -> (mpm_core::Op, Vec<Gossip>) {
+        let (seq, head) = v.head();
+        let covered = vec![Gossip {
+            device_id: dev_id,
+            seq,
+            head,
+        }];
+        let log = mpm_store::read_ops(dir, &dev_id).unwrap();
+        let by_seq: BTreeMap<u64, &mpm_core::Op> = log.ops.iter().map(|o| (o.seq, o)).collect();
+        let winners: Vec<([u8; 16], mpm_core::Op)> = v
+            .winner_origins()
+            .iter()
+            .map(|(d, s)| {
+                // swap: claim the record's OLDEST op as winner instead of
+                // its true winner — a dishonest but validly signed frame
+                let pick = if swap_winner && *s > 1 { 1 } else { *s };
+                (*d, by_seq[&pick].clone())
+            })
+            .collect();
+        (
+            v.make_checkpoint(covered.clone(), winners).unwrap(),
+            covered,
+        )
+    }
+
+    /// Plant a bare .snap file with no attestation — the pre-fix layout /
+    /// what a vault-dir writer can produce from a real signed frame.
+    fn plant_unattested(dir: &Path, author: &[u8; 16], op: &mpm_core::Op) {
+        let snaps = dir.join(mpm_store::SNAPS_DIR);
+        std::fs::create_dir_all(&snaps).unwrap();
+        std::fs::write(
+            snaps.join(format!("{}.snap", mpm_store::hex(author))),
+            op.encode(),
+        )
+        .unwrap();
+    }
+
+    fn snap_att_exists(dir: &Path, author: &[u8; 16]) -> bool {
+        dir.join(mpm_store::SNAPS_DIR)
+            .join(format!("{}.ok", mpm_store::hex(author)))
+            .exists()
+    }
+
+    fn snap_exists(dir: &Path, author: &[u8; 16]) -> bool {
+        dir.join(mpm_store::SNAPS_DIR)
+            .join(format!("{}.snap", mpm_store::hex(author)))
+            .exists()
+    }
+
+    #[test]
+    fn attested_snapshot_adopts_after_prefix_drop() {
+        let dir = tmpdir();
+        let (dev, seed) = init_vault(&dir);
+        let dev_id = dev.id;
+        let mut v = vault_with_ops(&dir, &seed, dev_id, &["a", "b", "c"]);
+        let (ckpt, covered) = make_own_checkpoint(&mut v, &dir, dev_id, false);
+        mpm_store::append_op(&dir, &dev_id, &ckpt).unwrap();
+        v.commit(&ckpt).unwrap();
+        let att = v.attest_snapshot(&ckpt);
+        mpm_store::save_snapshot(&dir, &dev_id, &ckpt.encode(), &att).unwrap();
+        for g in &covered {
+            mpm_store::drop_covered_prefix(&dir, &g.device_id, g.seq).unwrap();
+        }
+        mpm_store::save_base_vector(&dir, &covered).unwrap();
+
+        // replay must adopt the attested snapshot: covered ops are gone,
+        // the anchor carries the chain, winners seed the index
+        let mut v2 = reopen_vault(&dir, &seed, dev_id);
+        replay_state(&mut v2, &dir).unwrap();
+        assert_eq!(v2.records().count(), 3);
+        assert!(v2.anchor(&dev_id).is_some());
+    }
+
+    #[test]
+    fn unattested_snapshot_still_verifiable_when_ops_remain() {
+        let dir = tmpdir();
+        let (dev, seed) = init_vault(&dir);
+        let dev_id = dev.id;
+        let mut v = vault_with_ops(&dir, &seed, dev_id, &["a", "b"]);
+        let (ckpt, _covered) = make_own_checkpoint(&mut v, &dir, dev_id, false);
+        // bare .snap — no .ok sidecar, covered ops still on disk
+        plant_unattested(&dir, &dev_id, &ckpt);
+        mpm_store::append_op(&dir, &dev_id, &ckpt).unwrap();
+
+        let mut v2 = reopen_vault(&dir, &seed, dev_id);
+        replay_state(&mut v2, &dir).unwrap();
+        // claim verified against the replayed covered ops → adopted AND
+        // now attested, so the next unlock takes the fast path
+        assert_eq!(v2.records().count(), 2);
+        assert!(v2.anchor(&dev_id).is_some());
+        assert!(snap_att_exists(&dir, &dev_id));
+    }
+
+    #[test]
+    fn unattested_snapshot_with_dropped_prefix_fails_closed() {
+        let dir = tmpdir();
+        let (dev, seed) = init_vault(&dir);
+        let dev_id = dev.id;
+        let mut v = vault_with_ops(&dir, &seed, dev_id, &["a", "b"]);
+        let (seq, _head) = v.head();
+        let (ckpt, _) = make_own_checkpoint(&mut v, &dir, dev_id, false);
+        // the checkpoint op lives in the log past the covered prefix, so a
+        // missing anchor must surface as a chain gap — not silent emptiness
+        mpm_store::append_op(&dir, &dev_id, &ckpt).unwrap();
+        plant_unattested(&dir, &dev_id, &ckpt);
+        // drop the covered prefix WITHOUT an attestation — the snapshot
+        // claim can never be re-verified; anchors must not be trusted
+        mpm_store::drop_covered_prefix(&dir, &dev_id, seq).unwrap();
+
+        let mut v2 = reopen_vault(&dir, &seed, dev_id);
+        let err = replay_state(&mut v2, &dir).err().unwrap();
+        assert!(err.contains("gap") || err.contains("chain"), "{err}");
+        // never adopted — the unattested frame seeded no anchor. (It may
+        // linger as an untrusted cache file until a replay gets far enough
+        // to evaluate its claim; it can never install state either way.)
+        assert!(v2.anchor(&dev_id).is_none());
+    }
+
+    #[test]
+    fn dishonest_snapshot_claim_is_rejected() {
+        let dir = tmpdir();
+        let (dev, seed) = init_vault(&dir);
+        let dev_id = dev.id;
+        let mut v = vault_with_ops(&dir, &seed, dev_id, &["a", "b"]);
+        // same record twice so seq1 is a loser — the forged checkpoint
+        // claims it as the winner
+        {
+            let rid = match v.find("a") {
+                mpm_core::FindResult::One(r) => r,
+                _ => panic!(),
+            };
+            let mut it = v.item(&rid).unwrap();
+            it.set(tag::PASSWORD, b"v2".to_vec());
+            let op = v.make_update(&rid, ItemKind::Login, it).unwrap();
+            mpm_store::append_op(&dir, &dev_id, &op).unwrap();
+            v.commit(&op).unwrap();
+        }
+        let (ckpt, _) = make_own_checkpoint(&mut v, &dir, dev_id, true);
+        plant_unattested(&dir, &dev_id, &ckpt);
+        mpm_store::append_op(&dir, &dev_id, &ckpt).unwrap();
+
+        let mut v2 = reopen_vault(&dir, &seed, dev_id);
+        replay_state(&mut v2, &dir).unwrap();
+        // claim failed verify-or-nothing → not adopted, file removed; the
+        // checkpoint op remains a merge-inert log entry
+        assert!(!snap_exists(&dir, &dev_id));
+        assert!(v2.anchor(&dev_id).is_none());
+        assert_eq!(v2.records().count(), 2);
+    }
+
+    #[test]
+    fn transplanted_attestation_does_not_authorize() {
+        let dir = tmpdir();
+        let (dev, seed) = init_vault(&dir);
+        let dev_id = dev.id;
+        let mut v = vault_with_ops(&dir, &seed, dev_id, &["a", "b"]);
+        let (ckpt, covered) = make_own_checkpoint(&mut v, &dir, dev_id, false);
+        mpm_store::append_op(&dir, &dev_id, &ckpt).unwrap();
+        v.commit(&ckpt).unwrap();
+        let att = v.attest_snapshot(&ckpt);
+        mpm_store::save_snapshot(&dir, &dev_id, &ckpt.encode(), &att).unwrap();
+        for g in &covered {
+            mpm_store::drop_covered_prefix(&dir, &g.device_id, g.seq).unwrap();
+        }
+        // swap the frame under the existing attestation: the .ok was minted
+        // for different bytes and must not vouch for this one. ckpt2 is a
+        // real signed checkpoint (built post-adoption) — only its hash differs.
+        let ckpt2 = {
+            let mut vv = reopen_vault(&dir, &seed, dev_id);
+            replay_state(&mut vv, &dir).unwrap();
+            let winners: Vec<([u8; 16], mpm_core::Op)> = vv
+                .winner_origins()
+                .iter()
+                .map(|(d, s)| {
+                    (
+                        *d,
+                        vv.adopted_snapshot()
+                            .unwrap()
+                            .winners
+                            .iter()
+                            .find(|(wd, o)| *wd == *d && o.seq == *s)
+                            .unwrap()
+                            .1
+                            .clone(),
+                    )
+                })
+                .collect();
+            vv.make_checkpoint(covered.clone(), winners).unwrap()
+        };
+        std::fs::write(
+            dir.join(mpm_store::SNAPS_DIR)
+                .join(format!("{}.snap", mpm_store::hex(&dev_id))),
+            ckpt2.encode(),
+        )
+        .unwrap();
+
+        let mut v2 = reopen_vault(&dir, &seed, dev_id);
+        // unattested AND unverifiable (covered ops are gone) → the log
+        // gap surfaces honestly; the swapped frame seeded no anchor
+        let err = replay_state(&mut v2, &dir).err().unwrap();
+        assert!(err.contains("gap") || err.contains("chain"), "{err}");
+        assert!(v2.anchor(&dev_id).is_none());
+    }
 
     #[test]
     fn csv_quotes_and_commas() {

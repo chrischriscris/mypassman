@@ -59,3 +59,18 @@ pub fn op_sig_preimage(seq: u64, nonce: &[u8; 24], ct: &[u8]) -> Vec<u8> {
     p.extend_from_slice(ct);
     p
 }
+
+/// Snapshot-attestation preimage: "mypassman/v1/snapok"|vault_id|frame_hash.
+/// A replica holding the owner key signs this only AFTER the checkpoint's
+/// claim passed verify-or-nothing on its own replay. The signature makes a
+/// persisted `.snap` file's provenance durable — a directory writer can
+/// copy or delete it, but cannot make an unverified frame look attested.
+/// Owner (not device) signed so a backup restored under a fresh device key
+/// still verifies.
+pub fn snapshot_ok(vault_id: &[u8; VAULT_ID_LEN], frame_hash: &[u8; 32]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(19 + VAULT_ID_LEN + 32);
+    p.extend_from_slice(b"mypassman/v1/snapok");
+    p.extend_from_slice(vault_id);
+    p.extend_from_slice(frame_hash);
+    p
+}

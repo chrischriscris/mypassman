@@ -1081,7 +1081,8 @@ fn checkpoint_compact_roundtrip() {
     // ── author side: append the checkpoint, drop covered prefixes ──
     mpm_store::append_op(&dir, &dev_id, &ckpt).unwrap();
     v.commit(&ckpt).unwrap();
-    mpm_store::save_snapshot(&dir, &dev_id, &ckpt.encode()).unwrap();
+    let att = v.attest_snapshot(&ckpt);
+    mpm_store::save_snapshot(&dir, &dev_id, &ckpt.encode(), &att).unwrap();
     for g in &covered {
         mpm_store::drop_covered_prefix(&dir, &g.device_id, g.seq).unwrap();
     }
@@ -1115,7 +1116,8 @@ fn checkpoint_compact_roundtrip() {
     };
     let snaps = mpm_store::load_snapshots(&dir).unwrap();
     assert_eq!(snaps.len(), 1);
-    let (author, frame) = &snaps[0];
+    let (author, frame, att2) = &snaps[0];
+    assert!(v2.snapshot_attested(frame, att2.as_ref().unwrap()));
     let snap2 = v2.open_snapshot_op(frame, author).unwrap();
     v2.adopt_snapshot(&snap2).unwrap();
     let (aseq, _) = v2.anchor(&dev_id).expect("own anchor");

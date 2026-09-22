@@ -248,17 +248,25 @@ pub fn drop_covered_prefix(dir: &Path, device_id: &[u8; 16], covered_seq: u64) -
 // ── snapshots (adopted checkpoint ops, inside the synced vault dir) ──
 //
 // A snapshot file is just the raw checkpoint op frame — self-authenticating
-// (device signature + DEK-sealed body), re-verified at every unlock. The
-// winner frames it carries are real signed ops, so a tampered file fails
-// verification rather than seeding bad state.
+// (device signature + DEK-sealed body). But signature alone is NOT enough
+// to adopt it: the winner-set claim must have been verified against a
+// replay of the covered ops. That check is only possible while the covered
+// ops still exist, so a replica that ran it leaves a durable proof behind:
+// `<author>.ok`, an owner-key signature over the frame hash. A vault-dir
+// writer cannot forge the attestation (the owner key lives only inside
+// sealed bundles), and it survives backup/restore under a fresh device key.
 
 fn snap_path(dir: &Path, author: &[u8; 16]) -> PathBuf {
     dir.join(SNAPS_DIR).join(format!("{}.snap", hex(author)))
 }
 
-/// Persist an adopted checkpoint frame (one per author — a newer
-/// checkpoint from the same author supersedes).
-pub fn save_snapshot(dir: &Path, author: &[u8; 16], frame: &[u8]) -> Result<()> {
+fn att_path(dir: &Path, author: &[u8; 16]) -> PathBuf {
+    dir.join(SNAPS_DIR).join(format!("{}.ok", hex(author)))
+}
+
+/// Persist an adopted checkpoint frame + its claim attestation (one per
+/// author — a newer checkpoint from the same author supersedes).
+pub fn save_snapshot(dir: &Path, author: &[u8; 16], frame: &[u8], att: &[u8; 64]) -> Result<()> {
     let path = snap_path(dir, author);
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     {
@@ -267,13 +275,27 @@ pub fn save_snapshot(dir: &Path, author: &[u8; 16], frame: &[u8]) -> Result<()> 
         f.sync_all()?;
     }
     fs::rename(&tmp, &path)?;
+    let apath = att_path(dir, author);
+    let atmp = apath.with_extension(format!("{}.tmp", std::process::id()));
+    {
+        let mut f = private_files().create_new(true).open(&atmp)?;
+        f.write_all(att)?;
+        f.sync_all()?;
+    }
+    fs::rename(&atmp, &apath)?;
     fsync_dir(&dir.join(SNAPS_DIR))?;
     set_private_file(&path)?;
+    set_private_file(&apath)?;
     Ok(())
 }
 
-/// All stored snapshot frames: (author_device_id, op).
-pub fn load_snapshots(dir: &Path) -> Result<Vec<([u8; 16], Op)>> {
+/// A stored snapshot frame: (author_device_id, op, attestation).
+pub type SnapshotEntry = ([u8; 16], Op, Option<[u8; 64]>);
+
+/// All stored snapshot frames. A present-but-malformed `.ok` is treated
+/// as missing — the caller then refuses blind adoption exactly as if it
+/// were absent.
+pub fn load_snapshots(dir: &Path) -> Result<Vec<SnapshotEntry>> {
     let mut out = Vec::new();
     let snaps = dir.join(SNAPS_DIR);
     if !snaps.exists() {
@@ -286,8 +308,12 @@ pub fn load_snapshots(dir: &Path) -> Result<Vec<([u8; 16], Op)>> {
             continue;
         };
         let buf = fs::read(e.path())?;
+        let att = match fs::read(att_path(dir, &id)) {
+            Ok(b) => <[u8; 64]>::try_from(b.as_slice()).ok(),
+            Err(_) => None,
+        };
         match Op::decode(&buf) {
-            Ok((op, end)) if end == buf.len() => out.push((id, op)),
+            Ok((op, end)) if end == buf.len() => out.push((id, op, att)),
             _ => continue, // torn/corrupt snapshot — ignorable, it's a cache
         }
     }
@@ -295,13 +321,17 @@ pub fn load_snapshots(dir: &Path) -> Result<Vec<([u8; 16], Op)>> {
 }
 
 /// Drop a snapshot file that failed verification or was superseded by a
-/// deeper checkpoint — never fatal to unlock.
+/// deeper checkpoint — never fatal to unlock. The attestation goes with
+/// it: an orphaned `.ok` must never vouch for a different file.
 pub fn remove_snapshot(dir: &Path, author: &[u8; 16]) -> Result<()> {
-    match fs::remove_file(snap_path(dir, author)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
+    for p in [snap_path(dir, author), att_path(dir, author)] {
+        match fs::remove_file(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
+    Ok(())
 }
 
 /// The adopted covered vector, stored UNENCRYPTED (device ids, seqs, and
