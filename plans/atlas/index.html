@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>mypassman · Project atlas</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="data.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="#overview"><span class="brand-mark" aria-hidden="true">m.</span><span>mypassman<small>Project atlas</small></span></a>
+      <nav aria-label="Project">
+        <a href="#overview">Overview</a>
+        <a href="#decisions">Decisions</a>
+        <a href="#lab">Walkthroughs</a>
+        <a href="#evidence">Evidence & history</a>
+      </nav>
+      <p class="nav-label">Systems</p>
+      <nav id="system-nav" aria-label="Systems"></nav>
+      <div class="sidebar-foot"><span class="status-dot" aria-hidden="true"></span>Design phase<p>Build understanding before expanding the code.</p></div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar"><span>Design notebook / <strong id="breadcrumb">Overview</strong></span><span id="snapshot"></span></header>
+      <main id="content" tabindex="-1"></main>
+      <footer>Maintained with the project · <a href="README.md">How to keep this current</a><span id="feedback" role="status" aria-live="polite"></span></footer>
+    </div>
+  </div>
+  <noscript><p>This atlas needs JavaScript for navigation. Read the <a href="../ARCHITECTURE-PROPOSAL.md">architecture proposal</a> and <a href="../PRODUCT-BRIEF.md">product brief</a> directly.</p></noscript>
+</body>
+</html>

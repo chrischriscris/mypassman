@@ -1,0 +1,13 @@
+/target/
+**/node_modules/
+**/dist/
+**/.wrangler/
+.local-archive/
+.mimocode/
+.DS_Store
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
