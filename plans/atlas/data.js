@@ -2,7 +2,7 @@
 
 globalThis.MPM_ATLAS = {
   schemaVersion: 1,
-  updated: "2026-10-04",
+  updated: "2026-10-05",
   product: "A lightweight, local-first, cross-platform secure vault that is easy to self-host. Clients encrypt vault content; the hosting service holds only ciphertext and access metadata.",
   archive: {ref: "archive/pre-rebuild-2026-10-04", revision: "7435cece995d8b135898f1475f3e91ebb53ef28c"},
   scope: "The rebuild is in design: nothing is implemented or verified yet. The previous implementation is preserved on the archive branch as reference only.",
@@ -153,7 +153,7 @@ globalThis.MPM_ATLAS = {
     }
   ],
   decisions: [
-    {id: "rebuild-location", title: "Fresh implementation on main", status: "Chosen", timing: "Recorded 04 Oct 2026", choice: "Archive legacy progress; rebuild on main", why: "Explicitly chosen by the maintainer. The full code snapshot is preserved at 7435cec, the old main tip has a backup branch, and ignored local data has a private backup.", options: [], source: "../REBUILD.md"},
+    {id: "rebuild-location", title: "Fresh implementation on main", status: "Chosen", timing: "Recorded 04 Oct 2026; history restarted 05 Oct 2026", choice: "Archive legacy progress; rebuild on main with new history", why: "Explicitly chosen by the maintainer. The full code snapshot is preserved at 7435cec, the old main tip has a backup branch, and ignored local data has a private backup. Main's history was restarted on 05 Oct 2026; legacy commits remain on the archive branches.", options: [], source: "../REBUILD.md"},
     {id: "language", title: "Shared core language", status: "Chosen", timing: "Recorded 04 Oct 2026", choice: "Rust", why: "Explicitly chosen by the maintainer. Keep UI dependencies outside the core and measure ordinary edit/test cycles separately from release builds.", options: [], source: "../PRODUCT-BRIEF.md"},
     {id: "state-model", title: "Revision and authority model", status: "Open", timing: "Before durable format", why: "Storage, replay, conflicts, enrollment, revocation, and recovery depend on this. A concrete proposal is still needed before choosing its protocol.", options: ["Draft the state model next", "Review an existing model first"], source: "../ARCHITECTURE-PROPOSAL.md#choices-still-requiring-resolution"},
     {id: "first-host", title: "First hosting path", status: "Proposed", timing: "Before first end-to-end increment", choice: "Cloudflare first; one production host initially", why: "Easy self-hosting is a core goal. Validate a real operation, attachment upload, and restore. A portable native host remains a target.", options: ["Cloudflare first", "Native relay first", "Decide after the feasibility experiment"], source: "../ARCHITECTURE-PROPOSAL.md#web-and-hosting-integration"},
@@ -188,6 +188,7 @@ globalThis.MPM_ATLAS = {
     ]}
   ],
   activity: [
+    {date: "2026-10-05", title: "Main history restarted", kind: "Maintainer decision", detail: "Main now starts at the rebuild commit and was pushed to origin. The 56 legacy commits remain on the local archive branches.", href: "../REBUILD.md"},
     {date: "2026-10-04", title: "Atlas rebuilt as a map-first workspace", kind: "Documentation", detail: "Selecting a system on the map opens its chapter beside it; the checker requires every system on the map. Decisions list open questions first with their options and affected systems. Walkthroughs mark changed lanes and can be stepped with arrow keys. Decision drafts removed.", href: "README.md"},
     {date: "2026-10-04", title: "Local branches cleaned", kind: "Repository maintenance", detail: "Kept main and the two rebuild archive branches. Additional advisor/product histories preserved as tags; the product worktree's uncommitted changes remain in place.", href: "../REBUILD.md"},
     {date: "2026-10-04", title: "Upstream references cloned", kind: "Research setup", detail: "Bitwarden Rust SDK and KeePassXC cloned locally with exact commits recorded. Source inspection has not yet produced adopted design decisions.", href: "../REFERENCES.md"},

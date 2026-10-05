@@ -31,8 +31,12 @@ architecture proposal, independent review, and the project atlas. Remove the
 legacy implementation, build/deployment configuration, old normative formats,
 and historical implementation plans from main's active tree.
 
-Keep normal Git history. This is a new implementation in the same repository;
-there is no orphan branch or rewritten history. The branch changes are local.
+On 2026-10-05 the maintainer chose to restart main's history. Main no longer
+descends from the legacy commits; its first commit is the rebuild starting
+point, and the legacy history is reachable only through the archive branches.
+The rewritten main was pushed to `origin` the same day. The archive branches
+and tags are local; push them separately to keep the legacy history available
+remotely.
 
 Reused code must be reviewed and introduced in small, justified increments.
 The next step is the revision/key/authority state model, followed by a bounded

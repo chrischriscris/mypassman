@@ -24,8 +24,9 @@ The previous main tip is preserved on `archive/main-before-rebuild-2026-10-04`.
 These are local branches. See [legacy reference](plans/LEGACY-REFERENCE.md)
 for access and local-data preservation details.
 
-Main keeps normal Git history and starts with the current design records and
-atlas. Bring reviewed code into it deliberately as each component is built.
+Main's history was restarted on 2026-10-05: it starts with the current design
+records and atlas, and legacy commits are reachable only through the archive
+branches. Bring reviewed code into it deliberately as each component is built.
 
 ## Next step
 
