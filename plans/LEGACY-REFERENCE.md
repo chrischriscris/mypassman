@@ -25,6 +25,13 @@ current product brief before adopting their assumptions.
 The previous main tip is also available as
 `archive/main-before-rebuild-2026-10-04` (`9938e54`).
 
+Additional committed work is preserved by tags
+`archive/advisor-before-rebuild-2026-10-04` (`bad731c`) and
+`archive/product-before-rebuild-2026-10-04` (`be4b695`). The corresponding
+obsolete branch names were removed during local cleanup. The product worktree
+at `/Users/chus/Projects/mypassman-product` remains detached, including its
+uncommitted changes. The missing advisor worktree's stale registration was pruned.
+
 ## Local data
 
 Ignored files, including local Worker state and `.dev.vars`, were captured in

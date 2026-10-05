@@ -174,6 +174,8 @@ globalThis.MPM_ATLAS = {
     ]}
   ],
   activity: [
+    {date: "2026-10-04", title: "Local branches cleaned", kind: "Repository maintenance", detail: "Kept main and the two rebuild archive branches. Additional advisor/product histories preserved as tags; the product worktree's uncommitted changes remain in place.", href: "../REBUILD.md"},
+    {date: "2026-10-04", title: "Upstream references cloned", kind: "Research setup", detail: "Bitwarden Rust SDK and KeePassXC cloned locally with exact commits recorded. Source inspection has not yet produced adopted design decisions.", href: "../REFERENCES.md"},
     {date: "2026-10-04", title: "Main prepared for the fresh implementation", kind: "Maintainer decision", detail: "Legacy implementation and work in progress archived at 7435cec. Main retains current requirements, design, review, and atlas. Ignored local data preserved privately.", href: "../REBUILD.md"},
     {date: "2026-10-04", title: "Project atlas introduced", kind: "Documentation", detail: "System chapters, decision drafts, conceptual walkthroughs, and evidence rules. No product implementation is claimed."},
     {date: "2026-10-04", title: "Independent Opus 5.5 review", kind: "Design review", detail: "Reviewed the product brief and architecture proposal. Added compatibility requirements and clarified implementation order. No source audit or product tests.", href: "../reviews/2026-10-04-opus-5-5.md"},

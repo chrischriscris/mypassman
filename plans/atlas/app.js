@@ -56,6 +56,7 @@
         <li>${link("Product requirements", "../PRODUCT-BRIEF.md")}</li>
         <li>${link("Current architecture proposal", "../ARCHITECTURE-PROPOSAL.md")}</li>
         <li>${link("Independent review and qualifications", "../reviews/2026-10-04-opus-5-5.md")}</li>
+        <li>${link("Upstream reference repositories", "../REFERENCES.md")}</li>
       </ul><a class="button" href="#lab">Walk through a sync failure →</a></section></div>`;
   }
   function systemPage(system) {

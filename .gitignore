@@ -3,6 +3,7 @@
 **/dist/
 **/.wrangler/
 .local-archive/
+.references/
 .mimocode/
 .DS_Store
 .env

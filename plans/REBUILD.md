@@ -16,7 +16,13 @@ branch and use main for the from-scratch implementation.
 The archive snapshot was committed with a clean tracked working tree. The
 ignored-file tar archive was checked against every captured regular file.
 These preservation checks do not establish correctness of the legacy software.
-Other existing branches and worktrees remain independent.
+Subsequent local branch cleanup retained main and the two archive branches.
+`post-007-remediation` was already contained in the full archive. Unique advisor
+and product histories are preserved by tags
+`archive/advisor-before-rebuild-2026-10-04` (`bad731c`) and
+`archive/product-before-rebuild-2026-10-04` (`be4b695`). Their branch names were
+removed. The stale advisor worktree registration was pruned; the product
+worktree remains detached at its original commit with its uncommitted files.
 
 ## Main's starting boundary
 
