@@ -26,7 +26,7 @@ boilerplate comments, and broad incidental refactors.
 
 Maintain one current architecture and one active implementation plan. Update the
 relevant atlas chapter, affected decisions, evidence, and activity in the same
-change. Recommendations and browser drafts do not constitute maintainer decisions.
+change. Recommendations do not constitute maintainer decisions.
 Distinguish proposed, in progress, implemented, and verified. Verification needs
 a procedure, result, date, exact revision/snapshot, and limits.
 

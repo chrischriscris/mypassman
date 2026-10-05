@@ -56,6 +56,11 @@ for (const scenario of data.scenarios) {
   assert.ok(scenario.steps.length > 1);
   for (const step of scenario.steps) for (const field of ["title", "a", "relay", "b", "note"]) assert.ok(step[field]?.trim(), `${scenario.id}: missing ${field}`);
 }
+const { map, next, foundations } = data.overview;
+const placed = [...map.processes, ...map.stores, map.exchange, ...map.service, ...map.across];
+assert.deepEqual(placed.sort(), [...data.systems.map((system) => system.id)].sort(),"System map must place every system exactly once");
+for (const item of next) for (const field of ["title", "detail"]) assert.ok(item[field]?.trim(), `overview next step: missing ${field}`);
+for (const item of foundations) checkLink(item.href);
 for (const item of data.activity) if (item.href) checkLink(item.href);
 for (const path of ["index.html", "styles.css", "app.js", "README.md"]) assert.ok(existsSync(resolve(directory, path)));
-console.log(`Atlas checked: ${data.systems.length} systems, ${data.decisions.length} decisions, ${data.scenarios.length} walkthroughs; local targets and evidence requirements valid.`);
+console.log(`Atlas checked: ${data.systems.length} systems (all mapped), ${data.decisions.length} decisions, ${data.scenarios.length} walkthroughs; local targets and evidence requirements valid.`);

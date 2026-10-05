@@ -1,7 +1,7 @@
 # Current project records
 
-Open the [project atlas](atlas/index.html) to explore each system, record decision
-drafts, and inspect implementation evidence. Follow its
+Open the [project atlas](atlas/index.html) to explore each system, review open
+decisions, and inspect implementation evidence. Follow its
 [maintenance guide](atlas/README.md) as work progresses.
 
 - [Product brief](PRODUCT-BRIEF.md): requirements and chosen direction.

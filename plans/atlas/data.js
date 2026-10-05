@@ -3,9 +3,23 @@
 globalThis.MPM_ATLAS = {
   schemaVersion: 1,
   updated: "2026-10-04",
-  baseline: "Fresh main · archived implementation 7435cec",
+  product: "A lightweight, local-first, cross-platform secure vault that is easy to self-host. Clients encrypt vault content; the hosting service holds only ciphertext and access metadata.",
   archive: {ref: "archive/pre-rebuild-2026-10-04", revision: "7435cece995d8b135898f1475f3e91ebb53ef28c"},
-  scope: "Main is the fresh implementation starting point. Legacy code is preserved on the archive branch; no replacement implementation or product verification is recorded here.",
+  scope: "The rebuild is in design: nothing is implemented or verified yet. The previous implementation is preserved on the archive branch as reference only.",
+  overview: {
+    map: {processes: ["clients", "core"], stores: ["storage", "keys"], exchange: "sync", service: ["hosting"], across: ["attachments", "recovery", "compatibility", "sharing"]},
+    next: [
+      {title: "Make the state model concrete", detail: "Revisions, keys, authorization, recovery, compatibility."},
+      {title: "Prove two-device behavior", detail: "Offline edits, interruption, replay, revocation, and rollback."},
+      {title: "Build one usable path", detail: "One client and one host, with measured resource use."}
+    ],
+    foundations: [
+      {label: "Product requirements", href: "../PRODUCT-BRIEF.md"},
+      {label: "Current architecture proposal", href: "../ARCHITECTURE-PROPOSAL.md"},
+      {label: "Independent review and qualifications", href: "../reviews/2026-10-04-opus-5-5.md"},
+      {label: "Upstream reference repositories", href: "../REFERENCES.md"}
+    ]
+  },
   systems: [
     {
       id: "core", name: "Vault engine", tag: "Shared behavior", design: "Proposed", implementation: "not-started",
@@ -154,7 +168,7 @@ globalThis.MPM_ATLAS = {
       {title: "Start with a shared revision", a: "Revision 1 · saved locally", relay: "Encrypted revision 1", b: "Revision 1 · saved locally", note: "Both devices have already verified the same starting state."},
       {title: "Device A goes offline and edits", a: "Revision 2 · saved locally · pending sync", relay: "Encrypted revision 1", b: "Revision 1 · saved locally", note: "The encrypted revision and pending work commit together. The client can say saved on this device."},
       {title: "Reconnect and receive acknowledgment", a: "Revision 2 · synced", relay: "Encrypted revision 2 stored", b: "Revision 1 · waiting to receive", note: "Synced means the service acknowledged the upload. It does not mean every device has received it."},
-      {title: "Device B validates and commits", a: "Revision 2 · saved locally", relay: "Encrypted revisions retained", b: "Revision 2 · verified and saved", note: "Incoming content and sync progress commit together after client validation."}
+      {title: "Device B validates and commits", a: "Revision 2 · synced", relay: "Encrypted revisions retained", b: "Revision 2 · verified and saved", note: "Incoming content and sync progress commit together after client validation."}
     ]},
     {id: "conflict", title: "Two offline edits", steps: [
       {title: "Both devices start at revision 1", a: "Revision 1", relay: "Encrypted revision 1", b: "Revision 1", note: "A shared starting point lets clients relate later revisions."},
@@ -174,6 +188,7 @@ globalThis.MPM_ATLAS = {
     ]}
   ],
   activity: [
+    {date: "2026-10-04", title: "Atlas rebuilt as a map-first workspace", kind: "Documentation", detail: "Selecting a system on the map opens its chapter beside it; the checker requires every system on the map. Decisions list open questions first with their options and affected systems. Walkthroughs mark changed lanes and can be stepped with arrow keys. Decision drafts removed.", href: "README.md"},
     {date: "2026-10-04", title: "Local branches cleaned", kind: "Repository maintenance", detail: "Kept main and the two rebuild archive branches. Additional advisor/product histories preserved as tags; the product worktree's uncommitted changes remain in place.", href: "../REBUILD.md"},
     {date: "2026-10-04", title: "Upstream references cloned", kind: "Research setup", detail: "Bitwarden Rust SDK and KeePassXC cloned locally with exact commits recorded. Source inspection has not yet produced adopted design decisions.", href: "../REFERENCES.md"},
     {date: "2026-10-04", title: "Main prepared for the fresh implementation", kind: "Maintainer decision", detail: "Legacy implementation and work in progress archived at 7435cec. Main retains current requirements, design, review, and atlas. Ignored local data preserved privately.", href: "../REBUILD.md"},

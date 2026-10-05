@@ -3,175 +3,208 @@
 (() => {
   const data = globalThis.MPM_ATLAS;
   const content = document.getElementById("content");
-  const storageKey = "mypassman-atlas-drafts-v1";
+  const views = ["map", "decisions", "walkthroughs", "log"];
   const escape = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
   const link = (label, href) => `<a href="${escape(href)}">${escape(label)}</a>`;
-  const pill = (label) => `<span class="pill ${escape(label.toLowerCase().replaceAll(" ", "-"))}">${escape(label)}</span>`;
+  const byId = (items, id) => items.find((item) => item.id === id);
   const statusLabel = (status) => ({ "not-started": "Not started", "in-progress": "In progress", implemented: "Implemented", verified: "Verified" })[status];
-  let drafts = {};
-  let storageAvailable = true;
-  let scenarioId = data.scenarios[0].id;
-  let step = 0;
+  const levels = { Open: "l0", "Not started": "l0", Deferred: "l0", Proposed: "l1", "In progress": "l1", Implemented: "l2", Chosen: "l3", Verified: "l3" };
+  const ring = (status) => `<span class="ring ${levels[status]}" aria-hidden="true"></span>`;
+  const status = (value) => `<span class="status">${ring(value)}${escape(value)}</span>`;
+  const reducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-  try {
-    const saved = JSON.parse(localStorage.getItem(storageKey) || "{}");
-    for (const decision of data.decisions) {
-      const draft = saved?.[decision.id];
-      if (draft && typeof draft.note === "string" && (draft.choice === "" || decision.options.includes(draft.choice))) {
-        drafts[decision.id] = { choice: draft.choice, note: draft.note.slice(0, 2000), updated: typeof draft.updated === "string" ? draft.updated : "" };
-      }
-    }
-  } catch { storageAvailable = false; }
-
+  function route() {
+    const [view, id, step] = location.hash.slice(1).split("/");
+    return views.includes(view) ? { view, id, step } : { view: "map" };
+  }
   function feedback(message) { document.getElementById("feedback").textContent = message; }
-  function persistDrafts() {
-    try { localStorage.setItem(storageKey, JSON.stringify(drafts)); storageAvailable = true; }
-    catch { storageAvailable = false; }
+
+  function mapNode(id, selected) {
+    const system = byId(data.systems, id);
+    const active = system.id === selected;
+    return `<a class="node" data-id="${system.id}" href="#map${active ? "" : `/${system.id}`}"${active ? ' aria-current="true"' : ""}><strong>${escape(system.name)}${ring(system.design)}<span class="visually-hidden">, design ${escape(system.design.toLowerCase())}</span></strong><small>${escape(system.tag)}</small></a>`;
   }
-  function heading(label, title, description) {
-    return `<p class="eyebrow">${escape(label)}</p><h1>${escape(title)}</h1><p class="lede">${escape(description)}</p>`;
-  }
-  function overview() {
-    return `${heading("An understandable rebuild", "The whole system, in view.", "Explore a system, work through a failure, and see which decisions still need evidence.")}
-      <div class="row">${pill("Design phase")}<span class="small muted">Snapshot · ${escape(data.updated)} · ${escape(data.baseline)}</span></div>
-      <p class="note">${escape(data.scope)}</p>
-      <section class="section" aria-labelledby="map-title"><div class="row between"><h2 id="map-title">The system map</h2><span class="small muted">Select a component to explore it</span></div>
+  function mapView(id) {
+    const system = byId(data.systems, id);
+    const { map } = data.overview;
+    const node = (nodeId) => mapNode(nodeId, system?.id);
+    const wire = '<span class="wire-v" aria-hidden="true"></span>';
+    return `<div class="workspace">
+      <section class="canvas" aria-labelledby="canvas-title">
+        <div class="canvas-head"><h1 id="canvas-title">System map</h1><p>Select a system to see its details.</p></div>
         <div class="map">
-          <div class="device"><div class="device-label">Your device · trusted client</div>
-            <a class="node" href="#system/clients"><strong>Interface & autofill</strong><small>Platform behavior and selected plaintext</small></a>
-            <div class="connector" aria-hidden="true">↕</div>
-            <a class="node engine" href="#system/core"><strong>Rust vault engine</strong><small>One shared set of vault rules</small></a>
-            <div class="connector" aria-hidden="true">↕</div>
-            <div class="node-pair"><a class="node" href="#system/storage"><strong>Local storage</strong><small>Encrypted durable state</small></a><a class="node" href="#system/keys"><strong>Protected keys</strong><small>Authority stays on clients</small></a></div>
+          <div class="map-field">
+            <div class="zone"><p class="zone-label">Your device</p>${map.processes.map(node).join(wire)}${wire}<div class="stores">${map.stores.map(node).join("")}</div></div>
+            <div class="outside">
+              <div class="crossing"><span class="wire-h" aria-hidden="true"></span>${wire}${node(map.exchange)}<small>Encrypted changes</small></div>
+              <div class="service">${map.service.map(node).join("")}</div>
+              <div class="peer">${wire}<div class="zone"><p class="zone-label">Another authorized device</p><p>Validates changes before accepting them.</p></div></div>
+            </div>
           </div>
-          <div class="bridge" aria-hidden="true">⇄</div>
-          <div class="remote"><a class="node" href="#system/hosting"><strong>Blind hosting service</strong><small>Encrypted content + access metadata</small></a><a class="node" href="#system/sync"><strong>Another authorized device</strong><small>Validates changes before accepting them</small></a></div>
-        </div><p class="map-caption">Clients exchange encrypted changes and files through the service. Local access continues for content already present.</p>
+          <div class="across"><p class="zone-label">Across every component</p><div class="across-grid">${map.across.map(node).join("")}</div></div>
+          <ul class="legend">
+            <li><span class="swatch trusted" aria-hidden="true"></span>Trusted: keys and plaintext stay inside</li>
+            <li><span class="swatch" aria-hidden="true"></span>Outside: only ciphertext and access metadata</li>
+            <li>${ring("Open")}Open ${ring("Proposed")}Proposed ${ring("Chosen")}Chosen design</li>
+          </ul>
+        </div>
       </section>
-      <div class="split section"><section><h2>Next, in order</h2><ol class="steps">
-        <li><div><strong>Make the state model concrete</strong><p>Revisions, keys, authorization, recovery, compatibility.</p></div></li>
-        <li><div><strong>Prove two-device behavior</strong><p>Offline edits, interruption, replay, revocation, and rollback.</p></div></li>
-        <li><div><strong>Build one usable path</strong><p>One client and one host, with measured resource use.</p></div></li>
-      </ol></section><section><h2>Keep the foundations visible</h2><ul class="simple-list">
-        <li>${link("Product requirements", "../PRODUCT-BRIEF.md")}</li>
-        <li>${link("Current architecture proposal", "../ARCHITECTURE-PROPOSAL.md")}</li>
-        <li>${link("Independent review and qualifications", "../reviews/2026-10-04-opus-5-5.md")}</li>
-        <li>${link("Upstream reference repositories", "../REFERENCES.md")}</li>
-      </ul><a class="button" href="#lab">Walk through a sync failure →</a></section></div>`;
+      <aside class="panel" aria-labelledby="panel-title">${system ? systemPanel(system) : overviewPanel()}</aside>
+    </div>`;
   }
-  function systemPage(system) {
+  function overviewPanel() {
+    const built = data.systems.filter((system) => ["implemented", "verified"].includes(system.implementation)).length;
+    const open = data.decisions.filter((decision) => decision.status === "Open").length;
+    return `<h2 id="panel-title" tabindex="-1">Overview</h2>
+      <p class="lede">${escape(data.product)}</p>
+      <dl class="facts"><div><dt>Implemented</dt><dd>${built} of ${data.systems.length} systems</dd></div><div><dt>Open decisions</dt><dd><a href="#decisions">${open}</a></dd></div><div><dt>Snapshot</dt><dd>${escape(data.updated)}</dd></div></dl>
+      <p class="muted note">${escape(data.scope)}</p>
+      <section><h3>Next, in order</h3><ol class="steps">${data.overview.next.map((item) => `<li><div><strong>${escape(item.title)}</strong><p>${escape(item.detail)}</p></div></li>`).join("")}</ol></section>
+      <section><h3>Project records</h3><ul class="links">${data.overview.foundations.map((item) => `<li>${link(item.label, item.href)}</li>`).join("")}<li>${link("How to keep this atlas current", "README.md")}</li></ul></section>`;
+  }
+  function systemPanel(system) {
+    const index = data.systems.indexOf(system);
+    const previous = data.systems[(index - 1 + data.systems.length) % data.systems.length];
+    const next = data.systems[(index + 1) % data.systems.length];
     const sections = [["What it owns", system.owns], ["Where the boundary is", system.boundary], ["What can go wrong", system.failure], ["Next concrete step", system.next]];
-    return `${heading(system.tag, system.name, system.purpose)}
-      <div class="row"><span class="small muted">Design</span>${pill(system.design)}<span class="small muted">Delivery</span>${pill(statusLabel(system.implementation))}</div>
-      <div class="flow" aria-label="Proposed flow">${system.flow.map((text, i) => `${i ? '<span class="flow-arrow" aria-hidden="true">→</span>' : ""}<div class="flow-node">${escape(text)}</div>`).join("")}</div>
-      <div class="detail-grid">${sections.map(([title, body]) => `<section><h2>${title}</h2><p>${escape(body)}</p></section>`).join("")}</div>
-      <section class="panel section"><p class="eyebrow">Verification target</p><h2>What would count as evidence?</h2><p>${escape(system.done)}</p><p class="small muted">${system.evidence.length ? system.evidence.map((item) => link(item.label, item.href)).join(" · ") : "No replacement implementation evidence recorded yet."}</p></section>
-      <div class="split section"><section><h2>Related decisions</h2><ul class="simple-list">${system.decisions.map((id) => { const item = data.decisions.find((entry) => entry.id === id); return `<li>${link(item.title, `#decisions/${id}`)}<span class="small muted">${escape(item.status)} · ${escape(item.timing)}</span></li>`; }).join("")}</ul></section>
-      <section><h2>Sources & reference code</h2><p class="small muted">Existing code links are reference material, not proof that the proposed design is implemented.</p><ul class="simple-list">${system.sources.map((source) => `<li>${link(source.label, source.href)}${source.archivePath ? `<small class="muted">Archive path: <code>${escape(source.archivePath)}</code></small>` : ""}</li>`).join("")}</ul></section></div>`;
+    return `<div class="panel-top"><a class="close" href="#map" aria-label="Close ${escape(system.name)}">×</a></div>
+      <h2 id="panel-title" tabindex="-1">${escape(system.name)}</h2>
+      <p class="lede">${escape(system.purpose)}</p>
+      <dl class="facts"><div><dt>Design</dt><dd>${status(system.design)}</dd></div><div><dt>Delivery</dt><dd>${status(statusLabel(system.implementation))}</dd></div></dl>
+      <section><h3>Proposed flow</h3><ol class="flow">${system.flow.map((text) => `<li>${escape(text)}</li>`).join("")}</ol></section>
+      ${sections.map(([title, body]) => `<section><h3>${title}</h3><p>${escape(body)}</p></section>`).join("")}
+      <section><h3>What would count as evidence</h3><p>${escape(system.done)}</p><p class="muted">${system.evidence.length ? system.evidence.map((item) => link(item.label, item.href)).join(", ") : "No evidence recorded yet."}</p></section>
+      <section><h3>Decisions</h3><ul class="links">${system.decisions.map((id) => { const decision = byId(data.decisions, id); return `<li><a href="#decisions/${id}">${escape(decision.title)}</a>${status(decision.status)}</li>`; }).join("")}</ul></section>
+      <section><h3>Sources</h3><ul class="links">${system.sources.map((source) => `<li>${link(source.label, source.href)}${source.archivePath ? `<code>${escape(source.archivePath)}</code>` : ""}</li>`).join("")}</ul></section>
+      <nav class="pager" aria-label="Other systems"><a href="#map/${previous.id}">← ${escape(previous.name)}</a><a href="#map/${next.id}">${escape(next.name)} →</a></nav>`;
   }
-  function decisionPage(selectedId) {
-    return `${heading("Record the reason, not just the choice", "Decisions with a history.", "Chosen decisions are recorded in the project. Open questions stay visible until we resolve them.")}
-      <div class="row between"><p class="small muted">Drafts below stay in this browser. Export them for review and recording in the repository.</p><button type="button" id="export-drafts" ${Object.keys(drafts).length ? "" : "disabled"}>Export drafts</button></div>
-      ${!storageAvailable ? '<p class="note">Browser storage is unavailable. Drafts last only for this page session; export them before leaving.</p>' : ""}
-      ${data.decisions.map((decision) => {
-        const draft = drafts[decision.id];
-        const editable = decision.status !== "Chosen";
-        return `<article class="decision" id="decision-${decision.id}"><div class="decision-head"><h2>${escape(decision.title)}</h2><div class="row">${pill(decision.status)}<span class="small muted">${escape(decision.timing)}</span></div></div>
-          ${decision.choice ? `<p><strong>${escape(decision.choice)}</strong></p>` : ""}<p class="muted">${escape(decision.why)}</p><p class="small">${link("Read the recorded context", decision.source)}</p>
-          ${editable ? `<details ${selectedId === decision.id || draft ? "open" : ""}><summary>${draft ? "Review your saved draft" : "Draft a preference or question"}</summary><form data-decision="${decision.id}">
-            <label class="field">Preference<select name="choice"><option value="">No preference yet</option>${decision.options.map((option) => `<option ${draft?.choice === option ? "selected" : ""}>${escape(option)}</option>`).join("")}</select></label>
-            <label class="field">Reason or question<textarea name="note" maxlength="2000" placeholder="What matters to you about this decision?">${escape(draft?.note || "")}</textarea></label>
-            <div class="row"><button class="primary" type="submit">Save draft</button>${draft ? `<button type="button" data-discard="${decision.id}">Discard draft</button>` : ""}<span class="small muted">A draft does not change the project's decision.</span></div>
-          </form></details>` : ""}</article>`;
-      }).join("")}`;
+
+  function decisionsView(id) {
+    const order = ["Open", "Proposed", "Deferred", "Chosen"];
+    const selected = byId(data.decisions, id) || data.decisions.find((decision) => decision.status === "Open") || data.decisions[0];
+    const groups = order.map((value) => [value, data.decisions.filter((decision) => decision.status === value)]).filter(([, items]) => items.length);
+    return `<div class="workspace">
+      <section class="canvas list-canvas" aria-labelledby="canvas-title">
+        <div class="canvas-head"><h1 id="canvas-title">Decisions</h1><p>Open questions come first. A proposal is a recommendation, not a decision.</p></div>
+        ${groups.map(([value, items]) => `<h2 class="group">${value}<span>${items.length}</span></h2><ul class="rows">${items.map((decision) => `<li><a class="row" data-id="${decision.id}" href="#decisions/${decision.id}"${decision === selected ? ' aria-current="true"' : ""}>${ring(decision.status)}<span>${escape(decision.title)}</span><small>${escape(decision.timing)}</small></a></li>`).join("")}</ul>`).join("")}
+      </section>
+      <aside class="panel" aria-labelledby="panel-title">${decisionPanel(selected)}</aside>
+    </div>`;
   }
-  function labPage() {
-    const scenario = data.scenarios.find((item) => item.id === scenarioId);
-    const current = scenario.steps[step];
-    return `${heading("Explore the behavior", "What happens when…", "Step through the intended behavior of two devices and a blind relay.")}
-      <p class="note">Conceptual walkthrough with fictional revisions. This does not execute cryptography, test code, or establish that the protocol is correct.</p>
-      <div class="toolbar"><label class="field">Scenario<select id="scenario">${data.scenarios.map((item) => `<option value="${item.id}" ${item.id === scenarioId ? "selected" : ""}>${escape(item.title)}</option>`).join("")}</select></label><a href="#system/sync" class="small">Explore the sync system →</a></div>
-      <section class="panel lab-stage" aria-label="Scenario state"><div class="row between"><h2 id="step-title">${escape(current.title)}</h2><span class="lab-step">Step ${step + 1} of ${scenario.steps.length}</span></div>
-        <div class="lab-lanes"><div class="lab-lane"><h3>Device A</h3><p>${escape(current.a)}</p></div><div class="lab-lane relay"><h3>Blind relay</h3><p>${escape(current.relay)}</p></div><div class="lab-lane"><h3>Device B</h3><p>${escape(current.b)}</p></div></div>
-        <p class="muted">${escape(current.note)}</p><div class="row between"><button type="button" id="previous" ${step === 0 ? "disabled" : ""}>← Previous</button><button type="button" class="primary" id="next" ${step === scenario.steps.length - 1 ? "disabled" : ""}>Next step →</button></div>
-      </section>`;
+  function decisionPanel(decision) {
+    const affected = data.systems.filter((system) => system.decisions.includes(decision.id));
+    return `<p class="panel-status">${status(decision.status)}<span class="muted">${escape(decision.timing)}</span></p>
+      <h2 id="panel-title" tabindex="-1">${escape(decision.title)}</h2>
+      ${decision.choice ? `<p class="choice">${escape(decision.choice)}</p>` : ""}
+      <p>${escape(decision.why)}</p>
+      ${decision.options.length ? `<section><h3>Options</h3><ul class="bullets">${decision.options.map((option) => `<li>${escape(option)}</li>`).join("")}</ul></section>` : ""}
+      ${affected.length ? `<section><h3>Affects</h3><ul class="chips">${affected.map((system) => `<li><a href="#map/${system.id}">${escape(system.name)}</a></li>`).join("")}</ul></section>` : ""}
+      <p class="more">${link("Read the recorded context", decision.source)}</p>`;
   }
-  function evidencePage() {
-    return `${heading("Claims need something behind them", "Evidence, not percentages.", "Track what changed, what was checked, and which revision the result applies to.")}
-      <p class="note">Manually maintained snapshot: ${escape(data.baseline)}. This page does not scan Git, run tests, or update itself from build results.</p>
-      <div class="table-wrap"><table><caption class="small muted">Delivery status of the proposed replacement</caption><thead><tr><th scope="col">System</th><th scope="col">Delivery</th><th scope="col">Evidence</th></tr></thead><tbody>${data.systems.map((system) => `<tr><th scope="row">${link(system.name, `#system/${system.id}`)}</th><td>${pill(statusLabel(system.implementation))}</td><td>${system.evidence.length ? system.evidence.map((item) => link(item.label, item.href)).join(" · ") : "None recorded"}</td></tr>`).join("")}</tbody></table></div>
-      <section class="section"><h2>How status earns its name</h2><ol class="steps"><li><div><strong>In progress</strong><p>A scoped change has actually started; identify the work and remaining checks.</p></div></li><li><div><strong>Implemented</strong><p>Link the code and record the behavior that exists, including known gaps.</p></div></li><li><div><strong>Verified</strong><p>Attach a meaningful check, result, date, and exact code revision. Passing tests do not constitute a security audit.</p></div></li></ol></section>
-      <section class="section"><h2>Activity</h2><ol class="timeline">${data.activity.map((item) => `<li><time datetime="${item.date}">${item.date}</time><div><h3>${escape(item.title)}</h3>${pill(item.kind)}<p>${escape(item.detail)}</p>${item.href ? link("Open record", item.href) : ""}</div></li>`).join("")}</ol></section>`;
+
+  function walkState(at) {
+    const scenario = byId(data.scenarios, at.id) || data.scenarios[0];
+    const step = Math.max(0, Math.min(scenario.steps.length - 1, (Number.parseInt(at.step, 10) || 1) - 1));
+    return { scenario, step };
   }
-  function render(moveFocus = false) {
-    const [page, id] = location.hash.slice(1).split("/");
-    if (page === "content") { content.focus(); return; }
-    let title = "Overview";
-    if (page === "system") {
-      const system = data.systems.find((item) => item.id === id);
-      content.innerHTML = system ? systemPage(system) : `${heading("Unknown system", "This chapter does not exist.", "Return to the overview to find a system.")}<a href="#overview">Open overview</a>`;
-      title = system?.name || "Unknown system";
-    } else if (page === "decisions") { content.innerHTML = decisionPage(id); title = "Decisions"; }
-    else if (page === "lab") { content.innerHTML = labPage(); title = "Walkthroughs"; }
-    else if (page === "evidence") { content.innerHTML = evidencePage(); title = "Evidence & history"; }
-    else { content.innerHTML = overview(); }
-    document.getElementById("breadcrumb").textContent = title;
-    document.title = `${title} · mypassman atlas`;
-    for (const anchor of document.querySelectorAll("nav a")) {
-      const active = anchor.hash === (page === "decisions" ? "#decisions" : location.hash || "#overview");
-      if (active) anchor.setAttribute("aria-current", "page"); else anchor.removeAttribute("aria-current");
+  function walkthroughsView(at) {
+    const { scenario, step } = walkState(at);
+    const shown = scenario.steps[step];
+    const previous = scenario.steps[step - 1];
+    const lane = (key, label, kind) => {
+      const changed = previous && previous[key] !== shown[key];
+      return `<div class="lane ${kind}${changed ? " changed" : ""}"><h3>${label}${changed ? '<span class="changed-tag">Changed</span>' : ""}</h3><p>${escape(shown[key])}</p></div>`;
+    };
+    return `<section class="page wide" aria-labelledby="page-title">
+      <div class="page-head"><h1 id="page-title">Walkthroughs</h1><p class="lede">Step through the intended behavior of two devices and a blind relay.</p></div>
+      <div class="segmented" role="group" aria-label="Scenario">${data.scenarios.map((item) => `<button type="button" data-scenario="${item.id}" aria-pressed="${item === scenario}">${escape(item.title)}</button>`).join("")}</div>
+      <div class="stage">
+        <div class="stage-head"><h2 id="step-title">${escape(shown.title)}</h2><ol class="dots" aria-label="Steps">${scenario.steps.map((item, i) => `<li${i < step ? ' class="done"' : ""}><button type="button" data-step="${i}" aria-label="Step ${i + 1}: ${escape(item.title)}"${i === step ? ' aria-current="step"' : ""}>${i + 1}</button></li>`).join("")}</ol></div>
+        <div class="lanes">${lane("a", "Device A", "trusted")}${lane("relay", "Blind relay", "relay")}${lane("b", "Device B", "trusted")}</div>
+        <p class="step-note">${escape(shown.note)}</p>
+        <div class="controls"><button type="button" id="previous" aria-keyshortcuts="ArrowLeft"${step === 0 ? " disabled" : ""}>Previous</button><button type="button" class="primary" id="next" aria-keyshortcuts="ArrowRight"${step === scenario.steps.length - 1 ? " disabled" : ""}>Next</button></div>
+      </div>
+      <p class="footnote">Conceptual walkthrough with fictional revisions. It does not execute cryptography, test code, or establish that the protocol is correct. ${link("Read the sync chapter", "#map/sync")}</p>
+    </section>`;
+  }
+  function showStep(scenario, step) {
+    history.replaceState(null, "", `#walkthroughs/${scenario.id}/${step + 1}`);
+    current = render();
+  }
+  function goToStep(target, focus) {
+    const { scenario, step } = walkState(route());
+    target = Math.max(0, Math.min(scenario.steps.length - 1, target));
+    if (target === step) return;
+    showStep(scenario, target);
+    const element = focus && content.querySelector(focus);
+    (element?.disabled ? document.getElementById(element.id === "next" ? "previous" : "next") : element)?.focus({ preventScroll: true });
+    feedback(`Step ${target + 1}: ${scenario.steps[target].title}. ${scenario.steps[target].note}`);
+  }
+
+  function logView() {
+    const ladder = [["In progress", "A scoped change has actually started; identify the work and remaining checks."], ["Implemented", "Link the code and record the behavior that exists, including known gaps."], ["Verified", "Attach a meaningful check, result, date, and exact code revision. Passing tests do not constitute a security audit."]];
+    return `<section class="page" aria-labelledby="page-title">
+      <div class="page-head"><h1 id="page-title">Evidence and activity</h1><p class="lede">What exists, what was checked, and when. Maintained by hand; this page does not scan Git or run tests.</p></div>
+      <section><h2>Delivery</h2><ul class="status-table">${data.systems.map((system) => `<li><a href="#map/${system.id}">${escape(system.name)}</a>${status(statusLabel(system.implementation))}<span class="muted">${system.evidence.length ? system.evidence.map((item) => link(item.label, item.href)).join(", ") : "No evidence recorded"}</span></li>`).join("")}</ul></section>
+      <section><h2>How status earns its name</h2><ol class="ladder">${ladder.map(([value, detail]) => `<li>${status(value)}<p>${detail}</p></li>`).join("")}</ol></section>
+      <section><h2>Activity</h2><ol class="timeline">${data.activity.map((item) => `<li><time datetime="${item.date}">${item.date}</time><div><h3>${escape(item.title)}</h3><p class="kind">${escape(item.kind)}</p><p>${escape(item.detail)}</p>${item.href ? link("Open record", item.href) : ""}</div></li>`).join("")}</ol></section>
+      <p class="footnote">${link("How to keep this atlas current", "README.md")}</p>
+    </section>`;
+  }
+
+  function render() {
+    const at = route();
+    content.innerHTML = at.view === "decisions" ? decisionsView(at.id) : at.view === "walkthroughs" ? walkthroughsView(at) : at.view === "log" ? logView() : mapView(at.id);
+    for (const anchor of document.querySelectorAll(".tabs a")) {
+      if (anchor.hash === `#${at.view}`) anchor.setAttribute("aria-current", "page"); else anchor.removeAttribute("aria-current");
     }
-    if (moveFocus) { content.focus({ preventScroll: true }); window.scrollTo(0, 0); }
-    if (page === "decisions" && id) document.getElementById(`decision-${id}`)?.scrollIntoView({ block: "start" });
+    const system = at.view === "map" && byId(data.systems, at.id);
+    const titles = { map: "Map", decisions: "Decisions", walkthroughs: "Walkthroughs", log: "Evidence and activity" };
+    document.title = `${system ? system.name : titles[at.view]} · mypassman atlas`;
+    return at;
   }
-  document.getElementById("system-nav").innerHTML = data.systems.map((system) => link(system.name, `#system/${system.id}`)).join("");
-  document.getElementById("snapshot").textContent = `Snapshot · ${data.updated}`;
-  window.addEventListener("hashchange", () => { feedback(""); render(true); });
-  content.addEventListener("submit", (event) => {
-    const form = event.target.closest("form[data-decision]");
-    if (!form) return;
-    event.preventDefault();
-    const values = new FormData(form);
-    const decision = data.decisions.find((item) => item.id === form.dataset.decision);
-    const choice = String(values.get("choice"));
-    if (!decision || (choice && !decision.options.includes(choice))) return;
-    drafts[decision.id] = { choice, note: String(values.get("note")).slice(0, 2000), updated: new Date().toISOString() };
-    persistDrafts();
-    const scroll = window.scrollY;
-    render(); window.scrollTo(0, scroll);
-    content.querySelector(`[data-decision="${decision.id}"] button[type="submit"]`)?.focus({ preventScroll: true });
-    feedback(storageAvailable ? "Draft saved in this browser. The project decision is unchanged; export the draft for review." : "Browser storage unavailable. Export your draft before leaving this page.");
+  function focusPanel() {
+    const title = document.getElementById("panel-title");
+    title?.focus({ preventScroll: true });
+    if (matchMedia("(max-width: 999px)").matches) title?.scrollIntoView({ block: "start", behavior: reducedMotion() ? "auto" : "smooth" });
+  }
+
+  let current = render();
+  window.addEventListener("hashchange", () => {
+    const before = current;
+    current = render();
+    feedback("");
+    const changedView = current.view !== before.view;
+    if (changedView) window.scrollTo(0, 0);
+    if (["map", "decisions"].includes(current.view) && current.id && (changedView || current.id !== before.id)) focusPanel();
+    else if (!changedView && !current.id && before.id) content.querySelector(`[data-id="${before.id}"]`)?.focus();
+    else content.focus({ preventScroll: true });
   });
-  content.addEventListener("change", (event) => {
-    if (event.target.id === "scenario") {
-      scenarioId = event.target.value; step = 0; render();
-      document.getElementById("scenario").focus({ preventScroll: true });
-      feedback(`Scenario: ${data.scenarios.find((item) => item.id === scenarioId).title}. Step 1.`);
-    }
-  });
+  document.querySelector(".skip").addEventListener("click", (event) => { event.preventDefault(); content.focus(); });
   content.addEventListener("click", (event) => {
     const button = event.target.closest("button");
     if (!button) return;
-    if (button.id === "next" || button.id === "previous") {
-      const scenario = data.scenarios.find((item) => item.id === scenarioId);
-      step = Math.max(0, Math.min(scenario.steps.length - 1, step + (button.id === "next" ? 1 : -1)));
-      render();
-      const focusId = step === scenario.steps.length - 1 ? "previous" : step === 0 ? "next" : button.id;
-      document.getElementById(focusId).focus({ preventScroll: true });
-      feedback(`Step ${step + 1}: ${scenario.steps[step].title}. ${scenario.steps[step].note}`);
-    } else if (button.dataset.discard) {
-      const id = button.dataset.discard;
-      delete drafts[id]; persistDrafts(); render();
-      document.querySelector(`#decision-${id} summary`)?.focus({ preventScroll: true });
-      feedback("Local draft discarded.");
-    } else if (button.id === "export-drafts") {
-      const blob = new Blob([JSON.stringify({ schemaVersion: 1, kind: "decision-drafts", sourceSnapshot: data.updated, exportedAt: new Date().toISOString(), drafts }, null, 2) + "\n"], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url; anchor.download = "mypassman-decision-drafts.json"; anchor.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-      feedback("Draft export downloaded. Review and record accepted decisions in the project; this export is not an approval record.");
+    if (button.dataset.scenario) {
+      const scenario = byId(data.scenarios, button.dataset.scenario);
+      showStep(scenario, 0);
+      content.querySelector(`[data-scenario="${scenario.id}"]`)?.focus({ preventScroll: true });
+      feedback(`${scenario.title}. Step 1: ${scenario.steps[0].title}.`);
+    } else if (button.id === "next" || button.id === "previous") {
+      goToStep(walkState(route()).step + (button.id === "next" ? 1 : -1), `#${button.id}`);
+    } else if (button.dataset.step) {
+      goToStep(Number(button.dataset.step), `[data-step="${button.dataset.step}"]`);
     }
   });
-  render();
+  document.addEventListener("keydown", (event) => {
+    if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.target.closest("input, select, textarea, [contenteditable]")) return;
+    const now = route();
+    if (event.key === "Escape" && now.view === "map" && now.id) { location.hash = "#map"; return; }
+    const delta = { ArrowLeft: -1, ArrowRight: 1 }[event.key];
+    if (now.view !== "walkthroughs" || !delta) return;
+    event.preventDefault();
+    const target = walkState(now).step + delta;
+    const active = document.activeElement;
+    const focus = !content.contains(active) ? "" : active.dataset.step ? `[data-step="${target}"]` : active.dataset.scenario ? `[data-scenario="${active.dataset.scenario}"]` : active.id ? `#${active.id}` : "";
+    goToStep(target, focus);
+  });
 })();
